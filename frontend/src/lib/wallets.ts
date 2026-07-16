@@ -161,3 +161,34 @@ export function generateApiKey(token: string, id: string) {
   });
 }
 
+export type WebhookEndpoint = {
+  id: string;
+  wallet_id: string;
+  url: string;
+  secret: string;
+  active: boolean;
+};
+
+export type WebhookDelivery = {
+  id: string;
+  endpoint_id: string;
+  event_type: string;
+  payload: any;
+  status: string; // 'pending' | 'delivered' | 'failed'
+  attempts: number;
+  response_code: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** List registered webhook endpoints for a wallet. */
+export function listWebhooks(token: string, id: string) {
+  return apiFetch<WebhookEndpoint[]>(`/v1/wallets/${id}/webhooks`, { token });
+}
+
+/** List recent webhook deliveries for a specific endpoint. */
+export function listWebhookDeliveries(token: string, id: string, endpointId: string) {
+  return apiFetch<WebhookDelivery[]>(`/v1/wallets/${id}/webhooks/${endpointId}/deliveries`, { token });
+}
+
+
