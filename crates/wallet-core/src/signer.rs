@@ -187,6 +187,10 @@ pub struct FeeBumpRequest<'a> {
     /// Base64-encoded signed `TransactionEnvelope` from the user. Must be a v1 (`Tx`) envelope.
     pub inner_xdr: &'a str,
     /// Maximum base fee (in stroops) the sponsor is willing to pay for the fee-bump.
+    ///
+    /// Note: this value is assigned verbatim to the outer fee-bump envelope's fee field.
+    /// It is NOT automatically multiplied by the number of inner operations. The caller
+    /// is responsible for computing and providing the correct pre-multiplied maximum fee.
     pub max_base_fee_stroops: i64,
 }
 
@@ -780,5 +784,92 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
+    }
+
+    // ── Helper: build a signed multi-operation inner payment envelope XDR ──────
+
+    fn make_multi_op_inner_xdr(source_index: u32, seq: i64, num_ops: usize) -> String {
+        use stellar_base::operations::Operation;
+        use stellar_base::transaction::{Transaction, MIN_BASE_FEE};
+        use stellar_base::xdr::XDRSerialize;
+        use stellar_base::amount::Stroops;
+
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let keypair = keypair_from_sealed(&mk, &sealed, StellarNetwork::Testnet, source_index).unwrap();
+        let source = keypair.public_key();
+        
+        let destination = parse_destination(DEST).unwrap();
+        let payment = Operation::new_payment()
+            .with_destination(destination)
+            .with_amount(Stroops::new(100_000))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut builder = Transaction::builder(source, seq, MIN_BASE_FEE);
+        for _ in 0..num_ops {
+            builder = builder.add_operation(payment.clone());
+        }
+        let mut tx = builder.into_transaction().unwrap();
+        tx.sign(keypair.as_ref(), &StellarNetwork::Testnet.to_base()).unwrap();
+        tx.into_envelope().xdr_base64().unwrap()
+    }
+
+    #[test]
+    fn fee_bump_multi_op_inner_preserves_all_operations_and_signatures() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let inner_xdr = make_multi_op_inner_xdr(0, 1, 3);
+
+        let inner_env_before =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&inner_xdr).unwrap();
+        let inner_sigs_before = match inner_env_before {
+            stellar_base::xdr::TransactionEnvelope::Tx(ref e) => e.signatures.to_vec(),
+            _ => panic!("expected Tx"),
+        };
+
+        let result = sign_fee_bump(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+        )
+        .unwrap();
+
+        let outer_env =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&result.envelope_xdr).unwrap();
+        let fee_bump_env = match outer_env {
+            stellar_base::xdr::TransactionEnvelope::TxFeeBump(e) => e,
+            _ => panic!("expected TxFeeBump"),
+        };
+        let inner_tx_after = match fee_bump_env.tx.inner_tx {
+            stellar_base::xdr::FeeBumpTransactionInnerTx::Tx(e) => e,
+        };
+        
+        assert_eq!(inner_tx_after.signatures.to_vec(), inner_sigs_before, "signatures must be preserved");
+        assert_eq!(inner_tx_after.tx.operations.len(), 3, "all 3 operations must be preserved");
+    }
+
+    #[test]
+    fn fee_bump_fee_field_is_not_multiplied_by_inner_op_count() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let inner_xdr = make_multi_op_inner_xdr(0, 1, 3);
+        let max_base_fee: i64 = 500;
+        let result = sign_fee_bump(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: max_base_fee, sequence: 0 },
+        )
+        .unwrap();
+
+        let outer_env =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&result.envelope_xdr).unwrap();
+        let fee_bump_env = match outer_env {
+            stellar_base::xdr::TransactionEnvelope::TxFeeBump(e) => e,
+            _ => panic!("expected TxFeeBump"),
+        };
+        assert_eq!(fee_bump_env.tx.fee, max_base_fee, "fee field should be exactly max_base_fee_stroops");
     }
 }
