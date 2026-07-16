@@ -46,6 +46,18 @@ export async function apiFetch<T>(
   }
 
   if (!res.ok) {
+    // التعديل الجديد هنا:
+    if (res.status === 401 && window.location.pathname !== "/login") {
+      // 1. مسح الـ Session (ممكن تستعملي الطريقة اللي كيستعملو في المشروع)
+      localStorage.removeItem("token"); // أو أي مفتاح كتستعملوه
+      
+      // 2. الـ Redirect لـ /login
+      window.location.href = "/login";
+      
+      // نرجعو Promise فارغة باش ما يكملش الكود لتحت
+      return new Promise(() => {});
+    }
+
     throw new ApiError(body?.message ?? `Request failed (${res.status})`, res.status);
   }
   return body!.data;
