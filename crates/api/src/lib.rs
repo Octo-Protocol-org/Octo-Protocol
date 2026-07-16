@@ -16,14 +16,16 @@ mod state;
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
+use axum::error_handling::HandleErrorLayer;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{BoxError, Router};
+use tower::ServiceBuilder;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Build the API router with shared state.
 pub fn build_router(state: AppState) -> Router {
-    // The browser dashboard calls this API cross-origin. Allow any origin for the JSON API
-    // (auth is via bearer tokens, not cookies, so this is not a CSRF vector).
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -73,11 +75,37 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
         )
-        .layer(cors)
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_errors))
+                .layer(cors),
+        )
         .with_state(state)
 }
 
 /// Liveness probe.
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Custom error handler to wrap oversized body rejections (413) in the standard envelope.
+async fn handle_errors(err: BoxError) -> Response {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        return (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response();
+    }
+
+    if err.is::<axum::extract::rejection::PayloadTooLarge>() {
+        return error::Envelope::error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body too large".to_string(),
+            None,
+        )
+        .into_response();
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Unhandled internal error: {}", err),
+    )
+        .into_response()
 }
