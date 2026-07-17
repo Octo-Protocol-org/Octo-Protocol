@@ -41,3 +41,4 @@ sqlx.workspace = true
 stellar-base.workspace = true
 dotenvy = "0.15"
 reqwest.workspace = true
+wiremock = "0.6"
