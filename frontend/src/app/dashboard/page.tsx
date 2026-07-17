@@ -13,6 +13,8 @@ import { DashboardShell } from "@/components/dashboard/DashboardShell";
 export default function DashboardHome() {
   const { user, token, loading, logout } = useAuth();
   const [wallets, setWallets] = useState<WalletView[] | null>(null);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [sponsorshipByWalletId, setSponsorshipByWalletId] = useState<
     Map<string, SponsorshipConfig | null>
   >(new Map());
@@ -21,32 +23,54 @@ export default function DashboardHome() {
     if (!token) return;
     let aborted = false;
     listWallets(token)
-      .then(async (ws) => {
+      .then(async (page) => {
         if (aborted) return;
-        setWallets(ws);
-        // Fetch sponsorship configs in parallel so the wallet list never has to wait on them.
-        // A single failed sponsorship fetch must not blank out the whole row.
+        setWallets(page.data);
+        setCursor(page.next_cursor);
+        // Fetch sponsorship configs in parallel.
         const results = await Promise.allSettled(
-          ws.map((w) => getSponsorshipConfig(token, w.id)),
+          page.data.map((w) => getSponsorshipConfig(token, w.id)),
         );
         if (aborted) return;
         const map = new Map<string, SponsorshipConfig | null>();
-        ws.forEach((w, i) => {
+        page.data.forEach((w, i) => {
           const r = results[i];
           map.set(w.id, r.status === "fulfilled" ? r.value : null);
         });
         setSponsorshipByWalletId(map);
       })
       .catch(() => {
-        // Gate on the same `aborted` flag the .then already uses so we don't call
-        // setState on an unmounted component when listWallets rejects late.
         if (aborted) return;
         setWallets([]);
       });
-    return () => {
-      aborted = true;
-    };
+    return () => { aborted = true; };
   }, [token]);
+
+  async function loadMore() {
+    if (!cursor || loadingMore || !token) return;
+    setLoadingMore(true);
+    try {
+      const page = await listWallets(token, cursor);
+      setWallets((prev) => [...(prev ?? []), ...page.data]);
+      setCursor(page.next_cursor);
+      // Fetch sponsorship configs for the new batch.
+      const results = await Promise.allSettled(
+        page.data.map((w) => getSponsorshipConfig(token, w.id)),
+      );
+      setSponsorshipByWalletId((prev) => {
+        const map = new Map(prev);
+        page.data.forEach((w, i) => {
+          const r = results[i];
+          map.set(w.id, r.status === "fulfilled" ? r.value : null);
+        });
+        return map;
+      });
+    } catch {
+      // leave existing list in place on failure
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   if (loading || !user) {
     return (
@@ -103,15 +127,28 @@ export default function DashboardHome() {
           ) : wallets.length === 0 ? (
             <EmptyState />
           ) : (
-            <div className="grid gap-4 md:grid-cols-2">
-              {wallets.map((w) => (
-                <WalletCard
-                  key={w.id}
-                  wallet={w}
-                  sponsorship={sponsorshipByWalletId.get(w.id) ?? undefined}
-                />
-              ))}
-            </div>
+            <>
+              <div className="grid gap-4 md:grid-cols-2">
+                {wallets.map((w) => (
+                  <WalletCard
+                    key={w.id}
+                    wallet={w}
+                    sponsorship={sponsorshipByWalletId.get(w.id) ?? undefined}
+                  />
+                ))}
+              </div>
+              {cursor && (
+                <div className="mt-6 text-center">
+                  <button
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="rounded-lg border border-white/10 bg-white/[0.03] px-5 py-2.5 text-sm text-foreground transition-colors hover:border-burgundy/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {loadingMore ? "Loading…" : "Load more wallets"}
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>

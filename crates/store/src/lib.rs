@@ -254,6 +254,60 @@ impl Store {
         Ok(rows)
     }
 
+    /// Paginated version of [`list_wallets_for_user`]: returns at most `limit` rows, newest first.
+    /// Pass the last page's final wallet id as `before_id` to fetch the next page.
+    pub async fn list_wallets_for_user_page(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE user_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM wallets WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated version of [`list_wallets_for_user`]: returns at most `limit` rows created
+    /// before the row with `before_id` (keyset pagination, most-recent-first).
+    pub async fn list_wallets_for_user_page(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE user_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM wallets WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// List all wallets (used by the ingest supervisor to fan out poll loops).
     pub async fn list_wallets(&self) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>("SELECT * FROM wallets ORDER BY created_at")
@@ -333,6 +387,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// Paginated version of [`list_addresses`]: returns at most `limit` rows, newest first.
+    /// Pass the last page's final address id as `before_id` to fetch the next page.
+    pub async fn list_addresses_page(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Address>, StoreError> {
+        let rows = sqlx::query_as::<_, Address>(
+            r#"
+            SELECT * FROM addresses
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM addresses WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Fetch an address by id.
     pub async fn get_address(&self, id: Uuid) -> Result<Option<Address>, StoreError> {
         let row = sqlx::query_as::<_, Address>("SELECT * FROM addresses WHERE id = $1")
@@ -406,6 +487,33 @@ impl Store {
             "SELECT * FROM transactions WHERE wallet_id = $1 ORDER BY created_at DESC",
         )
         .bind(wallet_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated version of [`list_transactions`]: returns at most `limit` rows, newest first.
+    /// Pass the last page's final transaction id as `before_id` to fetch the next page.
+    pub async fn list_transactions_page(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Transaction>, StoreError> {
+        let rows = sqlx::query_as::<_, Transaction>(
+            r#"
+            SELECT * FROM transactions
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM transactions WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

@@ -33,6 +33,10 @@ export default function WalletOverview({
   const [balances, setBalances] = useState<Balance[]>([]);
   const [addresses, setAddresses] = useState<Address[]>([]);
   const [txns, setTxns] = useState<Transaction[]>([]);
+  const [addrCursor, setAddrCursor] = useState<string | null>(null);
+  const [txnCursor, setTxnCursor] = useState<string | null>(null);
+  const [loadingMoreAddr, setLoadingMoreAddr] = useState(false);
+  const [loadingMoreTxn, setLoadingMoreTxn] = useState(false);
   const [creating, setCreating] = useState(false);
   const [showDeposit, setShowDeposit] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
@@ -40,16 +44,49 @@ export default function WalletOverview({
   function refresh() {
     if (!token) return;
     getBalances(token, id).then(setBalances).catch(() => {});
-    listTransactions(token, id).then(setTxns).catch(() => {});
+    listTransactions(token, id).then((page) => {
+      setTxns(page.data);
+      setTxnCursor(page.next_cursor);
+    }).catch(() => {});
   }
 
   useEffect(() => {
     if (!token) return;
     getWallet(token, id).then(setWallet).catch(() => setWallet(null));
     getBalances(token, id).then(setBalances).catch(() => setBalances([]));
-    listAddresses(token, id).then(setAddresses).catch(() => setAddresses([]));
-    listTransactions(token, id).then(setTxns).catch(() => setTxns([]));
+    listAddresses(token, id).then((page) => {
+      setAddresses(page.data);
+      setAddrCursor(page.next_cursor);
+    }).catch(() => setAddresses([]));
+    listTransactions(token, id).then((page) => {
+      setTxns(page.data);
+      setTxnCursor(page.next_cursor);
+    }).catch(() => setTxns([]));
   }, [token, id]);
+
+  async function loadMoreAddresses() {
+    if (!addrCursor || loadingMoreAddr || !token) return;
+    setLoadingMoreAddr(true);
+    try {
+      const page = await listAddresses(token, id, addrCursor);
+      setAddresses((prev) => [...prev, ...page.data]);
+      setAddrCursor(page.next_cursor);
+    } finally {
+      setLoadingMoreAddr(false);
+    }
+  }
+
+  async function loadMoreTransactions() {
+    if (!txnCursor || loadingMoreTxn || !token) return;
+    setLoadingMoreTxn(true);
+    try {
+      const page = await listTransactions(token, id, txnCursor);
+      setTxns((prev) => [...prev, ...page.data]);
+      setTxnCursor(page.next_cursor);
+    } finally {
+      setLoadingMoreTxn(false);
+    }
+  }
 
   async function onNewAddress() {
     if (!token) return;
@@ -181,7 +218,7 @@ export default function WalletOverview({
                   <Empty>No addresses generated yet.</Empty>
                 ) : (
                   <ul className="space-y-3">
-                    {addresses.slice(0, 5).map((a) => (
+                    {addresses.map((a) => (
                       <li key={a.id}>
                         <p className="font-mono text-xs text-burgundy-bright">
                           {a.muxed_address.slice(0, 8)}…{a.muxed_address.slice(-6)}
@@ -194,9 +231,18 @@ export default function WalletOverview({
                     ))}
                   </ul>
                 )}
-                <p className="mt-4 text-right text-xs text-muted">
-                  Showing last {Math.min(addresses.length, 5)} generated
-                </p>
+                <div className="mt-4 flex items-center justify-between text-xs text-muted">
+                  <span>Showing {addresses.length} generated</span>
+                  {addrCursor && (
+                    <button
+                      onClick={loadMoreAddresses}
+                      disabled={loadingMoreAddr}
+                      className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-foreground hover:border-burgundy/50 disabled:opacity-50"
+                    >
+                      {loadingMoreAddr ? "Loading…" : "Load more"}
+                    </button>
+                  )}
+                </div>
               </Panel>
             </div>
 
@@ -248,6 +294,17 @@ export default function WalletOverview({
                     ))}
                   </tbody>
                 </table>
+              )}
+              {txnCursor && (
+                <div className="mt-4 text-center">
+                  <button
+                    onClick={loadMoreTransactions}
+                    disabled={loadingMoreTxn}
+                    className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-foreground transition-colors hover:border-burgundy/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {loadingMoreTxn ? "Loading…" : "Load more"}
+                  </button>
+                </div>
               )}
             </Panel>
           </main>

@@ -1,15 +1,16 @@
-//! Address endpoints: generate a customer deposit address, list them.
+//! Address endpoints: generate a customer deposit address, list them with pagination.
 //!
 //! Each address is returned in **both** forms — the muxed `M...` (default) and the
 //! `G...` + numeric `memo_id` fallback for senders that don't support muxed (see
 //! `docs/deposit-model.md`).
 
 use crate::auth::authorize_wallet;
-use crate::error::{ApiResult, Envelope};
+use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
+use crate::routes::wallets::{make_page, validated_limit, HasId, PageQuery, PageResponse};
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_wallet_core::encode_muxed;
@@ -38,6 +39,12 @@ pub struct AddressView {
     pub base_address: String,
     pub memo_id: i64,
     pub metadata: serde_json::Value,
+}
+
+impl HasId for AddressView {
+    fn id(&self) -> Uuid {
+        self.id
+    }
 }
 
 /// `POST /v1/wallets/{id}/addresses`
@@ -96,28 +103,37 @@ pub async fn create_address(
     Ok((status, json))
 }
 
-/// `GET /v1/wallets/{id}/addresses`
+/// `GET /v1/wallets/{id}/addresses` — paginated address list.
+///
+/// Query params: `?limit=50&before=<uuid>`
 pub async fn list_addresses(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
-) -> ApiResult<Json<Envelope<Vec<AddressView>>>> {
+    Query(q): Query<PageQuery>,
+) -> ApiResult<Json<Envelope<PageResponse<AddressView>>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
-    // Confirm the wallet exists (404 otherwise) and get its base account for the fallback form.
     let wallet = state.store().get_wallet(wallet_id).await?;
-    let rows = state.store().list_addresses(wallet_id).await?;
 
-    let views = rows
+    let limit = validated_limit(q.limit)?;
+    let rows = state
+        .store()
+        .list_addresses_page(wallet_id, limit + 1, q.before)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let base = wallet.stellar_account_g.clone();
+    let views: Vec<AddressView> = rows
         .into_iter()
         .map(|a| AddressView {
             id: a.id,
             customer_ref: a.customer_ref,
             muxed_address: a.muxed_address,
-            base_address: wallet.stellar_account_g.clone(),
+            base_address: base.clone(),
             memo_id: a.muxed_id,
             metadata: a.metadata,
         })
         .collect();
 
-    Ok(Envelope::ok(views))
+    Ok(Envelope::ok(make_page(views, limit)))
 }
