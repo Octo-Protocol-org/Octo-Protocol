@@ -136,6 +136,47 @@ pub async fn login(
     }))
 }
 
+/// `POST /v1/auth/refresh` — exchange a valid, unexpired token for a freshly-signed one.
+///
+/// The caller presents their current JWT via `Authorization: Bearer`; the response carries a new
+/// token for the same user with a full [`TOKEN_TTL_SECS`] window starting now.
+///
+/// **This is not a security control.** Refreshing does **not** invalidate the previous token:
+/// both the old and the new token remain valid until their natural expiry. That is an intentional
+/// scope limit — real revocation (server-side session state / a token denylist) is a separate,
+/// larger piece of work.
+pub async fn refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<AuthResponse>>> {
+    let user_id = authenticate(&headers, &state)?;
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    crate::audit::record(
+        &state,
+        user.id,
+        "refreshed session token",
+        crate::audit::category::AUTH,
+        None,
+        &headers,
+    )
+    .await;
+
+    let token = issue_token(state.jwt_secret(), user.id)?;
+    Ok(Envelope::ok(AuthResponse {
+        token,
+        user: UserView {
+            id: user.id,
+            email: user.email,
+        },
+    }))
+}
+
 /// `GET /v1/auth/me` — returns the authenticated user (token required).
 pub async fn me(
     State(state): State<AppState>,

@@ -53,6 +53,153 @@ fn unique_email() -> String {
     format!("user-{}@octo.test", uuid::Uuid::new_v4().simple())
 }
 
+/// Sign up a fresh user and return `(token, user_id)`.
+async fn signup(app: &axum::Router, email: &str) -> (String, String) {
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let j = body_json(resp).await;
+    (
+        j["data"]["token"].as_str().unwrap().to_string(),
+        j["data"]["user"]["id"].as_str().unwrap().to_string(),
+    )
+}
+
+fn post_refresh(token: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder().method("POST").uri("/v1/auth/refresh");
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// Decode a JWT payload (no verification — test-side inspection only).
+fn jwt_claims(token: &str) -> serde_json::Value {
+    use base64::Engine;
+    let payload = token.split('.').nth(1).unwrap();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Forge an HS256 JWT with the test secret and an arbitrary `exp` (mirrors the server's format).
+fn forge_token(sub: &str, exp: i64) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"; // {"alg":"HS256","typ":"JWT"}
+    let payload = b64(format!(r#"{{"sub":"{sub}","exp":{exp}}}"#).as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(b"test-jwt-secret-at-least-16-bytes")
+        .unwrap();
+    mac.update(signing_input.as_bytes());
+    let sig = b64(&mac.finalize().into_bytes());
+    format!("{signing_input}.{sig}")
+}
+
+#[tokio::test]
+async fn refresh_issues_a_new_token_with_an_extended_expiry_for_the_same_user() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state);
+    let email = unique_email();
+    let (token, user_id) = signup(&app, &email).await;
+    let old_claims = jwt_claims(&token);
+
+    // Ensure the wall clock advances so the new exp is strictly later.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_refresh(Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let new_token = j["data"]["token"].as_str().unwrap().to_string();
+    assert_eq!(j["data"]["user"]["id"], user_id.as_str());
+    assert_eq!(j["data"]["user"]["email"], email);
+
+    // Same subject, strictly later expiry.
+    let new_claims = jwt_claims(&new_token);
+    assert_eq!(new_claims["sub"], old_claims["sub"]);
+    assert!(new_claims["exp"].as_i64().unwrap() > old_claims["exp"].as_i64().unwrap());
+
+    // The refreshed token works against a protected route.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {new_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["email"], email);
+}
+
+#[tokio::test]
+async fn refresh_rejects_an_expired_token() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let (_token, user_id) = signup(&app, &unique_email()).await;
+
+    // Correctly signed, but expired a minute ago.
+    let expired = forge_token(
+        &user_id,
+        chrono::Utc::now().timestamp() - 60,
+    );
+    let resp = app.oneshot(post_refresh(Some(&expired))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn refresh_rejects_a_missing_or_malformed_token() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+
+    // No Authorization header at all.
+    let resp = app.clone().oneshot(post_refresh(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Garbage bearer token.
+    let resp = app
+        .clone()
+        .oneshot(post_refresh(Some("not.a.jwt")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Well-formed JWT signed with the wrong secret.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/refresh")
+                .header("authorization", "Basic abc123") // wrong scheme
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn signup_login_me_flow() {
     let Some(state) = test_state().await else {
