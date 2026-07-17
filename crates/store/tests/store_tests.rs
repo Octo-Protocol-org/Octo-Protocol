@@ -367,3 +367,163 @@ async fn upsert_gas_sponsorship_config_works() {
         .expect("sum");
     assert_eq!(spent, 0);
 }
+
+/// Create a throwaway user with a unique email (so tests don't collide).
+async fn fresh_user(store: &Store) -> Uuid {
+    let email = format!("test-{}@example.invalid", Uuid::new_v4().simple());
+    store
+        .create_user(&email, "not-a-real-hash")
+        .await
+        .expect("create user")
+        .id
+}
+
+// --- indexing-overhaul correctness regressions (hard/store/indexing-overhaul-with-load-test) ---
+//
+// These assert result *correctness* (ordering, filtering) for the query shapes the new indices in
+// migrations/0008_sponsored_and_audit_indexing.sql target. An index change must never change which
+// rows come back or in what order — if either of these starts failing, the index migration altered
+// query semantics, not just performance, and that's a bug in the migration.
+
+#[tokio::test]
+async fn list_sponsored_transactions_orders_filters_and_paginates_correctly() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    insert_sponsorship_config(&store, wallet_id).await;
+
+    // Three rows, two different statuses, with `created_at` pinned to strictly increasing values
+    // (rather than relying on wall-clock ordering, which is too coarse to guarantee distinct
+    // timestamps for back-to-back inserts and would make the ORDER BY assertions flaky).
+    let mut ids = Vec::new();
+    for (i, (label, status)) in [("a", "pending"), ("b", "confirmed"), ("c", "confirmed")]
+        .into_iter()
+        .enumerate()
+    {
+        let row = store
+            .record_sponsored_tx(NewSponsoredTx {
+                wallet_id,
+                inner_tx_hash: &format!("order-{label}-{}", Uuid::new_v4().simple()),
+                fee_stroops: 100,
+            })
+            .await
+            .expect("record");
+        if status == "confirmed" {
+            store
+                .update_sponsored_tx_status(row.id, "confirmed", None, None)
+                .await
+                .expect("confirm");
+        }
+        sqlx::query("UPDATE sponsored_transactions SET created_at = now() - make_interval(secs => $2) WHERE id = $1")
+            .bind(row.id)
+            .bind((10 - i) as f64)
+            .execute(store.pool())
+            .await
+            .expect("pin created_at");
+        ids.push(row.id);
+    }
+
+    // Unfiltered: most-recent-first (created_at DESC, id DESC — insertion order reversed).
+    let all = store
+        .list_sponsored_transactions(wallet_id, 10, None, None)
+        .await
+        .expect("list all");
+    let all_ids: Vec<Uuid> = all.iter().map(|r| r.id).collect();
+    assert_eq!(all_ids, vec![ids[2], ids[1], ids[0]]);
+
+    // Status filter: only the two confirmed rows, same relative order.
+    let confirmed = store
+        .list_sponsored_transactions(wallet_id, 10, Some("confirmed"), None)
+        .await
+        .expect("list confirmed");
+    let confirmed_ids: Vec<Uuid> = confirmed.iter().map(|r| r.id).collect();
+    assert_eq!(confirmed_ids, vec![ids[2], ids[1]]);
+
+    // Cursor pagination: page of 1 starting after the newest row returns the next one down.
+    let page = store
+        .list_sponsored_transactions(wallet_id, 1, None, Some(ids[2]))
+        .await
+        .expect("list after cursor");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, ids[1]);
+}
+
+#[tokio::test]
+async fn list_audit_logs_filters_by_category_and_search_correctly() {
+    let Some(store) = store().await else { return };
+    let user_id = fresh_user(&store).await;
+
+    store
+        .record_audit(
+            user_id,
+            "signed in",
+            "authentication",
+            None,
+            Some("203.0.113.1"),
+        )
+        .await
+        .expect("record 1");
+    store
+        .record_audit(
+            user_id,
+            "created wallet octo master wallet",
+            "wallet",
+            Some("octo master wallet"),
+            None,
+        )
+        .await
+        .expect("record 2");
+    store
+        .record_audit(user_id, "rotated api key", "credentials", None, None)
+        .await
+        .expect("record 3");
+
+    // Pin `created_at` to strictly increasing values in insertion order (see the sponsored-tx test
+    // above for why wall-clock ordering alone isn't reliable enough for the ORDER BY assertions).
+    for (offset_secs, action) in [
+        (10.0, "signed in"),
+        (9.0, "created wallet octo master wallet"),
+        (8.0, "rotated api key"),
+    ] {
+        sqlx::query(
+            "UPDATE audit_logs SET created_at = now() - make_interval(secs => $2) \
+             WHERE user_id = $1 AND action = $3",
+        )
+        .bind(user_id)
+        .bind(offset_secs)
+        .bind(action)
+        .execute(store.pool())
+        .await
+        .expect("pin created_at");
+    }
+
+    // Category filter: only the "wallet" row.
+    let by_category = store
+        .list_audit_logs(user_id, Some("wallet"), None, 10)
+        .await
+        .expect("list by category");
+    assert_eq!(by_category.len(), 1);
+    assert_eq!(by_category[0].category, "wallet");
+
+    // Search filter (the ILIKE / trigram-index case): matches action OR target, case-insensitive.
+    let by_search = store
+        .list_audit_logs(user_id, None, Some("MASTER"), 10)
+        .await
+        .expect("list by search");
+    assert_eq!(by_search.len(), 1);
+    assert_eq!(by_search[0].action, "created wallet octo master wallet");
+
+    // No match.
+    let no_match = store
+        .list_audit_logs(user_id, None, Some("nonexistent-term"), 10)
+        .await
+        .expect("list no match");
+    assert!(no_match.is_empty());
+
+    // Unfiltered: all three, most-recent-first.
+    let all = store
+        .list_audit_logs(user_id, None, None, 10)
+        .await
+        .expect("list all");
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].action, "rotated api key");
+}
