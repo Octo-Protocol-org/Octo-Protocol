@@ -138,6 +138,20 @@ pub struct SponsoredTransaction {
     pub created_at: DateTime<Utc>,
 }
 
+/// A row in the token deny-list (JWT revocation record).
+///
+/// Only the SHA-256 hash of the token is stored — never the raw token itself.
+#[derive(Debug, Clone, FromRow)]
+pub struct DenylistedToken {
+    /// SHA-256 hex of the raw JWT.
+    pub token_hash: String,
+    /// Mirrors the token's `exp` claim; used for safe pruning.
+    pub expires_at: DateTime<Utc>,
+    /// The user who revoked the token.
+    pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A new sponsored transaction to record (inserted as `pending`).
 #[derive(Debug, Clone)]
 pub struct NewSponsoredTx<'a> {

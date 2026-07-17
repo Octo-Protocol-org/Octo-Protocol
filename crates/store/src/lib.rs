@@ -17,7 +17,7 @@ mod models;
 
 pub use error::StoreError;
 pub use models::{
-    Address, ApiKey, AuditLog, GasSponsorshipConfig, NewDeposit, NewSponsoredTx,
+    Address, ApiKey, AuditLog, DenylistedToken, GasSponsorshipConfig, NewDeposit, NewSponsoredTx,
     SponsoredTransaction, Transaction, User, Wallet, WebhookEndpoint, Withdrawal,
 };
 
@@ -673,6 +673,50 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(total.unwrap_or(0))
+    }
+
+    // --- token deny-list -------------------------------------------------
+
+    /// Add a token to the deny-list so it cannot be replayed after logout.
+    ///
+    /// `token_hash` must be the **SHA-256 hex** of the raw JWT (never the token itself).
+    /// `expires_at` should mirror the token's own `exp` claim so that rows can be pruned once
+    /// they are past their natural expiry and cannot match any valid token anyway.
+    ///
+    /// Inserting the same hash twice is harmless (ON CONFLICT DO NOTHING).
+    pub async fn denylist_token(
+        &self,
+        token_hash: &str,
+        user_id: Uuid,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO token_denylist (token_hash, user_id, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (token_hash) DO NOTHING
+            "#,
+        )
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns `true` if the token hash is present in the deny-list **and** has not yet expired.
+    ///
+    /// Expired rows are logically irrelevant (the token itself would fail `verify_token`'s expiry
+    /// check), but this query skips them so a slow pruning job doesn't affect correctness.
+    pub async fn is_token_denylisted(&self, token_hash: &str) -> Result<bool, StoreError> {
+        let found: Option<bool> = sqlx::query_scalar(
+            "SELECT true FROM token_denylist WHERE token_hash = $1 AND expires_at > now() LIMIT 1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
     }
 
     // --- ingest cursor ----------------------------------------------------

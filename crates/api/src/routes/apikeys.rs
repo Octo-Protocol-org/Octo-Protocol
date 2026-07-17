@@ -39,7 +39,7 @@ async fn owned_wallet(
     headers: &HeaderMap,
     wallet_id: Uuid,
 ) -> Result<octo_store::Wallet, ApiError> {
-    let user_id = authenticate(headers, state)?;
+    let user_id = authenticate(headers, state).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.user_id != Some(user_id) {
         // Don't reveal existence of someone else's wallet.

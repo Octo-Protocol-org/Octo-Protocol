@@ -131,7 +131,7 @@ pub async fn sponsor(
         .await;
 
     // 7. Audit log (best-effort) — only when driven by a dashboard login (API keys have no user).
-    if let Ok(user_id) = crate::auth::require_login(&headers, &state) {
+    if let Ok(user_id) = crate::auth::require_login(&headers, &state).await {
         if wallet.user_id == Some(user_id) {
             crate::audit::record(
                 &state,
@@ -200,7 +200,7 @@ pub async fn list_sponsored_transactions(
     Query(q): Query<SponsoredTxnQuery>,
 ) -> ApiResult<Json<Envelope<SponsoredTxnListResponse>>> {
     // JWT login session required (no API keys).
-    let user_id = crate::auth::require_login(&headers, &state)?;
+    let user_id = crate::auth::require_login(&headers, &state).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.user_id != Some(user_id) {
         return Err(ApiError::NotFound);
