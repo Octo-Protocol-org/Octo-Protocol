@@ -367,3 +367,85 @@ async fn upsert_gas_sponsorship_config_works() {
         .expect("sum");
     assert_eq!(spent, 0);
 }
+
+// ---------------------------------------------------------------------------
+// try_reserve_sponsored_transaction – concurrent budget race (#52)
+// ---------------------------------------------------------------------------
+
+/// Spawns N concurrent calls to `try_reserve_sponsored_transaction` for the
+/// same wallet with a budget that only fits M < N of them. Each call uses a
+/// distinct `inner_tx_hash` so the unique-index conflict path is not the
+/// mechanism under test — only the budget CTE atomicity is.
+///
+/// Asserts:
+/// - exactly M calls succeed,
+/// - exactly N - M calls fail with `StoreError::BudgetExceeded`,
+/// - the sum reserved today never exceeds the budget (i.e. exactly M * fee_stroops).
+#[tokio::test]
+async fn concurrent_reservations_never_exceed_daily_budget() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    insert_sponsorship_config(&store, wallet_id).await;
+
+    // Budget allows exactly 3 reservations of 100 stroops each (300 total).
+    // We fire 8 concurrent attempts — only 3 must succeed.
+    let fee_stroops: i64 = 100;
+    let budget: i64 = 300; // fits exactly 3
+    let total_attempts: usize = 8;
+    let expected_successes: usize = (budget / fee_stroops) as usize; // 3
+
+    let mut handles = Vec::with_capacity(total_attempts);
+    for _ in 0..total_attempts {
+        let store_clone = store.clone();
+        // Each call gets a distinct hash so the unique-index is never the limiting factor.
+        let hash = format!("race-{}", Uuid::new_v4().simple());
+        handles.push(tokio::spawn(async move {
+            store_clone
+                .try_reserve_sponsored_transaction(wallet_id, &hash, fee_stroops, Some(budget))
+                .await
+        }));
+    }
+
+    // Collect all results (await each handle sequentially; they ran concurrently above).
+    let mut results: Vec<Result<Result<_, StoreError>, _>> = Vec::with_capacity(total_attempts);
+    for handle in handles {
+        results.push(handle.await);
+    }
+
+    let mut successes = 0usize;
+    let mut budget_exceeded = 0usize;
+    for join_result in results {
+        match join_result.expect("task panicked") {
+            Ok(_) => successes += 1,
+            Err(StoreError::BudgetExceeded) => budget_exceeded += 1,
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    assert_eq!(
+        successes, expected_successes,
+        "expected exactly {expected_successes} successful reservations, got {successes}"
+    );
+    assert_eq!(
+        budget_exceeded,
+        total_attempts - expected_successes,
+        "expected {} BudgetExceeded errors, got {budget_exceeded}",
+        total_attempts - expected_successes
+    );
+
+    // Confirm the DB reflects exactly M * fee_stroops reserved — never over-budget.
+    let reserved = store
+        .sum_sponsored_fees_reserved_today(wallet_id)
+        .await
+        .expect("sum_sponsored_fees_reserved_today");
+    assert_eq!(
+        reserved,
+        (expected_successes as i64) * fee_stroops,
+        "reserved total {reserved} differs from expected {}",
+        (expected_successes as i64) * fee_stroops
+    );
+    assert!(
+        reserved <= budget,
+        "reserved total {reserved} exceeds the daily budget {budget}"
+    );
+}
