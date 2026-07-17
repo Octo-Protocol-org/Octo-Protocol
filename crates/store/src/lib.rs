@@ -243,12 +243,30 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
-    /// List a user's wallets (most recent first).
-    pub async fn list_wallets_for_user(&self, user_id: Uuid) -> Result<Vec<Wallet>, StoreError> {
+    /// List a user's wallets (most recent first), with optional cursor-based pagination.
+    ///
+    /// Fetching `limit + 1` rows lets the caller detect whether a next page exists without a
+    /// separate COUNT query — the same pattern used by `list_sponsored_transactions`.
+    pub async fn list_wallets_for_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
-            "SELECT * FROM wallets WHERE user_id = $1 ORDER BY created_at DESC",
+            r#"
+            SELECT * FROM wallets
+            WHERE user_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM wallets WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
         )
         .bind(user_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -322,12 +340,27 @@ impl Store {
         Ok(address)
     }
 
-    /// List addresses for a wallet (most recent first).
-    pub async fn list_addresses(&self, wallet_id: Uuid) -> Result<Vec<Address>, StoreError> {
+    /// List addresses for a wallet (most recent first), with optional cursor-based pagination.
+    pub async fn list_addresses(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Address>, StoreError> {
         let rows = sqlx::query_as::<_, Address>(
-            "SELECT * FROM addresses WHERE wallet_id = $1 ORDER BY created_at DESC",
+            r#"
+            SELECT * FROM addresses
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM addresses WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
         )
         .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -400,12 +433,27 @@ impl Store {
         }
     }
 
-    /// List transactions for a wallet (most recent first).
-    pub async fn list_transactions(&self, wallet_id: Uuid) -> Result<Vec<Transaction>, StoreError> {
+    /// List transactions for a wallet (most recent first), with optional cursor-based pagination.
+    pub async fn list_transactions(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Transaction>, StoreError> {
         let rows = sqlx::query_as::<_, Transaction>(
-            "SELECT * FROM transactions WHERE wallet_id = $1 ORDER BY created_at DESC",
+            r#"
+            SELECT * FROM transactions
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM transactions WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
         )
         .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
