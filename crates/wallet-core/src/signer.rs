@@ -186,7 +186,15 @@ pub fn sign_payment(
 pub struct FeeBumpRequest<'a> {
     /// Base64-encoded signed `TransactionEnvelope` from the user. Must be a v1 (`Tx`) envelope.
     pub inner_xdr: &'a str,
-    /// Maximum base fee (in stroops) the sponsor is willing to pay for the fee-bump.
+    /// Maximum fee (in stroops) the sponsor is willing to pay for the fee-bump.
+    ///
+    /// This value is stored **verbatim** as the outer `FeeBumpTransaction.fee` — a **flat total
+    /// fee bid in stroops for the whole envelope**, not a per-operation base fee. Per Stellar's
+    /// fee-bump validity rules (CAP-15), the network treats the declared fee as covering
+    /// `inner_operation_count + 1` operations (the inner ops plus the fee-bump itself), so for
+    /// multi-op inner transactions the caller must size this bid accordingly — use
+    /// [`inner_operation_count`] to inspect the inner transaction. See `docs/threat-model.md`
+    /// section B (signing-path abuse / fee injection) for the fee-semantics threat rows.
     pub max_base_fee_stroops: i64,
 }
 
@@ -317,6 +325,26 @@ pub fn compute_inner_tx_hash(
     };
     let payload_xdr = sig_payload.xdr_bytes().map_err(|_| WalletError::Signing)?;
     Ok(Sha256::digest(&payload_xdr).into())
+}
+
+/// Count the operations in the inner transaction of a fee-bump flow, so callers can size the
+/// flat fee bid ([`FeeBumpRequest::max_base_fee_stroops`]) as
+/// `(operation_count + 1) × base_fee` per Stellar's fee-bump rule (the `+ 1` pays for the
+/// fee-bump itself).
+///
+/// Accepts only a v1 (`Tx`) envelope — the same constraint as [`sign_fee_bump`] — and returns
+/// [`WalletError::InvalidXdr`] for anything else. Pure parsing: no I/O, no secret material. A
+/// zero-op envelope parses and returns `Ok(0)`; Stellar itself rejects zero-op transactions, so
+/// this helper reports the count, it does not validate the transaction.
+pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
+    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
+
+    let inner_env =
+        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
+    match inner_env {
+        TransactionEnvelope::Tx(v1) => Ok(v1.tx.operations.len()),
+        _ => Err(WalletError::InvalidXdr),
+    }
 }
 
 /// Parse a destination that may be a `G...` account or an `M...` muxed address.
@@ -808,5 +836,86 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
+    }
+
+    // ── inner_operation_count ────────────────────────────────────────────────
+
+    /// Build a minimal (unsigned) v1 envelope with `n` operations, serialized to base64 XDR.
+    fn make_n_op_inner_xdr(n: usize) -> String {
+        use stellar_base::xdr::{
+            Memo as XdrMemo, MuxedAccount, Operation as XdrOperation, OperationBody, Preconditions,
+            SequenceNumber, Transaction as XdrTransaction, TransactionEnvelope, TransactionExt,
+            TransactionV1Envelope, Uint256,
+        };
+
+        let operations: Vec<XdrOperation> = (0..n)
+            .map(|_| XdrOperation {
+                source_account: None,
+                body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([1u8; 32]))),
+            })
+            .collect();
+        let tx = XdrTransaction {
+            source_account: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: XdrMemo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+        TransactionEnvelope::Tx(envelope).xdr_base64().unwrap()
+    }
+
+    #[test]
+    fn inner_operation_count_reports_correct_count_for_single_and_multi_op_transactions() {
+        // Single-op: a real signed payment envelope.
+        let single = make_inner_xdr(0, 1);
+        assert_eq!(inner_operation_count(&single).unwrap(), 1);
+
+        // Multi-op envelopes built directly from XDR.
+        for n in [2usize, 3] {
+            let xdr = make_n_op_inner_xdr(n);
+            assert_eq!(inner_operation_count(&xdr).unwrap(), n);
+        }
+
+        // Zero-op parses fine: the helper reports, Stellar itself rejects zero-op transactions.
+        let zero = make_n_op_inner_xdr(0);
+        assert_eq!(inner_operation_count(&zero).unwrap(), 0);
+    }
+
+    #[test]
+    fn inner_operation_count_rejects_malformed_xdr_matching_sign_fee_bumps_error_type() {
+        assert!(matches!(
+            inner_operation_count("this-is-not-valid-base64-xdr"),
+            Err(WalletError::InvalidXdr)
+        ));
+        assert!(matches!(
+            inner_operation_count(""),
+            Err(WalletError::InvalidXdr)
+        ));
+
+        // A fee-bump envelope is not a valid inner envelope — same rejection as sign_fee_bump.
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let inner_xdr = make_inner_xdr(0, 1);
+        let fee_bump_xdr = sign_fee_bump(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: 200,
+            },
+        )
+        .unwrap()
+        .envelope_xdr;
+        assert!(matches!(
+            inner_operation_count(&fee_bump_xdr),
+            Err(WalletError::InvalidXdr)
+        ));
     }
 }

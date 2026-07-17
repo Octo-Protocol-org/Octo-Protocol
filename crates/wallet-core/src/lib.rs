@@ -28,6 +28,6 @@ pub use derive::WalletSeed;
 pub use error::WalletError;
 pub use provision::{import_wallet, provision_wallet, ProvisionedWallet};
 pub use signer::{
-    account_id_from_sealed, compute_inner_tx_hash, sign_fee_bump, sign_payment, FeeBumpRequest,
-    PaymentRequest, SignedPayment, StellarNetwork,
+    account_id_from_sealed, compute_inner_tx_hash, inner_operation_count, sign_fee_bump,
+    sign_payment, FeeBumpRequest, PaymentRequest, SignedPayment, StellarNetwork,
 };
