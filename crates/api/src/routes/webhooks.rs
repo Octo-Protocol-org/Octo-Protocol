@@ -5,9 +5,10 @@ use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use octo_store::WebhookDelivery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -66,6 +67,43 @@ pub async fn create_webhook(
     };
     let (status, json) = Envelope::created(view);
     Ok((status, json))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeliveriesQuery {
+    /// Maximum rows to return (default 50, max 200).
+    pub limit: Option<i64>,
+}
+
+/// `GET /v1/wallets/:id/webhooks/:endpoint_id/deliveries` — an endpoint's delivery history,
+/// newest first.
+pub async fn list_deliveries(
+    State(state): State<AppState>,
+    Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Query(q): Query<DeliveriesQuery>,
+) -> ApiResult<Json<Envelope<Vec<WebhookDelivery>>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+
+    let limit = q.limit.unwrap_or(50);
+    if limit > 200 {
+        return Err(ApiError::BadRequest("limit must not exceed 200".into()));
+    }
+    if limit < 1 {
+        return Err(ApiError::BadRequest("limit must be at least 1".into()));
+    }
+
+    // Don't leak whether the endpoint exists under a different wallet.
+    let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
+    if endpoint.wallet_id != wallet_id {
+        return Err(ApiError::NotFound);
+    }
+
+    let rows = state
+        .store()
+        .list_webhook_deliveries(endpoint_id, limit)
+        .await?;
+    Ok(Envelope::ok(rows))
 }
 
 /// Generate a random hex secret for HMAC signing.

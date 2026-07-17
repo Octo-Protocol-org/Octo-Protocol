@@ -57,6 +57,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::webhooks::create_webhook),
         )
         .route(
+            "/v1/wallets/:id/webhooks/:endpoint_id/deliveries",
+            get(routes::webhooks::list_deliveries),
+        )
+        .route(
             "/v1/wallets/:id/api-key",
             post(routes::apikeys::generate_key).get(routes::apikeys::get_key),
         )

@@ -18,7 +18,7 @@ mod models;
 pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, GasSponsorshipConfig, NewDeposit, NewSponsoredTx,
-    SponsoredTransaction, Transaction, User, Wallet, WebhookEndpoint, Withdrawal,
+    SponsoredTransaction, Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint, Withdrawal,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -743,6 +743,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Fetch a single webhook endpoint by id, regardless of `active` state.
+    pub async fn get_webhook_endpoint(&self, id: Uuid) -> Result<WebhookEndpoint, StoreError> {
+        sqlx::query_as::<_, WebhookEndpoint>("SELECT * FROM webhook_endpoints WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.
     pub async fn log_webhook_delivery(
         &self,
@@ -770,5 +779,21 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// List an endpoint's delivery history, newest first, capped at `limit` rows.
+    pub async fn list_webhook_deliveries(
+        &self,
+        endpoint_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<WebhookDelivery>, StoreError> {
+        let rows = sqlx::query_as::<_, WebhookDelivery>(
+            "SELECT * FROM webhook_deliveries WHERE endpoint_id = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(endpoint_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }

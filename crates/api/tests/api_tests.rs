@@ -822,3 +822,161 @@ async fn list_sponsored_transactions_requires_auth() {
     let resp = app.oneshot(get(&uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// --- webhook delivery history ------------------------------------------------
+
+/// Register a webhook endpoint for `wallet_id` and return its id.
+async fn register_webhook_endpoint(app: &axum::Router, token: &str, wallet_id: &str) -> String {
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks");
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &uri,
+            r#"{"url":"https://example.com/hook"}"#,
+            token,
+        ))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    json["data"]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn list_webhook_deliveries_returns_history_newest_first() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_id = register_webhook_endpoint(&app, &token, &wallet_id).await;
+    let endpoint_uuid: uuid::Uuid = endpoint_id.parse().unwrap();
+
+    // Seed 3 delivery attempts directly via the store, oldest first.
+    for i in 0..3 {
+        state
+            .store()
+            .log_webhook_delivery(
+                endpoint_uuid,
+                "transaction.sponsored",
+                &serde_json::json!({"seq": i}),
+                "delivered",
+                1,
+                Some(200),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}/deliveries");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let rows = j["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // Newest first: seq 2, then 1, then 0.
+    let seqs: Vec<i64> = rows
+        .iter()
+        .map(|r| r["payload"]["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, vec![2, 1, 0], "expected newest-first ordering");
+}
+
+#[tokio::test]
+async fn get_deliveries_for_an_endpoint_not_owned_by_the_wallet_in_the_url_is_404() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let owner_token = auth_token(&app).await;
+    let other_token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &owner_token))
+        .await
+        .unwrap();
+    let owner_wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_id = register_webhook_endpoint(&app, &owner_token, &owner_wallet_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &other_token))
+        .await
+        .unwrap();
+    let other_wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Querying the owner's endpoint id under a different (but validly owned) wallet must 404,
+    // not leak that the endpoint exists elsewhere.
+    let uri = format!("/v1/wallets/{other_wallet_id}/webhooks/{endpoint_id}/deliveries");
+    let resp = app.oneshot(get_auth(&uri, &other_token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_deliveries_respects_the_limit_parameter() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_id = register_webhook_endpoint(&app, &token, &wallet_id).await;
+    let endpoint_uuid: uuid::Uuid = endpoint_id.parse().unwrap();
+
+    for i in 0..5 {
+        state
+            .store()
+            .log_webhook_delivery(
+                endpoint_uuid,
+                "transaction.sponsored",
+                &serde_json::json!({"seq": i}),
+                "delivered",
+                1,
+                Some(200),
+            )
+            .await
+            .unwrap();
+    }
+
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}/deliveries?limit=2");
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&uri, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["data"].as_array().unwrap().len(), 2);
+
+    // Out-of-range limit is rejected rather than silently clamped.
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}/deliveries?limit=201");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
