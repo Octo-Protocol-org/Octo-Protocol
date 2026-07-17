@@ -162,6 +162,22 @@ pub fn open(
     Ok(Zeroizing::new(plaintext))
 }
 
+/// Rotate the master key protecting an already-sealed secret.
+///
+/// Opens `sealed` under `old_key`/`context`, then seals the recovered plaintext under `new_key`
+/// and the same `context`. The intermediate plaintext is wrapped in [`Zeroizing`] (as returned by
+/// [`open`]) and wiped on drop. The returned [`SealedSeed`] gets a fresh random nonce and salt, as
+/// [`seal`] always generates — it never reuses the original record's.
+pub fn reseal(
+    old_key: &[u8; MASTER_KEY_LEN],
+    new_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    context: &[u8],
+) -> Result<SealedSeed, CryptoError> {
+    let plaintext = open(old_key, sealed, context)?;
+    seal(new_key, plaintext.as_ref(), context)
+}
+
 /// Convenience: parse a 32-byte master key from a byte slice (e.g. decoded from a KMS/env value).
 pub fn master_key_from_slice(bytes: &[u8]) -> Result<[u8; MASTER_KEY_LEN], CryptoError> {
     bytes.try_into().map_err(|_| CryptoError::InvalidKeyLength)
@@ -275,6 +291,51 @@ mod tests {
         let mk = key();
         let sealed = seal(&mk, b"", CTX).unwrap();
         assert_eq!(open(&mk, &sealed, CTX).unwrap().as_slice(), b"");
+    }
+
+    #[test]
+    fn reseal_produces_a_record_openable_only_under_the_new_key() {
+        let old_mk = key();
+        let new_mk = key();
+        let secret = b"a 24-word BIP39 mnemonic seed lives here";
+        let sealed = seal(&old_mk, secret, CTX).unwrap();
+
+        let resealed = reseal(&old_mk, &new_mk, &sealed, CTX).unwrap();
+
+        assert_eq!(open(&new_mk, &resealed, CTX).unwrap().as_slice(), secret);
+        assert!(matches!(
+            open(&old_mk, &resealed, CTX),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn reseal_result_has_fresh_nonce_and_salt_distinct_from_the_original() {
+        let old_mk = key();
+        let new_mk = key();
+        let sealed = seal(&old_mk, b"seed", CTX).unwrap();
+
+        let resealed = reseal(&old_mk, &new_mk, &sealed, CTX).unwrap();
+
+        assert_ne!(resealed.nonce, sealed.nonce);
+        assert_ne!(resealed.salt, sealed.salt);
+    }
+
+    #[test]
+    fn reseal_fails_cleanly_if_old_key_or_context_is_wrong() {
+        let old_mk = key();
+        let new_mk = key();
+        let wrong_mk = key();
+        let sealed = seal(&old_mk, b"seed", CTX).unwrap();
+
+        assert!(matches!(
+            reseal(&wrong_mk, &new_mk, &sealed, CTX),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        assert!(matches!(
+            reseal(&old_mk, &new_mk, &sealed, b"octo:mainnet"),
+            Err(CryptoError::DecryptionFailed)
+        ));
     }
 
     #[test]
