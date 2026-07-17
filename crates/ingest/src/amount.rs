@@ -68,4 +68,31 @@ mod tests {
         assert_eq!(to_stroops("0.1000000"), Some(1_000_000));
         assert_eq!(to_stroops("0.2000000"), Some(2_000_000));
     }
+
+    #[test]
+    fn rejects_thousands_separators() {
+        assert_eq!(to_stroops("1,000.0000000"), None);
+    }
+
+    #[test]
+    fn rejects_scientific_notation() {
+        assert_eq!(to_stroops("1e5"), None);
+        assert_eq!(to_stroops("1E5"), None);
+    }
+
+    #[test]
+    fn rejects_multiple_decimal_points() {
+        assert_eq!(to_stroops("1.2.3"), None);
+        assert_eq!(to_stroops("0.100000000.500000"), None);
+    }
+
+    #[test]
+    fn overflowing_whole_units_returns_none_not_panic() {
+        assert_eq!(to_stroops("214748364700000.123"), None);
+    }
+
+    #[test]
+    fn leading_plus_sign_behavior_is_locked_in() {
+        assert_eq!(to_stroops("+1.0000000"), None);
+    }
 }
