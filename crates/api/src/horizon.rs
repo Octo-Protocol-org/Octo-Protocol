@@ -5,6 +5,16 @@
 
 use crate::error::ApiError;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Timeout for balance/sequence reads and friendbot funding — these are simple GETs against a
+/// Horizon-like endpoint and should be fast; a hung connection here must not block a request
+/// handler indefinitely.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Signed-transaction submission may legitimately take longer than a simple read (Horizon can hold
+/// the connection while the tx is validated/applied), so it gets a longer per-request override
+/// instead of raising the client's default for every call.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single balance line from a Horizon account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +64,10 @@ pub struct Horizon {
 impl Horizon {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(DEFAULT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.into(),
         }
     }
@@ -119,6 +132,7 @@ impl Horizon {
             .http
             .post(&url)
             .form(&[("tx", envelope_xdr)])
+            .timeout(SUBMIT_TIMEOUT)
             .send()
             .await
             .map_err(|_| ApiError::Internal)?;
@@ -149,12 +163,23 @@ impl Horizon {
 /// Fund a testnet account via friendbot. Best-effort: returns `Ok(())` on success, and a logged
 /// error otherwise (the caller decides whether funding is required).
 pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), ApiError> {
+    friendbot_fund_with_timeout(friendbot_url, account_g, DEFAULT_TIMEOUT).await
+}
+
+async fn friendbot_fund_with_timeout(
+    friendbot_url: &str,
+    account_g: &str,
+    timeout: Duration,
+) -> Result<(), ApiError> {
     let url = format!(
         "{}/?addr={}",
         friendbot_url.trim_end_matches('/'),
         account_g
     );
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default()
         .get(&url)
         .send()
         .await
@@ -163,5 +188,53 @@ pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), 
         Ok(())
     } else {
         Err(ApiError::Internal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Binds an ephemeral listener that accepts a connection and then holds it open forever
+    /// without reading or writing, so callers get no response and only the client's own timeout
+    /// ends the request. Returns the base URL to hit.
+    async fn hanging_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn horizon_client_times_out_and_maps_to_internal_error() {
+        let base_url = hanging_server().await;
+        let horizon = Horizon {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            base_url,
+        };
+
+        let result = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;
+        assert!(matches!(result, Err(ApiError::Internal)));
+    }
+
+    #[tokio::test]
+    async fn friendbot_fund_times_out_and_returns_an_error() {
+        let base_url = hanging_server().await;
+
+        let result = friendbot_fund_with_timeout(
+            &base_url,
+            "GABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Internal)));
     }
 }
