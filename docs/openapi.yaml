@@ -1,0 +1,391 @@
+openapi: 3.1.0
+info:
+  title: Octo Protocol API
+  version: 1.0.0
+  description: OpenAPI contract for the /v1 Octo Protocol routes.
+servers:
+  - url: /
+paths:
+  /v1/wallets:
+    post:
+      summary: Create a master wallet
+      operationId: createWallet
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                description:
+                  type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateWalletResponse'
+  /v1/wallets/{id}:
+    get:
+      summary: Get wallet details
+      operationId: getWallet
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletViewResponse'
+  /v1/wallets/{id}/addresses:
+    post:
+      summary: Generate a dedicated customer address
+      operationId: createAddress
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customer_ref:
+                  type: string
+                metadata:
+                  type: object
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAddressResponse'
+    get:
+      summary: List addresses
+      operationId: listAddresses
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListAddressesResponse'
+  /v1/wallets/{id}/withdraw:
+    post:
+      summary: Withdraw funds
+      operationId: withdraw
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                destination:
+                  type: string
+                amount_stroops:
+                  type: integer
+                asset:
+                  type: object
+                  properties:
+                    code:
+                      type: string
+                    issuer:
+                      type: string
+                  required:
+                    - code
+                    - issuer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawResponse'
+  /v1/wallets/{id}/transactions:
+    get:
+      summary: List transactions
+      operationId: listTransactions
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListTransactionsResponse'
+  /v1/webhooks:
+    post:
+      summary: Register a webhook
+      operationId: createWebhook
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                secret:
+                  type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+components:
+  schemas:
+    Envelope:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+    CreateWalletResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          required:
+            - id
+            - network
+            - address
+            - recovery_mnemonic
+          properties:
+            id:
+              type: string
+              format: uuid
+            network:
+              type: string
+            address:
+              type: string
+            recovery_mnemonic:
+              type: string
+    WalletViewResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          required:
+            - id
+            - network
+            - address
+          properties:
+            id:
+              type: string
+              format: uuid
+            network:
+              type: string
+            address:
+              type: string
+            label:
+              type: string
+            description:
+              type: string
+            balance_stroops:
+              type: integer
+    CreateAddressResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          required:
+            - id
+            - muxed_address
+            - base_address
+            - memo_id
+          properties:
+            id:
+              type: string
+              format: uuid
+            customer_ref:
+              type: string
+            muxed_address:
+              type: string
+            base_address:
+              type: string
+            memo_id:
+              type: integer
+    ListAddressesResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            required:
+              - id
+              - muxed_address
+              - base_address
+              - memo_id
+            properties:
+              id:
+                type: string
+                format: uuid
+              customer_ref:
+                type: string
+              muxed_address:
+                type: string
+              base_address:
+                type: string
+              memo_id:
+                type: integer
+    WithdrawResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          required:
+            - id
+            - status
+            - destination
+            - amount_stroops
+          properties:
+            id:
+              type: string
+              format: uuid
+            status:
+              type: string
+            stellar_tx_hash:
+              type: string
+            destination:
+              type: string
+            amount_stroops:
+              type: integer
+    ListTransactionsResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+    WebhookResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          required:
+            - id
+            - url
+            - secret
+            - active
+          properties:
+            id:
+              type: string
+              format: uuid
+            url:
+              type: string
+            secret:
+              type: string
+            active:
+              type: boolean
+    ErrorResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - error
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        error:
+          type: string
