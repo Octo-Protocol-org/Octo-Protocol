@@ -264,6 +264,16 @@ async fn addresses_on_unknown_wallet_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// DELETE with an Authorization bearer token.
+fn delete_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn post_json(uri: &str, body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -821,4 +831,157 @@ async fn list_sponsored_transactions_requires_auth() {
     );
     let resp = app.oneshot(get(&uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// --- webhook endpoint deactivation ------------------------------------------
+
+/// Register a webhook endpoint for `wallet_id` and return its id.
+async fn register_webhook_endpoint(app: &axum::Router, token: &str, wallet_id: &str) -> String {
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks");
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &uri,
+            r#"{"url":"https://example.com/hook"}"#,
+            token,
+        ))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    json["data"]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn delete_webhook_endpoint_deactivates_it_and_stops_further_deliveries() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let endpoint_id = register_webhook_endpoint(&app, &token, &wallet_id).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}");
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(&uri, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Deactivated endpoints no longer show up as active delivery targets.
+    let wallet_uuid: uuid::Uuid = wallet_id.parse().unwrap();
+    let active = state
+        .store()
+        .active_webhook_endpoints(wallet_uuid)
+        .await
+        .unwrap();
+    assert!(
+        active.is_empty(),
+        "endpoint must no longer be active after deactivation"
+    );
+
+    // Deactivation is idempotent: deactivating an already-inactive endpoint still succeeds.
+    let resp = app.oneshot(delete_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn delete_webhook_endpoint_on_unowned_wallet_is_404() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let owner_token = auth_token(&app).await;
+    let other_token = auth_token(&app).await;
+
+    // Endpoint belongs to the owner's wallet.
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &owner_token))
+        .await
+        .unwrap();
+    let owner_wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_id = register_webhook_endpoint(&app, &owner_token, &owner_wallet_id).await;
+
+    // A different wallet, owned by a different user, must not be able to deactivate it.
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &other_token))
+        .await
+        .unwrap();
+    let other_wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let uri = format!("/v1/wallets/{other_wallet_id}/webhooks/{endpoint_id}");
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(&uri, &other_token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The endpoint must remain untouched under its real owner.
+    let uri = format!("/v1/wallets/{owner_wallet_id}/webhooks/{endpoint_id}");
+    let resp = app
+        .oneshot(delete_auth(&uri, &owner_token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn delete_webhook_endpoint_records_an_audit_log_entry() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_id = register_webhook_endpoint(&app, &token, &wallet_id).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}");
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(&uri, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(get_auth("/v1/audit-logs?category=configuration", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let logs = body_json(resp).await;
+    let arr = logs["data"].as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|l| l["action"].as_str().unwrap_or("").contains("webhook")),
+        "expected a webhook deactivation audit entry, got {arr:?}"
+    );
 }

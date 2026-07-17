@@ -743,6 +743,27 @@ impl Store {
         Ok(rows)
     }
 
+    /// Deactivate a webhook endpoint, scoped to its owning wallet. Returns `StoreError::NotFound`
+    /// if the endpoint doesn't exist or belongs to a different wallet, so callers can 404 without
+    /// leaking whether the endpoint exists under another wallet.
+    pub async fn deactivate_webhook_endpoint(
+        &self,
+        wallet_id: Uuid,
+        endpoint_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE webhook_endpoints SET active = false WHERE id = $1 AND wallet_id = $2",
+        )
+        .bind(endpoint_id)
+        .bind(wallet_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.
     pub async fn log_webhook_delivery(
         &self,

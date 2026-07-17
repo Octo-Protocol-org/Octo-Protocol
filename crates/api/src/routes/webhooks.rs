@@ -68,6 +68,37 @@ pub async fn create_webhook(
     Ok((status, json))
 }
 
+/// `DELETE /v1/wallets/:id/webhooks/:endpoint_id`
+pub async fn delete_webhook(
+    State(state): State<AppState>,
+    Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+
+    state
+        .store()
+        .deactivate_webhook_endpoint(wallet_id, endpoint_id)
+        .await?;
+
+    // Best-effort audit entry; only recorded when the wallet has a login-owning user (API-key
+    // authorized requests may not).
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if let Some(uid) = wallet.user_id {
+        crate::audit::record(
+            &state,
+            uid,
+            "deactivated a webhook endpoint",
+            crate::audit::category::WEBHOOK,
+            wallet.label.as_deref(),
+            &headers,
+        )
+        .await;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Generate a random hex secret for HMAC signing.
 fn generate_secret() -> String {
     // A v4 UUID (122 bits of randomness) rendered without dashes is a fine webhook secret.
