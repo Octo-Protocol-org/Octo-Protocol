@@ -743,6 +743,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Deactivate a webhook endpoint by setting its active status to false.
+    pub async fn deactivate_webhook_endpoint(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE webhook_endpoints SET active = false WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.
     pub async fn log_webhook_delivery(
         &self,

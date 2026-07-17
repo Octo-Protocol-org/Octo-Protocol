@@ -367,3 +367,37 @@ async fn upsert_gas_sponsorship_config_works() {
         .expect("sum");
     assert_eq!(spent, 0);
 }
+
+#[tokio::test]
+async fn deactivate_webhook_endpoint_stops_it_from_appearing_in_active_webhook_endpoints() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // Create webhook endpoint
+    let ep = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/webhook", "supersecret")
+        .await
+        .expect("create webhook endpoint");
+
+    assert!(ep.active);
+
+    // Verify it appears in active_webhook_endpoints
+    let active = store.active_webhook_endpoints(wallet_id).await.expect("list active");
+    assert!(active.iter().any(|e| e.id == ep.id));
+
+    // Deactivate it
+    store.deactivate_webhook_endpoint(ep.id).await.expect("deactivate");
+
+    // Verify it no longer appears in active_webhook_endpoints
+    let active_after = store.active_webhook_endpoints(wallet_id).await.expect("list active");
+    assert!(!active_after.iter().any(|e| e.id == ep.id));
+}
+
+#[tokio::test]
+async fn deactivate_webhook_endpoint_on_nonexistent_id_is_a_no_op() {
+    let Some(store) = store().await else { return };
+    let random_id = Uuid::new_v4();
+    let res = store.deactivate_webhook_endpoint(random_id).await;
+    assert!(res.is_ok(), "deactivating nonexistent endpoint should be a no-op returning Ok, got: {res:?}");
+}
+
