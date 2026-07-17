@@ -76,9 +76,15 @@ pub async fn delete_webhook(
 ) -> ApiResult<StatusCode> {
     authorize_wallet(&headers, &state, wallet_id).await?;
 
+    // Don't leak whether the endpoint exists under a different wallet.
+    let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
+    if endpoint.wallet_id != wallet_id {
+        return Err(ApiError::NotFound);
+    }
+
     state
         .store()
-        .deactivate_webhook_endpoint(wallet_id, endpoint_id)
+        .deactivate_webhook_endpoint(endpoint_id)
         .await?;
 
     // Best-effort audit entry; only recorded when the wallet has a login-owning user (API-key

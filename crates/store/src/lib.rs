@@ -743,24 +743,22 @@ impl Store {
         Ok(rows)
     }
 
-    /// Deactivate a webhook endpoint, scoped to its owning wallet. Returns `StoreError::NotFound`
-    /// if the endpoint doesn't exist or belongs to a different wallet, so callers can 404 without
-    /// leaking whether the endpoint exists under another wallet.
-    pub async fn deactivate_webhook_endpoint(
-        &self,
-        wallet_id: Uuid,
-        endpoint_id: Uuid,
-    ) -> Result<(), StoreError> {
-        let result = sqlx::query(
-            "UPDATE webhook_endpoints SET active = false WHERE id = $1 AND wallet_id = $2",
-        )
-        .bind(endpoint_id)
-        .bind(wallet_id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
-        }
+    /// Fetch a single webhook endpoint by id, regardless of `active` state.
+    pub async fn get_webhook_endpoint(&self, id: Uuid) -> Result<WebhookEndpoint, StoreError> {
+        sqlx::query_as::<_, WebhookEndpoint>("SELECT * FROM webhook_endpoints WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// Deactivate a webhook endpoint so it stops receiving deliveries. A no-op if the id doesn't
+    /// exist (matches the update-by-id convention used elsewhere in this file).
+    pub async fn deactivate_webhook_endpoint(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE webhook_endpoints SET active = false WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
