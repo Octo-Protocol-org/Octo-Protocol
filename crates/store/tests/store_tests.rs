@@ -48,6 +48,7 @@ async fn fresh_wallet(store: &Store) -> Uuid {
             sealed_ciphertext: b"ciphertext",
             sealed_nonce: b"nonce12bytes",
             sealed_salt: b"saltsaltsaltsalt",
+            sealed_scheme: 1,
             label: Some("test"),
             user_id: None,
             description: None,
@@ -366,4 +367,205 @@ async fn upsert_gas_sponsorship_config_works() {
         .await
         .expect("sum");
     assert_eq!(spent, 0);
+}
+
+// ---------------------------------------------------------------------------
+// reseal_wallet / list_wallets_needing_reseal — batch migration (#132)
+// ---------------------------------------------------------------------------
+
+/// Helper: insert a wallet row whose scheme is set to a specific value directly via raw SQL
+/// so we can simulate pre-migration rows (scheme = 0) without going through `create_wallet`
+/// (which always writes scheme = 1).
+async fn insert_wallet_with_scheme(store: &Store, scheme: i16) -> Uuid {
+    let acct = format!("G{}", Uuid::new_v4().simple());
+    let id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO wallets
+            (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
+             sealed_scheme, label)
+        VALUES ('testnet', $1, $2, $3, $4, $5, 'migration-test')
+        RETURNING id
+        "#,
+    )
+    .bind(&acct)
+    .bind(b"ciphertext".as_ref())
+    .bind(b"nonce12bytes".as_ref())
+    .bind(b"saltsaltsaltsalt".as_ref())
+    .bind(scheme)
+    .fetch_one(store.pool())
+    .await
+    .expect("insert wallet with scheme");
+    id
+}
+
+/// `list_wallets_needing_reseal` returns only wallets whose scheme differs from the target,
+/// and is correctly filtered by the `after_id` cursor for resumable iteration.
+#[tokio::test]
+async fn list_wallets_needing_reseal_returns_only_non_target_scheme() {
+    let Some(store) = store().await else { return };
+
+    // Insert 3 wallets: two at scheme 0 (legacy sentinel) and one at scheme 1 (already migrated).
+    let id_a = insert_wallet_with_scheme(&store, 0).await;
+    let id_b = insert_wallet_with_scheme(&store, 0).await;
+    let _id_c = insert_wallet_with_scheme(&store, 1).await;
+
+    // list_wallets_needing_reseal(target=1) should only return a and b.
+    let needs_migration = store
+        .list_wallets_needing_reseal(1, 100, None)
+        .await
+        .expect("list_wallets_needing_reseal");
+
+    let ids: Vec<Uuid> = needs_migration.iter().map(|w| w.id).collect();
+    assert!(ids.contains(&id_a), "wallet with scheme 0 must appear");
+    assert!(ids.contains(&id_b), "wallet with scheme 0 must appear");
+    for w in &needs_migration {
+        assert_ne!(w.sealed_scheme, 1, "must not include already-migrated rows");
+    }
+}
+
+/// `reseal_wallet` atomically swaps the sealed bytes and updates the scheme tag.
+/// A second call with the same `expected_old_scheme` is a safe no-op (idempotency guard).
+#[tokio::test]
+async fn reseal_wallet_updates_scheme_and_is_idempotent() {
+    let Some(store) = store().await else { return };
+
+    let wallet_id = insert_wallet_with_scheme(&store, 0).await;
+
+    // Simulate a reseal: write new (fake) ciphertext and bump scheme to 1.
+    let updated = store
+        .reseal_wallet(
+            wallet_id,
+            b"new-ciphertext",
+            b"newnonce12by",
+            b"newsaltnewsaltnewsaltnewsaltnews",
+            1,   // new scheme
+            0,   // expected old scheme
+        )
+        .await
+        .expect("reseal_wallet");
+    assert!(updated, "first reseal must update the row");
+
+    // Verify the stored values changed.
+    let row: (Vec<u8>, i16) =
+        sqlx::query_as("SELECT sealed_ciphertext, sealed_scheme FROM wallets WHERE id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch row");
+    assert_eq!(row.0, b"new-ciphertext", "ciphertext must be updated");
+    assert_eq!(row.1, 1i16, "scheme must be updated to 1");
+
+    // A second call claiming the row is still at scheme 0 must be a no-op (row is now at 1).
+    let second = store
+        .reseal_wallet(
+            wallet_id,
+            b"should-not-overwrite",
+            b"newnonce12by",
+            b"newsaltnewsaltnewsaltnewsaltnews",
+            1,
+            0, // wrong expected_old_scheme → WHERE clause won't match
+        )
+        .await
+        .expect("second reseal call");
+    assert!(!second, "second reseal with stale expected_old_scheme must be a no-op");
+
+    // Ciphertext is still the first update's value.
+    let row2: (Vec<u8>,) =
+        sqlx::query_as("SELECT sealed_ciphertext FROM wallets WHERE id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch row2");
+    assert_eq!(row2.0, b"new-ciphertext", "no-op must not overwrite ciphertext");
+}
+
+/// Full migration backfill scenario: seed several wallets at scheme 0, run the batch in
+/// sub-batches (simulating an interrupted run), verify the second run completes the rest
+/// without re-sealing already-migrated rows.
+#[tokio::test]
+async fn batch_reseal_is_resumable_and_does_not_double_reseal() {
+    let Some(store) = store().await else { return };
+
+    // Seed 5 wallets at scheme 0.
+    let mut wallet_ids = Vec::new();
+    for _ in 0..5 {
+        wallet_ids.push(insert_wallet_with_scheme(&store, 0).await);
+    }
+
+    // --- First pass: process only the first 2 wallets (simulates interruption). ---
+    let first_batch = store
+        .list_wallets_needing_reseal(1, 2, None)
+        .await
+        .expect("first batch");
+    assert_eq!(first_batch.len(), 2, "first batch must return 2 rows");
+
+    let mut reseal_count_pass1 = 0usize;
+    for w in &first_batch {
+        let updated = store
+            .reseal_wallet(
+                w.id,
+                b"migrated-ciphertext",
+                b"newnonce12by",
+                b"newsaltnewsaltnewsaltnewsaltnews",
+                1,
+                0,
+            )
+            .await
+            .expect("reseal pass 1");
+        if updated {
+            reseal_count_pass1 += 1;
+        }
+    }
+    assert_eq!(reseal_count_pass1, 2, "both rows in first batch must be updated");
+
+    // --- Second pass: resume from after the last processed wallet. ---
+    let last_processed = first_batch.last().unwrap().id;
+    let second_batch = store
+        .list_wallets_needing_reseal(1, 100, Some(last_processed))
+        .await
+        .expect("second batch");
+
+    // Must return the remaining 3 wallets (those still at scheme 0 with id > last_processed).
+    assert!(
+        !second_batch.is_empty(),
+        "second batch must return the remaining un-migrated wallets"
+    );
+    for w in &second_batch {
+        assert_ne!(
+            w.sealed_scheme, 1,
+            "second batch must not include already-migrated rows"
+        );
+    }
+
+    let mut reseal_count_pass2 = 0usize;
+    for w in &second_batch {
+        let updated = store
+            .reseal_wallet(
+                w.id,
+                b"migrated-ciphertext",
+                b"newnonce12by",
+                b"newsaltnewsaltnewsaltnewsaltnews",
+                1,
+                0,
+            )
+            .await
+            .expect("reseal pass 2");
+        if updated {
+            reseal_count_pass2 += 1;
+        }
+    }
+    assert!(reseal_count_pass2 > 0, "second pass must migrate remaining wallets");
+
+    // --- Verify: no wallets remain at scheme 0 for the IDs we inserted. ---
+    let remaining = store
+        .list_wallets_needing_reseal(1, 100, None)
+        .await
+        .expect("final check");
+    for w in &remaining {
+        assert!(
+            !wallet_ids.contains(&w.id),
+            "wallet {} should have been migrated but still shows scheme {}",
+            w.id, w.sealed_scheme
+        );
+    }
 }

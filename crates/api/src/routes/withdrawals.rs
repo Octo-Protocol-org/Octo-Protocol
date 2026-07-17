@@ -120,10 +120,11 @@ pub async fn withdraw(
         .await?;
 
     // --- sign inside wallet-core (decrypt -> derive -> sign -> zeroize) ---
-    let sealed = SealedSeed::from_parts(
+    let sealed = SealedSeed::from_parts_with_scheme(
         wallet.sealed_ciphertext.clone(),
         &wallet.sealed_nonce,
         &wallet.sealed_salt,
+        wallet.sealed_scheme as u8,
     )
     .map_err(|_| ApiError::Internal)?;
 
@@ -138,7 +139,7 @@ pub async fn withdraw(
         memo_id: req.memo_id.map(|m| m as u64),
         sequence: seq + 1, // next sequence
     };
-    let signed = sign_payment(state.master_key(), &sealed, state.network(), 0, &payment)?;
+    let signed = sign_payment(state.master_key_for_scheme(wallet.sealed_scheme), &sealed, state.network(), 0, &payment)?;
 
     // --- submit to Horizon ---
     let submit = state

@@ -40,6 +40,8 @@ pub struct NewWallet<'a> {
     pub sealed_ciphertext: &'a [u8],
     pub sealed_nonce: &'a [u8],
     pub sealed_salt: &'a [u8],
+    /// Scheme version tag for the sealed seed. Use `octo_crypto::SCHEME_V1`.
+    pub sealed_scheme: i16,
     pub label: Option<&'a str>,
     pub user_id: Option<Uuid>,
     pub description: Option<&'a str>,
@@ -224,9 +226,9 @@ impl Store {
         sqlx::query_as::<_, Wallet>(
             r#"
             INSERT INTO wallets
-                (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt, label,
-                 user_id, description)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
+                 sealed_scheme, label, user_id, description)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -235,6 +237,7 @@ impl Store {
         .bind(new.sealed_ciphertext)
         .bind(new.sealed_nonce)
         .bind(new.sealed_salt)
+        .bind(new.sealed_scheme)
         .bind(new.label)
         .bind(new.user_id)
         .bind(new.description)
@@ -269,6 +272,78 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)
+    }
+
+    /// Atomically swap the sealed seed material for a single wallet after a reseal/key-rotation.
+    ///
+    /// The caller (typically `bin/migrate-keys`) opens the old seed with the old master key,
+    /// re-seals it with the new master key via `octo_crypto::reseal`, and then calls this method
+    /// to persist the result. The `expected_scheme` guard ensures idempotency: if the row was
+    /// already migrated (e.g. by a concurrent runner) the update is silently skipped rather than
+    /// overwriting a newer record.
+    ///
+    /// Returns `true` if the row was updated, `false` if it was already on the target scheme.
+    pub async fn reseal_wallet(
+        &self,
+        wallet_id: Uuid,
+        new_ciphertext: &[u8],
+        new_nonce: &[u8],
+        new_salt: &[u8],
+        new_scheme: i16,
+        expected_old_scheme: i16,
+    ) -> Result<bool, StoreError> {
+        // Only update the row if it still carries the old scheme — this is the idempotency guard.
+        // A concurrent runner that already migrated this wallet will have set sealed_scheme to
+        // `new_scheme`, so the WHERE clause won't match and no double-reseal can occur.
+        let result = sqlx::query(
+            r#"
+            UPDATE wallets
+            SET sealed_ciphertext = $2,
+                sealed_nonce       = $3,
+                sealed_salt        = $4,
+                sealed_scheme      = $5,
+                updated_at         = now()
+            WHERE id = $1
+              AND sealed_scheme = $6
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(new_ciphertext)
+        .bind(new_nonce)
+        .bind(new_salt)
+        .bind(new_scheme)
+        .bind(expected_old_scheme)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Fetch a page of wallets whose `sealed_scheme` does not equal `target_scheme`, for the
+    /// migration backfill job. Returns at most `batch_size` rows ordered by `id` (stable for
+    /// resumable cursored iteration). Pass the last returned wallet's `id` as `after_id` on
+    /// subsequent calls to page through the full table without re-scanning already-migrated rows.
+    pub async fn list_wallets_needing_reseal(
+        &self,
+        target_scheme: i16,
+        batch_size: i64,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE sealed_scheme <> $1
+              AND ($2::uuid IS NULL OR id > $2)
+            ORDER BY id
+            LIMIT $3
+            "#,
+        )
+        .bind(target_scheme)
+        .bind(after_id)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     // --- addresses --------------------------------------------------------

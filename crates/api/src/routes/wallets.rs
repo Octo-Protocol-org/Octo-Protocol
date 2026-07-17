@@ -69,6 +69,7 @@ pub async fn create_wallet(
             sealed_ciphertext: &provisioned.sealed.ciphertext,
             sealed_nonce: &provisioned.sealed.nonce,
             sealed_salt: &provisioned.sealed.salt,
+            sealed_scheme: i16::from(provisioned.sealed.scheme),
             label: label.as_deref(),
             user_id: Some(user_id),
             description: description.as_deref(),
