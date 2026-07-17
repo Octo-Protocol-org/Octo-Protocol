@@ -413,6 +413,24 @@ impl Store {
 
     // --- withdrawals ------------------------------------------------------
 
+    /// Cheap existence check on `(wallet_id, idempotency_key)`, used to short-circuit a retried
+    /// request with a 409 **before** running any pre-flight Horizon checks — a key that has
+    /// already been consumed doesn't need its request re-validated against the chain.
+    pub async fn withdrawal_exists(
+        &self,
+        wallet_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool, StoreError> {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM withdrawals WHERE wallet_id = $1 AND idempotency_key = $2",
+        )
+        .bind(wallet_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
     /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
     /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
     pub async fn create_withdrawal(
