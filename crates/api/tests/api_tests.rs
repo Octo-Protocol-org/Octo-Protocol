@@ -41,14 +41,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-fn post(uri: &str) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap()
-}
-
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
