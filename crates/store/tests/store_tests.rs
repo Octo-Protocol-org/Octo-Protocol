@@ -353,6 +353,38 @@ async fn cursor_roundtrip() {
 }
 
 #[tokio::test]
+async fn migrate_is_idempotent_when_run_twice() {
+    let Some(store) = store().await else { return };
+    // `store()` already ran migrate() once during setup; running it again against the same
+    // already-migrated database mirrors a server restart (bin/server/src/main.rs calls
+    // store.migrate().await on every boot) and must be a safe no-op, not an error.
+    store
+        .migrate()
+        .await
+        .expect("second migrate() call must succeed with no error");
+}
+
+#[tokio::test]
+async fn migrate_applies_exactly_the_expected_version_set() {
+    let Some(store) = store().await else { return };
+
+    let mut versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version",
+    )
+    .fetch_all(store.pool())
+    .await
+    .expect("query _sqlx_migrations");
+    versions.sort_unstable();
+
+    // One version per file under crates/store/migrations/ (0001_init.sql .. 0007_gas_sponsorship.sql).
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "expected exactly the seven known migrations to be recorded as applied"
+    );
+}
+
+#[tokio::test]
 async fn upsert_gas_sponsorship_config_works() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
