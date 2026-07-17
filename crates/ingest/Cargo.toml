@@ -25,3 +25,4 @@ tokio.workspace = true
 dotenvy = "0.15"
 axum.workspace = true
 octo-webhooks.workspace = true
+wiremock = "=0.6.0"
