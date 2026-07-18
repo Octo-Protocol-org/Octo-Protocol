@@ -289,4 +289,55 @@ mod tests {
             Err(CryptoError::InvalidKeyLength)
         ));
     }
+
+    // ---------------------------------------------------------------------------
+    // Size-boundary tests
+    //
+    // HKDF-SHA256 can expand up to 255 * 32 = 8 160 bytes of output.  This crate
+    // always requests exactly 32 bytes, so the expansion limit is never approached
+    // regardless of plaintext size.  The GCM ciphertext-length invariant is:
+    //
+    //     ciphertext.len() == plaintext.len() + 16   (16-byte authentication tag)
+    //
+    // The tests below assert that invariant and verify seal/open round-trips for
+    // each size class: 0, 1, 64 (HD seed), 1 024, and 1 048 576 bytes (1 MiB).
+    // ---------------------------------------------------------------------------
+
+    /// Table-driven seal→open roundtrip across the full range of supported sizes.
+    #[test]
+    fn seal_open_roundtrips_across_size_range() {
+        let mk = key();
+        for &size in &[0usize, 1, 64, 1_024, 1_048_576] {
+            let plaintext: Vec<u8> = (0..size).map(|i| (i & 0xff) as u8).collect();
+            let sealed = seal(&mk, &plaintext, CTX)
+                .unwrap_or_else(|e| panic!("seal failed for size {size}: {e:?}"));
+            let opened = open(&mk, &sealed, CTX)
+                .unwrap_or_else(|e| panic!("open failed for size {size}: {e:?}"));
+            assert_eq!(
+                opened.as_slice(),
+                plaintext.as_slice(),
+                "roundtrip mismatch for size {size}"
+            );
+        }
+    }
+
+    /// The GCM ciphertext is always exactly plaintext.len() + 16 (the authentication tag).
+    #[test]
+    fn ciphertext_length_is_plaintext_plus_tag_across_size_range() {
+        const GCM_TAG_LEN: usize = 16;
+        let mk = key();
+        for &size in &[0usize, 1, 64, 1_024, 1_048_576] {
+            let plaintext: Vec<u8> = vec![0xab; size];
+            let sealed = seal(&mk, &plaintext, CTX)
+                .unwrap_or_else(|e| panic!("seal failed for size {size}: {e:?}"));
+            assert_eq!(
+                sealed.ciphertext.len(),
+                size + GCM_TAG_LEN,
+                "ciphertext length wrong for plaintext size {size}: \
+                 expected {}, got {}",
+                size + GCM_TAG_LEN,
+                sealed.ciphertext.len()
+            );
+        }
+    }
 }
