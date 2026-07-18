@@ -22,6 +22,39 @@ use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::time::Duration;
 use uuid::Uuid;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Shared thread-safe tracker for the last successful poll times of ingestion.
+#[derive(Debug, Clone, Default)]
+pub struct LastPollTracker {
+    last_polls: Arc<Mutex<HashMap<Uuid, i64>>>,
+}
+
+impl LastPollTracker {
+    /// Create a new empty `LastPollTracker`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a successful poll for a wallet.
+    pub fn record_success(&self, wallet_id: Uuid, timestamp: i64) {
+        if let Ok(mut map) = self.last_polls.lock() {
+            map.insert(wallet_id, timestamp);
+        }
+    }
+
+    /// Get the last successful poll timestamp (unix-seconds) for a wallet.
+    pub fn last_poll(&self, wallet_id: Uuid) -> Option<i64> {
+        self.last_polls.lock().ok().and_then(|map| map.get(&wallet_id).copied())
+    }
+
+    /// Get a copy of all tracked poll times.
+    pub fn all_last_polls(&self) -> HashMap<Uuid, i64> {
+        self.last_polls.lock().map(|map| map.clone()).unwrap_or_default()
+    }
+}
+
 
 /// Outcome of processing a single payment record.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,6 +74,7 @@ pub struct Ingestor {
     wallet_id: Uuid,
     account_g: String,
     webhooks: Option<WebhookSender>,
+    tracker: Option<LastPollTracker>,
 }
 
 impl Ingestor {
@@ -51,12 +85,19 @@ impl Ingestor {
             wallet_id,
             account_g,
             webhooks: None,
+            tracker: None,
         }
     }
 
     /// Attach a webhook sender so new deposits fire a `deposit.created` event.
     pub fn with_webhooks(mut self, sender: WebhookSender) -> Self {
         self.webhooks = Some(sender);
+        self
+    }
+
+    /// Attach a tracker to record successful poll times.
+    pub fn with_tracker(mut self, tracker: LastPollTracker) -> Self {
+        self.tracker = Some(tracker);
         self
     }
 
@@ -79,6 +120,15 @@ impl Ingestor {
                 .await?;
             count += 1;
         }
+
+        if let Some(ref tracker) = self.tracker {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            tracker.record_success(self.wallet_id, now);
+        }
+
         Ok(count)
     }
 
@@ -257,6 +307,7 @@ pub struct Supervisor {
     horizon_url: String,
     webhooks: WebhookSender,
     network: &'static str,
+    tracker: LastPollTracker,
 }
 
 impl Supervisor {
@@ -271,6 +322,7 @@ impl Supervisor {
             horizon_url,
             webhooks,
             network,
+            tracker: LastPollTracker::new(),
         }
     }
 
@@ -298,13 +350,28 @@ impl Supervisor {
                 w.id,
                 w.stellar_account_g.clone(),
             )
-            .with_webhooks(self.webhooks.clone());
+            .with_webhooks(self.webhooks.clone())
+            .with_tracker(self.tracker.clone());
             match ingestor.poll_once(page_limit).await {
                 Ok(n) => total += n,
                 Err(e) => tracing::warn!(wallet = %w.id, error = ?e, "wallet poll failed"),
             }
         }
         Ok(total)
+    }
+
+    /// Get a clone of the `LastPollTracker` to inspect poll lag.
+    ///
+    /// # Example
+    /// ```
+    /// # use octo_ingest::{Supervisor, LastPollTracker};
+    /// # // How a caller (like AppState or a health router) reads poll timestamps:
+    /// # // let supervisor: Supervisor = ...;
+    /// # // let tracker: LastPollTracker = supervisor.last_poll_tracker();
+    /// # // if let Some(ts) = tracker.last_poll(wallet_id) { ... }
+    /// ```
+    pub fn last_poll_tracker(&self) -> LastPollTracker {
+        self.tracker.clone()
     }
 }
 
