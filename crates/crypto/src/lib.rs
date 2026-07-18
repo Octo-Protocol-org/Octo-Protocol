@@ -321,6 +321,63 @@ mod tests {
         }
     }
 
+    /// Splicing fields from two independently-sealed records always fails authentication.
+    ///
+    /// We seal two different plaintexts under the same master key but with *different* contexts,
+    /// producing records A and B. Every cross-combination of
+    ///
+    ///   {A.ciphertext, B.ciphertext} × {A.nonce, B.nonce} × {A.salt, B.salt}
+    ///
+    /// is then tried under both contexts. The only combinations that could possibly succeed are
+    /// the two identity combinations (A opened under ctx_a, B opened under ctx_b); those are
+    /// excluded from the loop. All remaining 2×2×2×2 − 2 = 14 combinations must return
+    /// `Err(CryptoError::DecryptionFailed)`.
+    #[test]
+    fn spliced_sealed_seed_fields_never_decrypt() {
+        let mk = key();
+        let ctx_a: &[u8] = b"octo:mainnet";
+        let ctx_b: &[u8] = b"octo:testnet";
+
+        let a = seal(&mk, b"plaintext-alpha", ctx_a).unwrap();
+        let b = seal(&mk, b"plaintext-beta", ctx_b).unwrap();
+
+        let ciphertexts = [(&a.ciphertext, "A.ct"), (&b.ciphertext, "B.ct")];
+        let nonces = [(&a.nonce[..], "A.nonce"), (&b.nonce[..], "B.nonce")];
+        let salts = [(&a.salt[..], "A.salt"), (&b.salt[..], "B.salt")];
+        let contexts = [(ctx_a, "ctx_a"), (ctx_b, "ctx_b")];
+
+        for (ct, ct_label) in &ciphertexts {
+            for (nonce, nonce_label) in &nonces {
+                for (salt, salt_label) in &salts {
+                    for (ctx, ctx_label) in &contexts {
+                        // Skip the two identity combinations that are supposed to succeed.
+                        let is_identity_a = std::ptr::eq(*ct, &a.ciphertext)
+                            && std::ptr::eq(*nonce, &a.nonce[..])
+                            && std::ptr::eq(*salt, &a.salt[..])
+                            && std::ptr::eq(*ctx, ctx_a);
+                        let is_identity_b = std::ptr::eq(*ct, &b.ciphertext)
+                            && std::ptr::eq(*nonce, &b.nonce[..])
+                            && std::ptr::eq(*salt, &b.salt[..])
+                            && std::ptr::eq(*ctx, ctx_b);
+                        if is_identity_a || is_identity_b {
+                            continue;
+                        }
+
+                        let spliced =
+                            SealedSeed::from_parts((*ct).clone(), nonce, salt).unwrap();
+                        let result = open(&mk, &spliced, ctx);
+                        assert!(
+                            matches!(result, Err(CryptoError::DecryptionFailed)),
+                            "expected DecryptionFailed for splice \
+                             ({ct_label}, {nonce_label}, {salt_label}, {ctx_label}), \
+                             got {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The GCM ciphertext is always exactly plaintext.len() + 16 (the authentication tag).
     #[test]
     fn ciphertext_length_is_plaintext_plus_tag_across_size_range() {
