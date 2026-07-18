@@ -485,6 +485,15 @@ async fn api_key_for(app: &axum::Router, token: &str, wallet_id: &str) -> String
         .to_string()
 }
 
+fn delete_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn api_key_can_create_address_on_its_wallet() {
     let Some(state) = test_state().await else {
@@ -563,6 +572,169 @@ async fn api_key_cannot_touch_another_wallet() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_api_key_revokes_it_and_subsequent_calls_using_it_are_401() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Create a wallet and generate an API key.
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = api_key_for(&app, &token, &wallet_id).await;
+
+    // The key works for authenticated requests.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/addresses"),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Revoke the key via the dashboard.
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The revoked key no longer works — 401.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/addresses"),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // GET metadata confirms no key configured.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/wallets/{wallet_id}/api-key"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"]["configured"], false);
+}
+
+#[tokio::test]
+async fn delete_api_key_requires_wallet_ownership() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+
+    // User A creates a wallet with an API key.
+    let token_a = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token_a))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    api_key_for(&app, &token_a, &wallet_id).await;
+
+    // User B cannot revoke A's key → 404 (not revealed).
+    let token_b = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &token_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_api_key_on_a_wallet_with_no_key_is_ok() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Create a wallet without generating a key.
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // DELETE on a wallet with no key is still OK (idempotent).
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn delete_api_key_rejects_api_key_auth() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = api_key_for(&app, &token, &wallet_id).await;
+
+    // An API key cannot revoke itself — only dashboard JWT works.
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
