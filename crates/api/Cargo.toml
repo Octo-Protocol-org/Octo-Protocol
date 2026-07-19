@@ -41,3 +41,5 @@ sqlx.workspace = true
 stellar-base.workspace = true
 dotenvy = "0.15"
 reqwest.workspace = true
+serde_yaml = "0.9.34"
+jsonschema = "0.46.10"
