@@ -5,6 +5,7 @@
 //! Modules:
 //! - [`derive`]  — SEP-0005 key derivation from a BIP39 mnemonic (`m/44'/148'/index'`).
 //! - [`address`] — muxed (`M...`) primary + `G...`+memo fallback deposit addresses.
+//! - [`asset`]   — shared Stellar credit-asset code validation.
 //! - [`signer`]  — open a sealed seed, build & sign a **payment** (no raw-XDR oracle), zeroize.
 //!
 //! See `docs/architecture.md` and `docs/threat-model.md`.
@@ -16,6 +17,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod address;
+pub mod asset;
 pub mod derive;
 mod error;
 pub mod provision;
@@ -24,6 +26,7 @@ pub mod signer;
 pub use address::{
     decode_muxed, deposit_address, encode_muxed, is_valid_account, DecodedMuxed, DepositAddress,
 };
+pub use asset::is_valid_asset_code;
 pub use derive::WalletSeed;
 pub use error::WalletError;
 pub use provision::{import_wallet, provision_wallet, ProvisionedWallet};

@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_crypto::SealedSeed;
-use octo_wallet_core::{is_valid_account, sign_payment, PaymentRequest};
+use octo_wallet_core::{is_valid_account, is_valid_asset_code, sign_payment, PaymentRequest};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -97,9 +97,7 @@ pub async fn withdraw(
         None => ("native".to_string(), None),
         Some(a) => {
             if !is_valid_asset_code(&a.code) {
-                return Err(ApiError::BadRequest(
-                    "asset code must be 1-12 alphanumeric characters".into(),
-                ));
+                return Err(ApiError::BadRequest("invalid asset code".into()));
             }
             if !is_valid_account(&a.issuer) {
                 return Err(ApiError::BadRequest("invalid asset issuer".into()));
