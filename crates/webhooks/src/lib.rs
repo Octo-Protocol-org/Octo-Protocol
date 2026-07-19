@@ -230,4 +230,33 @@ mod tests {
         assert!(is_safe_url("http://172.15.0.1/x"));
         assert!(is_safe_url("http://172.32.0.1/x"));
     }
+
+    #[test]
+    fn decimal_ip_literal_loopback_bypass_is_documented() {
+        // KNOWN GAP: is_safe_url uses naive string matching instead of IP parsing.
+        // The decimal encoding of 127.0.0.1 (2130706433) bypasses the checks.
+        assert!(is_safe_url("http://2130706433/hook"), "decimal IP bypasses checks");
+    }
+
+    #[test]
+    fn octal_ip_literal_loopback_bypass_is_documented() {
+        // KNOWN GAP: is_safe_url uses naive string matching instead of IP parsing.
+        // The octal encoding of 127.0.0.1 (0177.0.0.1) bypasses the checks.
+        assert!(is_safe_url("http://0177.0.0.1/hook"), "octal IP bypasses checks");
+    }
+
+    #[test]
+    fn hex_ip_literal_loopback_bypass_is_documented() {
+        // KNOWN GAP: is_safe_url uses naive string matching instead of IP parsing.
+        // The hex encoding of 127.0.0.1 (0x7f000001) bypasses the checks.
+        assert!(is_safe_url("http://0x7f000001/hook"), "hex IP bypasses checks");
+    }
+
+    #[test]
+    fn ipv6_loopback_and_mapped_forms_bypass_is_documented() {
+        // KNOWN GAP: is_safe_url incorrectly splits on ':' which breaks IPv6 literal parsing,
+        // and it does not recognize IPv6 mapped addresses.
+        assert!(is_safe_url("http://[::1]/hook"), "IPv6 loopback bypasses checks");
+        assert!(is_safe_url("http://[::ffff:127.0.0.1]/hook"), "IPv4-mapped IPv6 bypasses checks");
+    }
 }
