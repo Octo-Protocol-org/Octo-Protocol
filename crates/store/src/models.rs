@@ -101,6 +101,21 @@ pub struct WebhookEndpoint {
     pub created_at: DateTime<Utc>,
 }
 
+/// A logged attempt to deliver a webhook event.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WebhookDelivery {
+    pub id: Uuid,
+    pub endpoint_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempts: i32,
+    pub response_code: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+
 /// An audit-log entry (append-only record of account activity).
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct AuditLog {

@@ -12,10 +12,14 @@ import {
   withdraw,
   amountToStroops,
   stroopsToAmount,
+  listWebhooks,
+  listWebhookDeliveries,
   type WalletView,
   type Balance,
   type Address,
   type Transaction,
+  type WebhookEndpoint,
+  type WebhookDelivery,
 } from "@/lib/wallets";
 import { WalletSidebar } from "@/components/dashboard/WalletSidebar";
 import { Modal, CopyField } from "@/components/dashboard/Modal";
@@ -36,11 +40,36 @@ export default function WalletOverview({
   const [creating, setCreating] = useState(false);
   const [showDeposit, setShowDeposit] = useState(false);
   const [showWithdraw, setShowWithdraw] = useState(false);
+  const [endpoints, setEndpoints] = useState<WebhookEndpoint[]>([]);
+  const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
+  const [loadingDeliveries, setLoadingDeliveries] = useState(false);
+
+  const loadWebhooksAndDeliveries = (authToken: string) => {
+    listWebhooks(authToken, id)
+      .then((eps) => {
+        setEndpoints(eps);
+        const active = eps.find((ep) => ep.active);
+        if (active) {
+          setLoadingDeliveries(true);
+          listWebhookDeliveries(authToken, id, active.id)
+            .then(setDeliveries)
+            .catch(() => setDeliveries([]))
+            .finally(() => setLoadingDeliveries(false));
+        } else {
+          setDeliveries([]);
+        }
+      })
+      .catch(() => {
+        setEndpoints([]);
+        setDeliveries([]);
+      });
+  };
 
   function refresh() {
     if (!token) return;
     getBalances(token, id).then(setBalances).catch(() => {});
     listTransactions(token, id).then(setTxns).catch(() => {});
+    loadWebhooksAndDeliveries(token);
   }
 
   useEffect(() => {
@@ -49,6 +78,7 @@ export default function WalletOverview({
     getBalances(token, id).then(setBalances).catch(() => setBalances([]));
     listAddresses(token, id).then(setAddresses).catch(() => setAddresses([]));
     listTransactions(token, id).then(setTxns).catch(() => setTxns([]));
+    loadWebhooksAndDeliveries(token);
   }, [token, id]);
 
   async function onNewAddress() {
@@ -248,6 +278,79 @@ export default function WalletOverview({
                     ))}
                   </tbody>
                 </table>
+              )}
+            </Panel>
+
+            {/* Webhook Delivery History */}
+            <Panel title="Webhook delivery history">
+              {endpoints.length === 0 ? (
+                <Empty>
+                  No webhook endpoints registered. Register one in the{" "}
+                  <Link href={`/dashboard/wallets/${id}/api`} className="text-burgundy-bright hover:underline">
+                    Developers tab
+                  </Link>{" "}
+                  to start receiving event notifications.
+                </Empty>
+              ) : loadingDeliveries ? (
+                <Empty>Loading delivery history…</Empty>
+              ) : deliveries.length === 0 ? (
+                <Empty>No webhook deliveries logged yet.</Empty>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm">
+                    <thead className="text-xs uppercase tracking-wide text-muted">
+                      <tr>
+                        <th className="py-2 pr-4">Date</th>
+                        <th className="py-2 pr-4">Event Type</th>
+                        <th className="py-2 pr-4">Status</th>
+                        <th className="py-2 pr-4 text-center">Attempts</th>
+                        <th className="py-2 text-right">Response Code</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {deliveries.map((d) => {
+                        const isSuccess = d.status === "delivered";
+                        const isFailed = d.status === "failed";
+                        const statusCls = isSuccess
+                          ? "bg-emerald-500/15 text-emerald-400"
+                          : isFailed
+                            ? "bg-red-500/15 text-red-400"
+                            : "bg-amber-500/15 text-amber-400";
+                        
+                        let codeCls = "text-muted";
+                        if (d.response_code !== null) {
+                          if (d.response_code >= 200 && d.response_code < 300) {
+                            codeCls = "text-emerald-400 font-semibold";
+                          } else {
+                            codeCls = "text-red-400 font-semibold";
+                          }
+                        }
+
+                        return (
+                          <tr key={d.id} className="text-foreground/90">
+                            <td className="py-3 pr-4 text-xs text-muted whitespace-nowrap">
+                              {formatDateTime(d.created_at)}
+                            </td>
+                            <td className="py-3 pr-4 font-mono text-xs text-foreground/80">
+                              {d.event_type}
+                            </td>
+                            <td className="py-3 pr-4">
+                              <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${statusCls}`}>
+                                {d.status}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-4 text-center text-xs">
+                              {d.attempts}
+                            </td>
+                            <td className={`py-3 text-right font-mono text-xs ${codeCls}`}>
+                              {d.response_code ?? "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </Panel>
           </main>
@@ -501,4 +604,21 @@ function Panel({
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="py-6 text-center text-sm text-muted">{children}</p>;
+}
+
+function formatDateTime(iso: string): string {
+  const d = new Date(iso);
+  const date = d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+  const time = d.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  });
+  return `${date} · ${time} UTC`;
 }
