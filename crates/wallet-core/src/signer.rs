@@ -658,10 +658,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: 200,
-            },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap();
 
@@ -703,10 +700,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: 200,
-            },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap();
 
@@ -733,10 +727,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: 200,
-            },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap();
 
@@ -760,10 +751,7 @@ mod tests {
                 &sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest {
-                    inner_xdr: "",
-                    max_base_fee_stroops: 200,
-                },
+                &FeeBumpRequest { inner_xdr: "", max_base_fee_stroops: 200 },
             ),
             Err(WalletError::InvalidXdr)
         ));
@@ -782,10 +770,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: 200,
-            },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap()
         .envelope_xdr;
@@ -797,10 +782,7 @@ mod tests {
                 &sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest {
-                    inner_xdr: &fee_bump_xdr,
-                    max_base_fee_stroops: 200,
-                },
+                &FeeBumpRequest { inner_xdr: &fee_bump_xdr, max_base_fee_stroops: 200 },
             ),
             Err(WalletError::InvalidXdr)
         ));
@@ -818,10 +800,7 @@ mod tests {
                 &mainnet_sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest {
-                    inner_xdr: &inner_xdr,
-                    max_base_fee_stroops: 200,
-                },
+                &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
             ),
             Err(WalletError::SeedDecryption)
         ));
@@ -840,10 +819,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: max_base_fee,
-            },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: max_base_fee },
         )
         .unwrap();
 
@@ -869,10 +845,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: 200,
-            },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
