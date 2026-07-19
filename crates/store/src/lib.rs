@@ -1037,13 +1037,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fetch a single webhook endpoint by id, regardless of `active` state.
-    pub async fn get_webhook_endpoint(&self, id: Uuid) -> Result<WebhookEndpoint, StoreError> {
-        sqlx::query_as::<_, WebhookEndpoint>("SELECT * FROM webhook_endpoints WHERE id = $1")
+    /// Deactivate a webhook endpoint by setting its active status to false.
+    pub async fn deactivate_webhook_endpoint(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE webhook_endpoints SET active = false WHERE id = $1")
             .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::NotFound)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.
