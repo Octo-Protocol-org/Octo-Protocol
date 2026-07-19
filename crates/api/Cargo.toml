@@ -13,6 +13,7 @@ octo-crypto.workspace = true
 octo-wallet-core.workspace = true
 octo-store.workspace = true
 octo-webhooks.workspace = true
+octo-resilience.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

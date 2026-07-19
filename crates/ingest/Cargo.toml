@@ -12,6 +12,7 @@ authors.workspace = true
 octo-store.workspace = true
 octo-wallet-core.workspace = true
 octo-webhooks.workspace = true
+octo-resilience.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 serde.workspace = true

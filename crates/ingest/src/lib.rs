@@ -54,6 +54,25 @@ impl Ingestor {
         }
     }
 
+    /// Create an Ingestor with explicit resilience configuration (used by `Supervisor::tick`
+    /// when `bin/server` wires env-var resilience config through).
+    pub fn new_with_resilience(
+        store: Store,
+        horizon_url: &str,
+        wallet_id: Uuid,
+        account_g: String,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
+    ) -> Self {
+        Self {
+            store,
+            horizon: HorizonPayments::with_resilience(horizon_url, retry, circuit),
+            wallet_id,
+            account_g,
+            webhooks: None,
+        }
+    }
+
     /// Attach a webhook sender so new deposits fire a `deposit.created` event.
     pub fn with_webhooks(mut self, sender: WebhookSender) -> Self {
         self.webhooks = Some(sender);
@@ -257,6 +276,8 @@ pub struct Supervisor {
     horizon_url: String,
     webhooks: WebhookSender,
     network: &'static str,
+    retry: octo_resilience::RetryPolicy,
+    circuit: octo_resilience::CircuitBreaker,
 }
 
 impl Supervisor {
@@ -271,6 +292,27 @@ impl Supervisor {
             horizon_url,
             webhooks,
             network,
+            retry: octo_resilience::RetryPolicy::default(),
+            circuit: octo_resilience::CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
+        }
+    }
+
+    /// Create a Supervisor with explicit resilience configuration (used by `bin/server`).
+    pub fn new_with_resilience(
+        store: Store,
+        horizon_url: String,
+        webhooks: WebhookSender,
+        network: &'static str,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
+    ) -> Self {
+        Self {
+            store,
+            horizon_url,
+            webhooks,
+            network,
+            retry,
+            circuit,
         }
     }
 
@@ -292,11 +334,13 @@ impl Supervisor {
             if w.network != self.network {
                 continue;
             }
-            let ingestor = Ingestor::new(
+            let ingestor = Ingestor::new_with_resilience(
                 self.store.clone(),
                 &self.horizon_url,
                 w.id,
                 w.stellar_account_g.clone(),
+                self.retry.clone(),
+                self.circuit.clone(),
             )
             .with_webhooks(self.webhooks.clone());
             match ingestor.poll_once(page_limit).await {

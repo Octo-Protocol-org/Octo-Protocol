@@ -4,6 +4,7 @@ use crate::error::ApiError;
 use crate::horizon::Horizon;
 use base64::Engine;
 use octo_crypto::{master_key_from_slice, MASTER_KEY_LEN};
+use octo_resilience::{CircuitBreaker, RetryPolicy};
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
@@ -55,7 +56,24 @@ impl AppState {
             horizon_url,
             friendbot_url,
             secret,
+            octo_resilience::RetryPolicy::default(),
+            octo_resilience::CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
         )
+    }
+
+    /// Build state with explicit resilience configuration (used by `bin/server`).
+    pub fn new_with_resilience(
+        store: Store,
+        master_key: [u8; MASTER_KEY_LEN],
+        network: StellarNetwork,
+        horizon_url: String,
+        friendbot_url: Option<String>,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
+    ) -> Self {
+        let mut secret = vec![0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
+        Self::build(store, master_key, network, horizon_url, friendbot_url, secret, retry, circuit)
     }
 
     /// Set the JWT signing secret (e.g. from the `JWT_SECRET` env var) so tokens survive restarts.
@@ -84,8 +102,10 @@ impl AppState {
         horizon_url: String,
         friendbot_url: Option<String>,
         jwt_secret: Vec<u8>,
+        retry: RetryPolicy,
+        circuit: CircuitBreaker,
     ) -> Self {
-        let horizon = Horizon::new(horizon_url.clone());
+        let horizon = Horizon::with_resilience(horizon_url.clone(), retry, circuit);
         let webhooks = WebhookSender::new(store.clone());
         Self {
             inner: Arc::new(Inner {
