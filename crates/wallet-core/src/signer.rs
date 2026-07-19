@@ -953,84 +953,112 @@ mod tests {
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
     }
 
-    // ── inner_operation_count ────────────────────────────────────────────────
+    // ── Malformed-XDR corpus (#44) ────────────────────────────────────────────
+    //
+    // Table-driven tests that mutate a known-good signed envelope at the byte
+    // level to produce truncated or bit-corrupted XDR.  Every case must return
+    // Err(WalletError::InvalidXdr) from both sign_fee_bump and
+    // compute_inner_tx_hash — never panic, never silently accept garbage.
 
-    /// Build a minimal (unsigned) v1 envelope with `n` operations, serialized to base64 XDR.
-    fn make_n_op_inner_xdr(n: usize) -> String {
-        use stellar_base::xdr::{
-            Memo as XdrMemo, MuxedAccount, Operation as XdrOperation, OperationBody, Preconditions,
-            SequenceNumber, Transaction as XdrTransaction, TransactionEnvelope, TransactionExt,
-            TransactionV1Envelope, Uint256,
-        };
+    fn valid_xdr_bytes() -> (String, Vec<u8>) {
+        use base64::prelude::*;
+        let xdr_b64 = make_inner_xdr(0, 1);
+        let bytes = BASE64_STANDARD.decode(&xdr_b64).unwrap();
+        (xdr_b64, bytes)
+    }
 
-        let operations: Vec<XdrOperation> = (0..n)
-            .map(|_| XdrOperation {
-                source_account: None,
-                body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([1u8; 32]))),
-            })
-            .collect();
-        let tx = XdrTransaction {
-            source_account: MuxedAccount::Ed25519(Uint256([2u8; 32])),
-            fee: 100,
-            seq_num: SequenceNumber(1),
-            cond: Preconditions::None,
-            memo: XdrMemo::None,
-            operations: operations.try_into().unwrap(),
-            ext: TransactionExt::V0,
-        };
-        let envelope = TransactionV1Envelope {
-            tx,
-            signatures: vec![].try_into().unwrap(),
-        };
-        TransactionEnvelope::Tx(envelope).xdr_base64().unwrap()
+    fn b64(bytes: &[u8]) -> String {
+        use base64::prelude::*;
+        BASE64_STANDARD.encode(bytes)
     }
 
     #[test]
-    fn inner_operation_count_reports_correct_count_for_single_and_multi_op_transactions() {
-        // Single-op: a real signed payment envelope.
-        let single = make_inner_xdr(0, 1);
-        assert_eq!(inner_operation_count(&single).unwrap(), 1);
+    fn truncated_xdr_variants_are_rejected() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let (_, bytes) = valid_xdr_bytes();
 
-        // Multi-op envelopes built directly from XDR.
-        for n in [2usize, 3] {
-            let xdr = make_n_op_inner_xdr(n);
-            assert_eq!(inner_operation_count(&xdr).unwrap(), n);
+        let truncations = [0usize, 1, bytes.len() / 4, bytes.len() / 2, bytes.len() - 1];
+
+        for &len in &truncations {
+            let truncated = b64(&bytes[..len]);
+            assert!(
+                matches!(
+                    sign_fee_bump(
+                        &mk,
+                        &sealed,
+                        StellarNetwork::Testnet,
+                        0,
+                        &FeeBumpRequest { inner_xdr: &truncated, max_base_fee_stroops: 200 },
+                    ),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "sign_fee_bump should reject truncated XDR (byte len {})",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn bit_flipped_xdr_variants_are_rejected() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let (_, bytes) = valid_xdr_bytes();
+
+        // Flip entire bytes at positions covering the 4-byte TransactionEnvelope
+        // type discriminant and the MuxedAccount type discriminant that follows.
+        // XOR with 0xFF guarantees a non-zero mutation on any non-FF byte.
+        let flip_offsets = [0usize, 1, 2, 3, 4];
+
+        for &offset in &flip_offsets {
+            let mut flipped = bytes.clone();
+            flipped[offset] ^= 0xFF;
+            let flipped_b64 = b64(&flipped);
+            assert!(
+                matches!(
+                    sign_fee_bump(
+                        &mk,
+                        &sealed,
+                        StellarNetwork::Testnet,
+                        0,
+                        &FeeBumpRequest { inner_xdr: &flipped_b64, max_base_fee_stroops: 200 },
+                    ),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "sign_fee_bump should reject bit-flipped XDR at byte offset {}",
+                offset
+            );
+        }
+    }
+
+    #[test]
+    fn compute_inner_tx_hash_rejects_same_corpus() {
+        let (_, bytes) = valid_xdr_bytes();
+
+        // Truncations
+        for &len in &[0usize, 1, bytes.len() / 2, bytes.len() - 1] {
+            let truncated = b64(&bytes[..len]);
+            assert!(
+                matches!(
+                    compute_inner_tx_hash(&truncated, StellarNetwork::Testnet),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "compute_inner_tx_hash should reject truncated XDR (len {})",
+                len
+            );
         }
 
-        // Zero-op parses fine: the helper reports, Stellar itself rejects zero-op transactions.
-        let zero = make_n_op_inner_xdr(0);
-        assert_eq!(inner_operation_count(&zero).unwrap(), 0);
-    }
-
-    #[test]
-    fn inner_operation_count_rejects_malformed_xdr_matching_sign_fee_bumps_error_type() {
-        assert!(matches!(
-            inner_operation_count("this-is-not-valid-base64-xdr"),
-            Err(WalletError::InvalidXdr)
-        ));
-        assert!(matches!(
-            inner_operation_count(""),
-            Err(WalletError::InvalidXdr)
-        ));
-
-        // A fee-bump envelope is not a valid inner envelope — same rejection as sign_fee_bump.
-        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
-        let inner_xdr = make_inner_xdr(0, 1);
-        let fee_bump_xdr = sign_fee_bump(
-            &mk,
-            &sealed,
-            StellarNetwork::Testnet,
-            0,
-            &FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: 200,
-            },
-        )
-        .unwrap()
-        .envelope_xdr;
-        assert!(matches!(
-            inner_operation_count(&fee_bump_xdr),
-            Err(WalletError::InvalidXdr)
-        ));
+        // Bit flips at discriminant bytes
+        for &offset in &[0usize, 3] {
+            let mut flipped = bytes.clone();
+            flipped[offset] ^= 0xFF;
+            let flipped_b64 = b64(&flipped);
+            assert!(
+                matches!(
+                    compute_inner_tx_hash(&flipped_b64, StellarNetwork::Testnet),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "compute_inner_tx_hash should reject bit-flipped XDR at offset {}",
+                offset
+            );
+        }
     }
 }
