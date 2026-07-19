@@ -162,34 +162,20 @@ pub async fn login(
     }))
 }
 
-/// `POST /v1/auth/refresh`
+/// `POST /v1/auth/refresh` — exchange a valid, unexpired token for a freshly-signed one.
 ///
-/// Issues a new token AND revokes the one used to authenticate this request.
-/// The client must replace the stored token with the new one immediately.
+/// The caller presents their current JWT via `Authorization: Bearer`; the response carries a new
+/// token for the same user with a full [`TOKEN_TTL_SECS`] window starting now.
+///
+/// **This is not a security control.** Refreshing does **not** invalidate the previous token:
+/// both the old and the new token remain valid until their natural expiry. That is an intentional
+/// scope limit — real revocation (server-side session state / a token denylist) is a separate,
+/// larger piece of work.
 pub async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    // 1. Authenticate (signature + expiry + deny-list).
-    let user_id = authenticate_async(&headers, &state).await?;
-
-    // 2. Capture the raw old token before it is revoked.
-    let old_token = bearer(&headers).ok_or(ApiError::Unauthorized)?.to_string();
-
-    // 3. Decode old token's `exp` for the deny-list row (so it can be pruned later).
-    let old_exp = token_exp(state.jwt_secret(), &old_token).ok_or(ApiError::Unauthorized)?;
-    let expires_at = Utc.timestamp_opt(old_exp, 0).single().unwrap_or_else(Utc::now);
-
-    // 4. Revoke the old token.
-    state
-        .store()
-        .revoke_token(&old_token, expires_at)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-
-    // 5. Issue a new token.
-    let new_token = issue_token(state.jwt_secret(), user_id)?;
-
+    let user_id = authenticate(&headers, &state)?;
     let user = state
         .store()
         .get_user(user_id)
@@ -199,7 +185,7 @@ pub async fn refresh(
 
     crate::audit::record(
         &state,
-        user_id,
+        user.id,
         "refreshed session token",
         crate::audit::category::AUTH,
         None,
@@ -207,42 +193,14 @@ pub async fn refresh(
     )
     .await;
 
+    let token = issue_token(state.jwt_secret(), user.id)?;
     Ok(Envelope::ok(AuthResponse {
-        token: new_token,
-        user: UserView { id: user.id, email: user.email },
+        token,
+        user: UserView {
+            id: user.id,
+            email: user.email,
+        },
     }))
-}
-
-/// `POST /v1/auth/logout`
-///
-/// Revokes the current token immediately. After this call the token is permanently invalid.
-pub async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    let user_id = authenticate_async(&headers, &state).await?;
-
-    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?.to_string();
-    let exp = token_exp(state.jwt_secret(), &token).ok_or(ApiError::Unauthorized)?;
-    let expires_at = Utc.timestamp_opt(exp, 0).single().unwrap_or_else(Utc::now);
-
-    state
-        .store()
-        .revoke_token(&token, expires_at)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-
-    crate::audit::record(
-        &state,
-        user_id,
-        "signed out",
-        crate::audit::category::AUTH,
-        None,
-        &headers,
-    )
-    .await;
-
-    Ok(Envelope::ok(serde_json::json!({ "message": "signed out" })))
 }
 
 /// `GET /v1/auth/me` — returns the authenticated user (token required).
