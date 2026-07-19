@@ -3,13 +3,18 @@
 //! These drive the real axum router with in-process requests, exercising
 //! crypto + wallet-core + store together. Skipped (with a message) if no DATABASE_URL.
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
-use octo_api::{build_router, AppState, Envelope}; // زدنا Envelope هنا
+use axum::routing::post as post_route;
+use axum::Router;
+use octo_api::{build_router, AppState};
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use std::sync::Once;
 use tower::ServiceExt; // for `oneshot`
+use tower_http::limit::RequestBodyLimitLayer;
+
+const REQUEST_BODY_LIMIT: usize = 64 * 1024;
 
 static LOAD_ENV: Once = Once::new();
 
@@ -43,6 +48,26 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn signup_request(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/auth/signup")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn body_limit_request(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/limit")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .body(Body::from(body))
+        .unwrap()
 }
 
 /// GET with an Authorization bearer token.
@@ -85,6 +110,36 @@ async fn auth_token(app: &axum::Router) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+async fn body_limit_handler(_: Bytes) -> Result<StatusCode, std::convert::Infallible> {
+    Ok(StatusCode::OK)
+}
+
+#[tokio::test]
+async fn request_body_over_the_configured_limit_returns_413() {
+    let app = Router::new()
+        .route("/limit", post_route(body_limit_handler))
+        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT));
+
+    let body = "a".repeat(REQUEST_BODY_LIMIT + 1);
+    assert!(body.len() > REQUEST_BODY_LIMIT);
+
+    let resp = app.oneshot(body_limit_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn request_body_at_the_configured_limit_succeeds() {
+    let app = Router::new()
+        .route("/limit", post_route(body_limit_handler))
+        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT));
+
+    let body = "a".repeat(REQUEST_BODY_LIMIT);
+    assert_eq!(body.len(), REQUEST_BODY_LIMIT);
+
+    let resp = app.oneshot(body_limit_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

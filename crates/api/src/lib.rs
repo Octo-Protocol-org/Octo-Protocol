@@ -19,6 +19,14 @@ pub use state::AppState;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+
+/// Keep API request payloads bounded to a deliberate, documented ceiling.
+///
+/// These routes deserialize JSON from raw `Bytes`; a `Bytes` extractor alone would otherwise
+/// rely on axum's implicit body limit (currently 2 MiB in this workspace's version). Making the
+/// limit explicit here keeps the behavior intentional and version-stable.
+const REQUEST_BODY_LIMIT: usize = 64 * 1024;
 
 /// Build the API router with shared state.
 pub fn build_router(state: AppState) -> Router {
@@ -28,6 +36,7 @@ pub fn build_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT))
         .route("/health", get(health))
         .route("/v1/auth/signup", post(auth::signup))
         .route("/v1/auth/login", post(auth::login))
