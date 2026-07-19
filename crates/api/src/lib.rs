@@ -16,12 +16,8 @@ mod state;
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
-use axum::error_handling::HandleErrorLayer;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{BoxError, Router};
-use tower::ServiceBuilder;
+use axum::routing::{delete, get, post};
+use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Build the API router with shared state.
@@ -74,7 +70,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/v1/wallets/:id/api-key",
-            post(routes::apikeys::generate_key).get(routes::apikeys::get_key),
+            post(routes::apikeys::generate_key)
+                .get(routes::apikeys::get_key)
+                .delete(routes::apikeys::delete_key),
         )
         .route(
             "/v1/wallets/:id/withdraw",

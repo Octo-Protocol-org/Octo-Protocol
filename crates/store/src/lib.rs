@@ -220,6 +220,15 @@ impl Store {
         Ok(row.map(|r| r.0))
     }
 
+    /// Delete (revoke) the API key for a wallet. Returns `Ok(())` even if no key existed.
+    pub async fn delete_api_key(&self, wallet_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM api_keys WHERE wallet_id = $1")
+            .bind(wallet_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // --- wallets ----------------------------------------------------------
 
     /// Create a master wallet. Fails with [`StoreError::Conflict`] if the account already exists.
