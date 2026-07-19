@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/useAuth";
 import { listWallets, type WalletView } from "@/lib/wallets";
 import {
   getSponsorshipConfig,
+  formatXlm,
   type SponsorshipConfig,
 } from "@/lib/sponsorship";
 import { DashboardShell } from "@/components/dashboard/DashboardShell";
@@ -173,10 +174,6 @@ function EmptyState() {
   );
 }
 
-function formatXlm(stroops: number): string {
-  return (stroops / 10_000_000).toFixed(2);
-}
-
 function WalletCard({
   wallet,
   sponsorship,
@@ -187,6 +184,11 @@ function WalletCard({
   const short = `${wallet.address.slice(0, 6)}…${wallet.address.slice(-6)}`;
   const sponsorEnabled = sponsorship?.enabled === true;
   const dailyBudget = sponsorship?.daily_budget_stroops;
+  const spentToday = sponsorship?.spent_today_stroops ?? 0;
+  const hasBudget = typeof dailyBudget === "number" && dailyBudget > 0;
+  const pct = hasBudget
+    ? Math.min(100, Math.max(0, (spentToday / dailyBudget) * 100))
+    : 0;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-burgundy-soft/30 p-5">
@@ -243,15 +245,20 @@ function WalletCard({
               {sponsorEnabled ? "Enabled" : "Off"}
             </span>
           </div>
-          {/* Daily-budget cap is rendered only when the API returns a numeric budget.
-              The progress bar for daily-spend consumption is intentionally omitted for now
-              because the current API response does not include a "fees_spent_today_stroops"
-              field. When that lands, swap this label for a fill-bar the same way the wallet
-              card already handles other grid cells. */}
-          {typeof dailyBudget === "number" && dailyBudget > 0 && (
-            <p className="mt-0.5 text-[10px] text-muted">
-              {formatXlm(dailyBudget)} XLM/day cap
-            </p>
+          {hasBudget ? (
+            <div className="mt-1.5 space-y-1">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-burgundy-bright transition-all"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-muted">
+                {formatXlm(spentToday)} / {formatXlm(dailyBudget)} XLM today
+              </p>
+            </div>
+          ) : (
+            <p className="mt-0.5 text-[10px] text-muted">no daily cap</p>
           )}
         </div>
       </div>

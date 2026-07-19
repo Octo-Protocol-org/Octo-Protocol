@@ -7,6 +7,7 @@ import { getWallet, stroopsToAmount, amountToStroops, type WalletView } from "@/
 import {
   getSponsorshipConfig,
   updateSponsorshipConfig,
+  formatXlm,
   type SponsorshipConfig,
 } from "@/lib/sponsorship";
 import { WalletSidebar } from "@/components/dashboard/WalletSidebar";
@@ -98,12 +99,12 @@ export default function SponsorshipSettingsPage({
   }
 
   const spentToday = config?.spent_today_stroops ?? 0;
-  const budgetStroops = config?.daily_budget_stroops ?? 0;
-  const remaining = Math.max(0, budgetStroops - spentToday);
-  const pct =
-    budgetStroops > 0
-      ? Math.min(100, Math.round((spentToday / budgetStroops) * 100))
-      : 0;
+  const budgetStroops = config?.daily_budget_stroops;
+  const hasBudget = typeof budgetStroops === "number" && budgetStroops > 0;
+  const remaining = hasBudget ? Math.max(0, budgetStroops - spentToday) : 0;
+  const pct = hasBudget
+    ? Math.min(100, Math.max(0, (spentToday / budgetStroops) * 100))
+    : 0;
 
   return (
     <div className="flex min-h-screen flex-col bg-background">
@@ -144,19 +145,28 @@ export default function SponsorshipSettingsPage({
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-muted">Today&apos;s spend</span>
                   <span className="text-foreground">
-                    {stroopsToAmount(spentToday)} XLM spent of{" "}
-                    {stroopsToAmount(budgetStroops)} XLM daily budget
+                    {hasBudget
+                      ? `${formatXlm(spentToday)} / ${formatXlm(budgetStroops)} XLM today`
+                      : "no daily cap"}
                   </span>
                 </div>
-                <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-                  <div
-                    className="h-full rounded-full bg-burgundy-bright"
-                    style={{ width: `${pct}%` }}
-                  />
-                </div>
-                <p className="mt-2 text-xs text-muted">
-                  {stroopsToAmount(remaining)} XLM remaining today
-                </p>
+                {hasBudget ? (
+                  <>
+                    <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                      <div
+                        className="h-full rounded-full bg-burgundy-bright transition-all"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <p className="mt-2 text-xs text-muted">
+                      {formatXlm(remaining)} XLM remaining today
+                    </p>
+                  </>
+                ) : (
+                  <p className="mt-2 text-xs text-muted">
+                    No daily budget limit is configured for gas sponsorship.
+                  </p>
+                )}
               </section>
 
               {/* Settings form */}
@@ -228,8 +238,9 @@ export default function SponsorshipSettingsPage({
                     className="mt-1.5 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-foreground placeholder:text-muted/50 focus:border-burgundy-bright focus:outline-none"
                   />
                   <p className="mt-1 text-xs text-muted">
-                    {stroopsToAmount(remaining)} XLM remaining of today&apos;s
-                    budget.
+                    {hasBudget
+                      ? `${formatXlm(remaining)} XLM remaining of today's budget.`
+                      : "No daily budget limit set."}
                   </p>
                 </div>
 
