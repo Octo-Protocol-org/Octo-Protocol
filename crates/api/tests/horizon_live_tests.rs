@@ -52,6 +52,14 @@ fn post_auth(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn get_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -123,12 +131,7 @@ async fn create_wallet_funds_and_has_balance() {
 
     // Balances should now include a positive native XLM balance.
     let resp = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/v1/wallets/{id}/balances"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(get_auth(&format!("/v1/wallets/{id}/balances"), &token))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -146,7 +149,9 @@ async fn create_wallet_funds_and_has_balance() {
     );
 }
 
-async fn create_funded_wallet(app: &axum::Router) -> (String, String) {
+/// Create a friendbot-funded wallet and return its `(id, address, owner_token)`. The token is
+/// needed because `/withdraw` is a login-only route (see `crate::auth::require_login`).
+async fn create_funded_wallet(app: &axum::Router) -> (String, String, String) {
     let token = auth_token(app).await;
     let resp = app
         .clone()
@@ -164,7 +169,18 @@ async fn create_funded_wallet(app: &axum::Router) -> (String, String) {
     (
         w["data"]["id"].as_str().unwrap().to_string(),
         w["data"]["address"].as_str().unwrap().to_string(),
+        token,
     )
+}
+
+fn withdraw_req(wallet_id: &str, token: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/wallets/{wallet_id}/withdraw"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -176,8 +192,8 @@ async fn withdraw_sends_xlm_on_chain() {
     let app = build_router(state);
 
     // Two funded wallets: A withdraws to B's account.
-    let (wallet_a, _addr_a) = create_funded_wallet(&app).await;
-    let (_wallet_b, addr_b) = create_funded_wallet(&app).await;
+    let (wallet_a, _addr_a, token_a) = create_funded_wallet(&app).await;
+    let (_wallet_b, addr_b, _token_b) = create_funded_wallet(&app).await;
 
     // Withdraw 1 XLM (10_000_000 stroops) from A to B.
     let key = uuid::Uuid::new_v4().to_string();
@@ -186,14 +202,7 @@ async fn withdraw_sends_xlm_on_chain() {
     );
     let resp = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/v1/wallets/{wallet_a}/withdraw"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+        .oneshot(withdraw_req(&wallet_a, &token_a, body))
         .await
         .unwrap();
 
@@ -210,6 +219,148 @@ async fn withdraw_sends_xlm_on_chain() {
     assert!(
         out["data"]["stellar_tx_hash"].as_str().is_some(),
         "a tx hash must be returned"
+    );
+}
+
+#[tokio::test]
+async fn withdraw_rejects_insufficient_balance_key_stays_unconsumed() {
+    let Some(state) = live_state().await else {
+        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
+        return;
+    };
+    let app = build_router(state);
+
+    let (wallet_a, _addr_a, token_a) = create_funded_wallet(&app).await;
+    let (_wallet_b, addr_b, _token_b) = create_funded_wallet(&app).await;
+    let key = uuid::Uuid::new_v4().to_string();
+
+    // Friendbot funds with far less than this; must be rejected pre-flight.
+    let too_much = format!(
+        r#"{{"destination":"{addr_b}","amount_stroops":9223372036854775807,"idempotency_key":"{key}"}}"#
+    );
+    let resp = app
+        .clone()
+        .oneshot(withdraw_req(&wallet_a, &token_a, too_much))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "insufficient balance must be rejected pre-flight"
+    );
+
+    // Same idempotency key, corrected amount -> must succeed (key was never consumed).
+    let corrected = format!(
+        r#"{{"destination":"{addr_b}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
+    );
+    let resp = app
+        .clone()
+        .oneshot(withdraw_req(&wallet_a, &token_a, corrected))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "retry with the same key must succeed once the request is corrected"
+    );
+}
+
+#[tokio::test]
+async fn withdraw_rejects_reserve_breach_key_stays_unconsumed() {
+    let Some(state) = live_state().await else {
+        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
+        return;
+    };
+    let app = build_router(state);
+
+    let (wallet_a, addr_a, token_a) = create_funded_wallet(&app).await;
+    let (_wallet_b, addr_b, _token_b) = create_funded_wallet(&app).await;
+    let key = uuid::Uuid::new_v4().to_string();
+
+    let horizon = octo_api::horizon::Horizon::new("https://horizon-testnet.stellar.org");
+    let native_balance = loop {
+        if let Ok(info) = horizon.account_info(&addr_a).await {
+            break info.native_balance_stroops();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+
+    // Draining down to (near) zero leaves nothing for the 1 XLM base reserve.
+    let breaches_reserve = native_balance - 200; // just short of the whole balance + fee
+    let body = format!(
+        r#"{{"destination":"{addr_b}","amount_stroops":{breaches_reserve},"idempotency_key":"{key}"}}"#
+    );
+    let resp = app
+        .clone()
+        .oneshot(withdraw_req(&wallet_a, &token_a, body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a withdrawal that breaches the minimum reserve must be rejected pre-flight"
+    );
+
+    // Same idempotency key, a modest amount that respects the reserve -> must succeed.
+    let corrected = format!(
+        r#"{{"destination":"{addr_b}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
+    );
+    let resp = app
+        .clone()
+        .oneshot(withdraw_req(&wallet_a, &token_a, corrected))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "retry with the same key must succeed once the request respects the reserve"
+    );
+}
+
+#[tokio::test]
+async fn withdraw_rejects_nonexistent_destination_key_stays_unconsumed() {
+    let Some(state) = live_state().await else {
+        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
+        return;
+    };
+    let app = build_router(state);
+
+    let (wallet_a, _addr_a, token_a) = create_funded_wallet(&app).await;
+    let key = uuid::Uuid::new_v4().to_string();
+
+    // A freshly generated keypair that has never been funded/created on-chain.
+    let unfunded = DalekKeyPair::random().expect("random keypair");
+    let unfunded_g = unfunded.public_key().account_id();
+
+    let body = format!(
+        r#"{{"destination":"{unfunded_g}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
+    );
+    let resp = app
+        .clone()
+        .oneshot(withdraw_req(&wallet_a, &token_a, body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a payment to a non-existent destination account must be rejected pre-flight"
+    );
+
+    // Fund the destination, then retry with the same idempotency key -> must succeed.
+    octo_api::horizon::friendbot_fund("https://friendbot.stellar.org", &unfunded_g)
+        .await
+        .expect("fund destination account");
+    sequence_with_retry("https://horizon-testnet.stellar.org", &unfunded_g).await;
+
+    let resp = app
+        .clone()
+        .oneshot(withdraw_req(&wallet_a, &token_a, body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "retry with the same key must succeed once the destination exists"
     );
 }
 

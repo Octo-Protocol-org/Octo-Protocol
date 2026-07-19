@@ -16,7 +16,16 @@ use axum::Json;
 use octo_crypto::SealedSeed;
 use octo_wallet_core::{is_valid_account, is_valid_asset_code, sign_payment, PaymentRequest};
 use serde::{Deserialize, Serialize};
+use stellar_base::transaction::MIN_BASE_FEE;
 use uuid::Uuid;
+
+/// The fee (in stroops) `sign_payment` will charge — always the protocol floor. Kept in sync
+/// with `wallet-core::signer::sign_payment`, which hardcodes `MIN_BASE_FEE` for the same reason
+/// documented there: no per-request fee negotiation, so there is nothing to check against a
+/// live "current network minimum" beyond the protocol floor we already pay.
+fn fee_stroops() -> i64 {
+    MIN_BASE_FEE.to_i64()
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct WithdrawRequest {
@@ -106,11 +115,104 @@ pub async fn withdraw(
         }
     };
 
-    // --- load wallet + reserve the idempotency key (prevents double-spend on retry) ---
     let wallet = state.store().get_wallet(wallet_id).await?;
 
+    // A key that has already been consumed short-circuits straight to 409 — no point spending a
+    // round trip to Horizon re-validating a request whose key is already spent.
+    if state
+        .store()
+        .withdrawal_exists(wallet_id, &idempotency_key)
+        .await?
+    {
+        return Err(ApiError::Conflict);
+    }
+
+    // --- pre-flight failure-mode checks (all BEFORE the idempotency key is consumed) ---
+    //
+    // Failure-mode matrix (see PR description for the full writeup):
+    //   1. Insufficient balance of the requested asset       -> checked here
+    //   2. Would breach the source account's minimum reserve -> checked here (native only)
+    //   3. Destination account doesn't exist on-chain yet    -> checked here (G... destinations)
+    //   4. Missing trustline for a credit-asset destination  -> checked here (G... destinations)
+    //   5. Fee below the current network minimum             -> NOT checked; we always sign at
+    //      the protocol-floor `MIN_BASE_FEE` (see `fee_stroops()`), so this class of failure can't
+    //      occur except under rare surge pricing, whose extra Horizon fee-stats call isn't
+    //      justified for that edge case.
+
+    // One Horizon call gets balances, sequence, and reserve inputs for the source account.
+    let source_info = state.horizon().account_info(&wallet.stellar_account_g).await?;
+
+    match &asset_issuer {
+        None => {
+            // Native XLM: balance must cover amount + fee, and what's left must clear reserve.
+            // `amount_stroops` is caller-supplied, so use checked arithmetic — an i64::MAX amount
+            // must fail as "insufficient balance", not panic.
+            let native = source_info.native_balance_stroops();
+            let required = amount_stroops
+                .checked_add(fee_stroops())
+                .ok_or_else(|| ApiError::BadRequest("amount_stroops is too large".into()))?;
+            if native < required {
+                return Err(ApiError::BadRequest(
+                    "insufficient XLM balance for amount + fee".into(),
+                ));
+            }
+            let remaining = native - required;
+            if remaining < source_info.min_reserve_stroops() {
+                return Err(ApiError::BadRequest(
+                    "withdrawal would breach the minimum reserve".into(),
+                ));
+            }
+        }
+        Some(issuer) => {
+            // Credit asset: balance/trustline for that asset, and enough native left for the fee
+            // + reserve (the fee is always paid in XLM regardless of the withdrawn asset).
+            let asset_balance = source_info
+                .asset_balance_stroops(&asset_code, issuer)
+                .ok_or_else(|| {
+                    ApiError::BadRequest("wallet has no trustline/balance for that asset".into())
+                })?;
+            if asset_balance < amount_stroops {
+                return Err(ApiError::BadRequest(
+                    "insufficient balance of the requested asset".into(),
+                ));
+            }
+            let native = source_info.native_balance_stroops();
+            if native - fee_stroops() < source_info.min_reserve_stroops() {
+                return Err(ApiError::BadRequest(
+                    "withdrawal would breach the minimum reserve (fee)".into(),
+                ));
+            }
+        }
+    }
+
+    // Destination-account-exists + trustline checks only apply to G... accounts; a muxed (M...)
+    // destination is always a subaccount of an existing G... account and isn't independently
+    // checkable via `/accounts` the same way, so it's out of scope here (documented gap).
+    if destination.starts_with('G') {
+        let dest_info = state.horizon().balances(&destination).await;
+        match dest_info {
+            Err(ApiError::NotFound) => {
+                return Err(ApiError::BadRequest(
+                    "destination account does not exist on-chain yet".into(),
+                ));
+            }
+            Err(e) => return Err(e),
+            Ok(dest_balances) => {
+                if let Some(issuer) = &asset_issuer {
+                    if !crate::horizon::has_trustline(&dest_balances, &asset_code, issuer) {
+                        return Err(ApiError::BadRequest(
+                            "destination account has no trustline for that asset".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // --- reserve the idempotency key (prevents double-spend on retry) ---
     // create_withdrawal is unique on (wallet_id, idempotency_key); a retry conflicts here BEFORE
-    // any signing/submit happens.
+    // any signing/submit happens. Every check above has already run, so a request that reaches
+    // this point has passed the full pre-flight matrix.
     let withdrawal = state
         .store()
         .create_withdrawal(octo_store::NewWithdrawal {
@@ -124,11 +226,8 @@ pub async fn withdraw(
         })
         .await?; // StoreError::Conflict -> ApiError::Conflict (409)
 
-    // --- fetch the master account sequence from Horizon ---
-    let seq = state
-        .horizon()
-        .account_sequence(&wallet.stellar_account_g)
-        .await?;
+    // Reuse the sequence fetched during pre-flight rather than a second Horizon round trip.
+    let seq = source_info.sequence;
 
     // --- sign inside wallet-core (decrypt -> derive -> sign -> zeroize) ---
     let sealed = SealedSeed::from_parts_with_scheme(
