@@ -21,6 +21,12 @@ pub fn sign(secret: &[u8], body: &[u8]) -> String {
 }
 
 /// Verify a hex signature against `body` using a constant-time comparison.
+///
+/// This must never be reimplemented as a variable-time `==` comparison of decoded bytes (or of
+/// the hex strings themselves). `secret` is a shared HMAC key: a byte-at-a-time early-exit
+/// comparison leaks timing information that lets an attacker recover it one byte at a time over
+/// repeated requests. `mac.verify_slice` (via the `subtle` crate through `hmac`/`crypto-mac`) is
+/// constant-time and must remain the comparison primitive here.
 pub fn verify(secret: &[u8], body: &[u8], signature_hex: &str) -> bool {
     let Ok(sig) = hex::decode(signature_hex) else {
         return false;
@@ -59,5 +65,41 @@ mod tests {
     fn garbage_signature_is_rejected() {
         assert!(!verify(b"k", b"body", "not-hex"));
         assert!(!verify(b"k", b"body", "00"));
+    }
+
+    /// Regression guard: `verify` must reject a near-miss signature that differs from the correct
+    /// one by only a single byte. This is a correctness check, not a timing measurement — the
+    /// durable guard against a *timing* regression is the doc-comment on `verify` plus the fact
+    /// that this crate never hand-rolls a byte comparison over the decoded signature. If a future
+    /// refactor replaces `mac.verify_slice` with a variable-time `==`, this test still passes
+    /// (the comparison would still be correct, just no longer constant-time), so it does not
+    /// substitute for keeping the doc-comment enforced in review.
+    #[test]
+    fn verify_rejects_signatures_differing_only_in_last_byte() {
+        let secret = b"shh-secret";
+        let body = b"payload";
+        let sig = sign(secret, body);
+
+        let mut bytes = hex::decode(&sig).expect("valid hex");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let tampered = hex::encode(bytes);
+
+        assert_ne!(tampered, sig);
+        assert!(!verify(secret, body, &tampered));
+    }
+
+    #[test]
+    fn verify_rejects_signatures_differing_only_in_first_byte() {
+        let secret = b"shh-secret";
+        let body = b"payload";
+        let sig = sign(secret, body);
+
+        let mut bytes = hex::decode(&sig).expect("valid hex");
+        bytes[0] ^= 0xFF;
+        let tampered = hex::encode(bytes);
+
+        assert_ne!(tampered, sig);
+        assert!(!verify(secret, body, &tampered));
     }
 }
