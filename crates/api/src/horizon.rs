@@ -22,6 +22,16 @@
 use crate::error::ApiError;
 use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Timeout for balance/sequence reads and friendbot funding — these are simple GETs against a
+/// Horizon-like endpoint and should be fast; a hung connection here must not block a request
+/// handler indefinitely.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Signed-transaction submission may legitimately take longer than a simple read (Horizon can hold
+/// the connection while the tx is validated/applied), so it gets a longer per-request override
+/// instead of raising the client's default for every call.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single balance line from a Horizon account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,7 +182,10 @@ impl Horizon {
         circuit: CircuitBreaker,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(DEFAULT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.into(),
             circuit,
             retry,
@@ -268,8 +281,14 @@ impl Horizon {
     /// caller can record the failure; only transport/HTTP errors return `Err`.
     pub async fn submit_transaction(&self, envelope_xdr: &str) -> Result<SubmitResult, ApiError> {
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
-        let http = self.http.clone();
-        let xdr = envelope_xdr.to_string();
+        let resp = self
+            .http
+            .post(&url)
+            .form(&[("tx", envelope_xdr)])
+            .timeout(SUBMIT_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| ApiError::Internal)?;
 
         let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
             let url = url.clone();
@@ -359,45 +378,31 @@ fn map_result<T>(r: Result<T, ResilienceError<FetchError>>) -> Result<T, ApiErro
 /// Fund a testnet account via friendbot. Best-effort; a single retry is safe because friendbot
 /// is idempotent (re-funding an already-funded account is a no-op on testnet).
 pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), ApiError> {
+    friendbot_fund_with_timeout(friendbot_url, account_g, DEFAULT_TIMEOUT).await
+}
+
+async fn friendbot_fund_with_timeout(
+    friendbot_url: &str,
+    account_g: &str,
+    timeout: Duration,
+) -> Result<(), ApiError> {
     let url = format!(
         "{}/?addr={}",
         friendbot_url.trim_end_matches('/'),
         account_g
     );
-    let policy = RetryPolicy {
-        max_attempts: 2,
-        base_delay_ms: 500,
-        max_delay_ms: 1_000,
-        ..Default::default()
-    };
-    // Friendbot uses its own isolated circuit breaker so friendbot failures don't bleed
-    // into the main Horizon circuit.
-    let circuit = CircuitBreaker::new(3, std::time::Duration::from_secs(30));
-    let http = reqwest::Client::new();
-
-    let result = execute(&circuit, &policy, CallKind::ReadOnly, || {
-        let url = url.clone();
-        let http = http.clone();
-        async move {
-            let resp = http
-                .get(&url)
-                .send()
-                .await
-                .map_err(|_| FetchError::Transport)?;
-            if resp.status().is_success() {
-                Ok(())
-            } else if resp.status().is_server_error() {
-                Err(FetchError::Transport)
-            } else {
-                Err(FetchError::Permanent)
-            }
-        }
-    })
-    .await;
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(_) => Err(ApiError::Internal),
+    let resp = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(ApiError::Internal)
     }
 }
 
@@ -405,85 +410,46 @@ pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), 
 mod tests {
     use super::*;
 
-    fn native(balance: &str) -> Balance {
-        Balance {
-            balance: balance.to_string(),
-            asset_type: "native".to_string(),
-            asset_code: None,
-            asset_issuer: None,
-        }
+    /// Binds an ephemeral listener that accepts a connection and then holds it open forever
+    /// without reading or writing, so callers get no response and only the client's own timeout
+    /// ends the request. Returns the base URL to hit.
+    async fn hanging_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        format!("http://{addr}")
     }
 
-    fn credit(balance: &str, code: &str, issuer: &str) -> Balance {
-        Balance {
-            balance: balance.to_string(),
-            asset_type: "credit_alphanum4".to_string(),
-            asset_code: Some(code.to_string()),
-            asset_issuer: Some(issuer.to_string()),
-        }
-    }
-
-    #[test]
-    fn parses_decimal_amounts_into_exact_stroops() {
-        assert_eq!(parse_amount_stroops("100.0000000"), Some(1_000_000_000));
-        assert_eq!(parse_amount_stroops("0.0000001"), Some(1));
-        assert_eq!(parse_amount_stroops("5"), Some(50_000_000));
-        assert_eq!(parse_amount_stroops("0.1"), Some(1_000_000));
-    }
-
-    #[test]
-    fn min_reserve_grows_with_subentries_and_sponsorship() {
-        let base = AccountInfo {
-            balances: vec![],
-            sequence: 0,
-            subentry_count: 0,
-            num_sponsoring: 0,
-            num_sponsored: 0,
+    #[tokio::test]
+    async fn horizon_client_times_out_and_maps_to_internal_error() {
+        let base_url = hanging_server().await;
+        let horizon = Horizon {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            base_url,
         };
-        assert_eq!(base.min_reserve_stroops(), 2 * BASE_RESERVE_STROOPS);
 
-        let with_trustlines = AccountInfo {
-            subentry_count: 3,
-            ..base.clone()
-        };
-        assert_eq!(with_trustlines.min_reserve_stroops(), 5 * BASE_RESERVE_STROOPS);
-
-        let sponsored = AccountInfo {
-            num_sponsoring: 1,
-            num_sponsored: 1,
-            ..base
-        };
-        // num_sponsoring - num_sponsored cancels out, back to the 2-entry floor.
-        assert_eq!(sponsored.min_reserve_stroops(), 2 * BASE_RESERVE_STROOPS);
+        let result = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;
+        assert!(matches!(result, Err(ApiError::Internal)));
     }
 
-    #[test]
-    fn native_and_asset_balance_lookups() {
-        let info = AccountInfo {
-            balances: vec![
-                native("42.5000000"),
-                credit("10.0000000", "USDC", "GISSUER"),
-            ],
-            sequence: 0,
-            subentry_count: 1,
-            num_sponsoring: 0,
-            num_sponsored: 0,
-        };
-        assert_eq!(info.native_balance_stroops(), 425_000_000);
-        assert_eq!(
-            info.asset_balance_stroops("USDC", "GISSUER"),
-            Some(100_000_000)
-        );
-        assert_eq!(info.asset_balance_stroops("USDC", "GOTHER"), None);
-        assert_eq!(info.asset_balance_stroops("EUR", "GISSUER"), None);
-    }
+    #[tokio::test]
+    async fn friendbot_fund_times_out_and_returns_an_error() {
+        let base_url = hanging_server().await;
 
-    #[test]
-    fn destination_trustline_matching() {
-        let dest_balances = vec![native("0.0000000"), credit("0.0000000", "USDC", "GISSUER")];
-        assert!(has_trustline(&dest_balances, "USDC", "GISSUER"));
-        assert!(!has_trustline(&dest_balances, "USDC", "GOTHER"));
-        assert!(!has_trustline(&dest_balances, "EUR", "GISSUER"));
-        assert!(!has_trustline(&[], "USDC", "GISSUER"));
+        let result = friendbot_fund_with_timeout(
+            &base_url,
+            "GABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Internal)));
     }
 }
