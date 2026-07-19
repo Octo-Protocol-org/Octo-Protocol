@@ -25,4 +25,10 @@ pub enum CryptoError {
     /// Authenticated encryption failed (should not happen for well-formed inputs).
     #[error("encryption failed")]
     EncryptionFailed,
+
+    /// The `scheme` tag stored in a [`crate::SealedSeed`] is not a value this version of the
+    /// code knows how to handle. The record must be migrated (re-sealed under the current scheme)
+    /// before it can be opened.
+    #[error("unknown sealed-seed scheme version: {0}")]
+    UnknownScheme(u8),
 }

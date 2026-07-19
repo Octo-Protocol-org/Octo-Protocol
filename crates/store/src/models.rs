@@ -17,6 +17,8 @@ pub struct Wallet {
     pub sealed_ciphertext: Vec<u8>,
     pub sealed_nonce: Vec<u8>,
     pub sealed_salt: Vec<u8>,
+    /// Scheme version tag for the sealed HD seed. See `octo_crypto::SCHEME_V1`.
+    pub sealed_scheme: i16,
     pub next_muxed_id: i64,
     pub label: Option<String>,
     pub user_id: Option<Uuid>,

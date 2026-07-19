@@ -21,6 +21,10 @@ struct Inner {
     store: Store,
     /// AES-256 master key used to seal/open seeds. Held zeroized.
     master_key: Zeroizing<[u8; MASTER_KEY_LEN]>,
+    /// Optional next master key present only during a rotation window.
+    /// When set, the server tries this key first (for already-migrated rows) and falls back to
+    /// `master_key` for rows not yet re-sealed by `octo-migrate-keys`.
+    master_key_next: Option<Zeroizing<[u8; MASTER_KEY_LEN]>>,
     network: StellarNetwork,
     horizon: Horizon,
     horizon_url: String,
@@ -46,6 +50,7 @@ impl AppState {
         Self::build(
             store,
             master_key,
+            None,
             network,
             horizon_url,
             friendbot_url,
@@ -61,10 +66,20 @@ impl AppState {
         self
     }
 
+    /// Set the next master key for zero-downtime key rotation.
+    /// When set, routes select the key based on the `sealed_scheme` of each wallet row:
+    /// already-migrated rows use `master_key_next`; un-migrated rows use `master_key`.
+    pub fn with_master_key_next(mut self, key: [u8; MASTER_KEY_LEN]) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.master_key_next = Some(Zeroizing::new(key));
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
         store: Store,
         master_key: [u8; MASTER_KEY_LEN],
+        master_key_next: Option<[u8; MASTER_KEY_LEN]>,
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
@@ -76,6 +91,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 store,
                 master_key: Zeroizing::new(master_key),
+                master_key_next: master_key_next.map(Zeroizing::new),
                 network,
                 horizon,
                 horizon_url,
@@ -101,6 +117,26 @@ impl AppState {
 
     pub fn master_key(&self) -> &[u8; MASTER_KEY_LEN] {
         &self.inner.master_key
+    }
+
+    /// Return the next master key, if one is configured for a rotation window.
+    pub fn master_key_next(&self) -> Option<&[u8; MASTER_KEY_LEN]> {
+        self.inner.master_key_next.as_deref()
+    }
+
+    /// Select the correct master key for a wallet given its `sealed_scheme`.
+    ///
+    /// During a rotation window (`MASTER_KEY_NEXT` is set):
+    /// - Rows already migrated to the target scheme use `master_key_next` (the new key).
+    /// - Rows not yet migrated use `master_key` (the old key).
+    ///
+    /// When no next key is configured, always returns `master_key`.
+    pub fn master_key_for_scheme(&self, sealed_scheme: i16) -> &[u8; MASTER_KEY_LEN] {
+        use octo_crypto::SCHEME_V1;
+        match &self.inner.master_key_next {
+            Some(next_key) if sealed_scheme == SCHEME_V1 as i16 => next_key,
+            _ => &self.inner.master_key,
+        }
     }
 
     pub fn jwt_secret(&self) -> &[u8] {

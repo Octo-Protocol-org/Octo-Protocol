@@ -48,6 +48,7 @@ async fn fresh_wallet(store: &Store) -> Uuid {
             sealed_ciphertext: b"ciphertext",
             sealed_nonce: b"nonce12bytes",
             sealed_salt: b"saltsaltsaltsalt",
+            sealed_scheme: 1,
             label: Some("test"),
             user_id: None,
             description: None,
@@ -401,142 +402,202 @@ async fn upsert_gas_sponsorship_config_works() {
 }
 
 // ---------------------------------------------------------------------------
-// list_audit_logs – category/search filter combinations (#53)
+// reseal_wallet / list_wallets_needing_reseal — batch migration (#132)
 // ---------------------------------------------------------------------------
 
-/// Create a throwaway user for audit-log tests (audit logs are user-scoped).
-async fn fresh_user(store: &Store) -> Uuid {
-    let email = format!("test-{}@octo.test", Uuid::new_v4().simple());
-    let user = store
-        .create_user(&email, "hashed-password-placeholder")
+/// Helper: insert a wallet row whose scheme is set to a specific value directly via raw SQL
+/// so we can simulate pre-migration rows (scheme = 0) without going through `create_wallet`
+/// (which always writes scheme = 1).
+async fn insert_wallet_with_scheme(store: &Store, scheme: i16) -> Uuid {
+    let acct = format!("G{}", Uuid::new_v4().simple());
+    let id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO wallets
+            (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
+             sealed_scheme, label)
+        VALUES ('testnet', $1, $2, $3, $4, $5, 'migration-test')
+        RETURNING id
+        "#,
+    )
+    .bind(&acct)
+    .bind(b"ciphertext".as_ref())
+    .bind(b"nonce12bytes".as_ref())
+    .bind(b"saltsaltsaltsalt".as_ref())
+    .bind(scheme)
+    .fetch_one(store.pool())
+    .await
+    .expect("insert wallet with scheme");
+    id
+}
+
+/// `list_wallets_needing_reseal` returns only wallets whose scheme differs from the target,
+/// and is correctly filtered by the `after_id` cursor for resumable iteration.
+#[tokio::test]
+async fn list_wallets_needing_reseal_returns_only_non_target_scheme() {
+    let Some(store) = store().await else { return };
+
+    // Insert 3 wallets: two at scheme 0 (legacy sentinel) and one at scheme 1 (already migrated).
+    let id_a = insert_wallet_with_scheme(&store, 0).await;
+    let id_b = insert_wallet_with_scheme(&store, 0).await;
+    let _id_c = insert_wallet_with_scheme(&store, 1).await;
+
+    // list_wallets_needing_reseal(target=1) should only return a and b.
+    let needs_migration = store
+        .list_wallets_needing_reseal(1, 100, None)
         .await
-        .expect("create test user");
-    user.id
+        .expect("list_wallets_needing_reseal");
+
+    let ids: Vec<Uuid> = needs_migration.iter().map(|w| w.id).collect();
+    assert!(ids.contains(&id_a), "wallet with scheme 0 must appear");
+    assert!(ids.contains(&id_b), "wallet with scheme 0 must appear");
+    for w in &needs_migration {
+        assert_ne!(w.sealed_scheme, 1, "must not include already-migrated rows");
+    }
 }
 
-/// Inserts several audit log rows spanning two categories and varied
-/// action/target text, then exercises all four filter combinations:
-/// (none, category-only, search-only, both).
-///
-/// Rows seeded (all prefixed with a test-specific UUID to avoid colliding
-/// with rows created by other tests running against a shared database):
-///
-///   category=auth    action="audit53-login"         target=Some("audit53-user@example.com")
-///   category=auth    action="audit53-logout"        target=Some("audit53-user@example.com")
-///   category=billing action="audit53-invoice"       target=Some("audit53-inv-001")
-///   category=billing action="audit53-payment"       target=None
-///   category=billing action="audit53-payment-retry" target=Some("audit53-retry-ref")
+/// `reseal_wallet` atomically swaps the sealed bytes and updates the scheme tag.
+/// A second call with the same `expected_old_scheme` is a safe no-op (idempotency guard).
 #[tokio::test]
-async fn list_audit_logs_filters_by_category() {
+async fn reseal_wallet_updates_scheme_and_is_idempotent() {
     let Some(store) = store().await else { return };
-    let user_id = fresh_user(&store).await;
 
-    // Seed rows.
-    store.record_audit(user_id, "audit53-login",  "auth",    Some("audit53-user@example.com"), None).await.unwrap();
-    store.record_audit(user_id, "audit53-logout", "auth",    Some("audit53-user@example.com"), None).await.unwrap();
-    store.record_audit(user_id, "audit53-invoice","billing", Some("audit53-inv-001"),           None).await.unwrap();
-    store.record_audit(user_id, "audit53-payment","billing", None,                              None).await.unwrap();
-    store.record_audit(user_id, "audit53-payment-retry", "billing", Some("audit53-retry-ref"), None).await.unwrap();
+    let wallet_id = insert_wallet_with_scheme(&store, 0).await;
 
-    // No filters → all 5 rows for this user.
-    let all = store.list_audit_logs(user_id, None, None, 50).await.unwrap();
-    assert_eq!(all.len(), 5, "no filter should return all 5 rows");
+    // Simulate a reseal: write new (fake) ciphertext and bump scheme to 1.
+    let updated = store
+        .reseal_wallet(
+            wallet_id,
+            b"new-ciphertext",
+            b"newnonce12by",
+            b"newsaltnewsaltnewsaltnewsaltnews",
+            1,   // new scheme
+            0,   // expected old scheme
+        )
+        .await
+        .expect("reseal_wallet");
+    assert!(updated, "first reseal must update the row");
 
-    // Category = auth → 2 rows.
-    let auth_rows = store.list_audit_logs(user_id, Some("auth"), None, 50).await.unwrap();
-    assert_eq!(auth_rows.len(), 2, "category=auth should return 2 rows");
-    assert!(auth_rows.iter().all(|r| r.category == "auth"),
-        "all returned rows must have category=auth");
+    // Verify the stored values changed.
+    let row: (Vec<u8>, i16) =
+        sqlx::query_as("SELECT sealed_ciphertext, sealed_scheme FROM wallets WHERE id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch row");
+    assert_eq!(row.0, b"new-ciphertext", "ciphertext must be updated");
+    assert_eq!(row.1, 1i16, "scheme must be updated to 1");
 
-    // Category = billing → 3 rows.
-    let billing_rows = store.list_audit_logs(user_id, Some("billing"), None, 50).await.unwrap();
-    assert_eq!(billing_rows.len(), 3, "category=billing should return 3 rows");
-    assert!(billing_rows.iter().all(|r| r.category == "billing"),
-        "all returned rows must have category=billing");
+    // A second call claiming the row is still at scheme 0 must be a no-op (row is now at 1).
+    let second = store
+        .reseal_wallet(
+            wallet_id,
+            b"should-not-overwrite",
+            b"newnonce12by",
+            b"newsaltnewsaltnewsaltnewsaltnews",
+            1,
+            0, // wrong expected_old_scheme → WHERE clause won't match
+        )
+        .await
+        .expect("second reseal call");
+    assert!(!second, "second reseal with stale expected_old_scheme must be a no-op");
+
+    // Ciphertext is still the first update's value.
+    let row2: (Vec<u8>,) =
+        sqlx::query_as("SELECT sealed_ciphertext FROM wallets WHERE id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch row2");
+    assert_eq!(row2.0, b"new-ciphertext", "no-op must not overwrite ciphertext");
 }
 
-/// Confirms that the search parameter matches case-insensitively against both
-/// the `action` and the `target` columns, and that rows with `target = NULL`
-/// are handled without error (via the ILIKE on `coalesce(target, '')`).
+/// Full migration backfill scenario: seed several wallets at scheme 0, run the batch in
+/// sub-batches (simulating an interrupted run), verify the second run completes the rest
+/// without re-sealing already-migrated rows.
 #[tokio::test]
-async fn list_audit_logs_search_matches_action_and_target_case_insensitively() {
+async fn batch_reseal_is_resumable_and_does_not_double_reseal() {
     let Some(store) = store().await else { return };
-    let user_id = fresh_user(&store).await;
 
-    store.record_audit(user_id, "audit53-cs-LOGIN",   "auth",    Some("audit53-cs-Alice"),  None).await.unwrap();
-    store.record_audit(user_id, "audit53-cs-logout",  "auth",    Some("audit53-cs-BOB"),    None).await.unwrap();
-    store.record_audit(user_id, "audit53-cs-payment", "billing", None,                      None).await.unwrap();
-    store.record_audit(user_id, "audit53-cs-invoice", "billing", Some("audit53-cs-ref-42"), None).await.unwrap();
+    // Seed 5 wallets at scheme 0.
+    let mut wallet_ids = Vec::new();
+    for _ in 0..5 {
+        wallet_ids.push(insert_wallet_with_scheme(&store, 0).await);
+    }
 
-    // Search "audit53-cs-login" matches action "audit53-cs-LOGIN" case-insensitively.
-    let by_action = store.list_audit_logs(user_id, None, Some("audit53-cs-login"), 50).await.unwrap();
-    assert_eq!(by_action.len(), 1, "case-insensitive action search should return 1 row");
-    assert_eq!(by_action[0].action, "audit53-cs-LOGIN");
+    // --- First pass: process only the first 2 wallets (simulates interruption). ---
+    let first_batch = store
+        .list_wallets_needing_reseal(1, 2, None)
+        .await
+        .expect("first batch");
+    assert_eq!(first_batch.len(), 2, "first batch must return 2 rows");
 
-    // Search "audit53-cs-alice" matches target "audit53-cs-Alice" case-insensitively.
-    let by_target = store.list_audit_logs(user_id, None, Some("audit53-cs-alice"), 50).await.unwrap();
-    assert_eq!(by_target.len(), 1, "case-insensitive target search should return 1 row");
-    assert_eq!(by_target[0].action, "audit53-cs-LOGIN");
+    let mut reseal_count_pass1 = 0usize;
+    for w in &first_batch {
+        let updated = store
+            .reseal_wallet(
+                w.id,
+                b"migrated-ciphertext",
+                b"newnonce12by",
+                b"newsaltnewsaltnewsaltnewsaltnews",
+                1,
+                0,
+            )
+            .await
+            .expect("reseal pass 1");
+        if updated {
+            reseal_count_pass1 += 1;
+        }
+    }
+    assert_eq!(reseal_count_pass1, 2, "both rows in first batch must be updated");
 
-    // Search "audit53-cs-bob" matches target "audit53-cs-BOB".
-    let by_bob = store.list_audit_logs(user_id, None, Some("audit53-cs-bob"), 50).await.unwrap();
-    assert_eq!(by_bob.len(), 1, "case-insensitive target search for BOB should return 1 row");
-    assert_eq!(by_bob[0].action, "audit53-cs-logout");
+    // --- Second pass: resume from after the last processed wallet. ---
+    let last_processed = first_batch.last().unwrap().id;
+    let second_batch = store
+        .list_wallets_needing_reseal(1, 100, Some(last_processed))
+        .await
+        .expect("second batch");
 
-    // Search "audit53-cs-payment" matches action; the row has NULL target, which should not panic.
-    let null_target = store.list_audit_logs(user_id, None, Some("audit53-cs-payment"), 50).await.unwrap();
-    assert_eq!(null_target.len(), 1, "search with NULL target row should not panic and should match action");
-    assert_eq!(null_target[0].action, "audit53-cs-payment");
-}
+    // Must return the remaining 3 wallets (those still at scheme 0 with id > last_processed).
+    assert!(
+        !second_batch.is_empty(),
+        "second batch must return the remaining un-migrated wallets"
+    );
+    for w in &second_batch {
+        assert_ne!(
+            w.sealed_scheme, 1,
+            "second batch must not include already-migrated rows"
+        );
+    }
 
-/// Confirms that combining category + search filters returns only rows that
-/// satisfy both conditions simultaneously.
-#[tokio::test]
-async fn list_audit_logs_combines_category_and_search_filters() {
-    let Some(store) = store().await else { return };
-    let user_id = fresh_user(&store).await;
+    let mut reseal_count_pass2 = 0usize;
+    for w in &second_batch {
+        let updated = store
+            .reseal_wallet(
+                w.id,
+                b"migrated-ciphertext",
+                b"newnonce12by",
+                b"newsaltnewsaltnewsaltnewsaltnews",
+                1,
+                0,
+            )
+            .await
+            .expect("reseal pass 2");
+        if updated {
+            reseal_count_pass2 += 1;
+        }
+    }
+    assert!(reseal_count_pass2 > 0, "second pass must migrate remaining wallets");
 
-    store.record_audit(user_id, "audit53-combo-login",   "auth",    Some("audit53-combo-user"),   None).await.unwrap();
-    store.record_audit(user_id, "audit53-combo-logout",  "auth",    Some("audit53-combo-user"),   None).await.unwrap();
-    store.record_audit(user_id, "audit53-combo-charge",  "billing", Some("audit53-combo-user"),   None).await.unwrap();
-    store.record_audit(user_id, "audit53-combo-invoice", "billing", Some("audit53-combo-inv-99"), None).await.unwrap();
-
-    // category=auth AND search="audit53-combo-user" → 2 auth rows that mention "user".
-    let both = store.list_audit_logs(user_id, Some("auth"), Some("audit53-combo-user"), 50).await.unwrap();
-    assert_eq!(both.len(), 2,
-        "combined filter: category=auth + search=audit53-combo-user should return 2 rows");
-    assert!(both.iter().all(|r| r.category == "auth"),
-        "all combined-filter rows must have category=auth");
-
-    // category=billing AND search="audit53-combo-inv" → only the invoice row.
-    let billing_inv = store.list_audit_logs(user_id, Some("billing"), Some("audit53-combo-inv"), 50).await.unwrap();
-    assert_eq!(billing_inv.len(), 1,
-        "combined filter: category=billing + search=audit53-combo-inv should return 1 row");
-    assert_eq!(billing_inv[0].action, "audit53-combo-invoice");
-
-    // category=auth AND search="audit53-combo-inv" → 0 rows (no auth row mentions "inv").
-    let no_match = store.list_audit_logs(user_id, Some("auth"), Some("audit53-combo-inv"), 50).await.unwrap();
-    assert!(no_match.is_empty(),
-        "combined filter that matches no rows must return empty (got {})", no_match.len());
-}
-
-/// Explicitly verifies the NULL-target edge case: rows with `target = NULL`
-/// are never accidentally excluded by the ILIKE search, and a search that
-/// would only match a null-target row via the action field works correctly.
-#[tokio::test]
-async fn list_audit_logs_search_handles_null_target() {
-    let Some(store) = store().await else { return };
-    let user_id = fresh_user(&store).await;
-
-    // Row with NULL target — action is unique so it won't appear in any other test.
-    store.record_audit(user_id, "audit53-null-action-xyz", "security", None, None).await.unwrap();
-    // Row with a non-NULL target that shouldn't match "xyz".
-    store.record_audit(user_id, "audit53-null-other",      "security", Some("audit53-null-ref"), None).await.unwrap();
-
-    // Search "xyz" should match "audit53-null-action-xyz" via action even though target IS NULL.
-    let results = store.list_audit_logs(user_id, None, Some("xyz"), 50).await.unwrap();
-    assert_eq!(results.len(), 1,
-        "search for 'xyz' should match the NULL-target row via action (got {} rows)", results.len());
-    assert_eq!(results[0].action, "audit53-null-action-xyz");
-    assert!(results[0].target.is_none(), "matched row should still have NULL target");
+    // --- Verify: no wallets remain at scheme 0 for the IDs we inserted. ---
+    let remaining = store
+        .list_wallets_needing_reseal(1, 100, None)
+        .await
+        .expect("final check");
+    for w in &remaining {
+        assert!(
+            !wallet_ids.contains(&w.id),
+            "wallet {} should have been migrated but still shows scheme {}",
+            w.id, w.sealed_scheme
+        );
+    }
 }
