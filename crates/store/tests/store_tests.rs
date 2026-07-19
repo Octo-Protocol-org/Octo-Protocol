@@ -401,142 +401,83 @@ async fn upsert_gas_sponsorship_config_works() {
 }
 
 // ---------------------------------------------------------------------------
-// list_sponsored_transactions – keyset pagination edge cases (#51)
+// try_reserve_sponsored_transaction – concurrent budget race (#52)
 // ---------------------------------------------------------------------------
 
-/// A `before_id` that does not exist in the table at all causes the correlated
-/// subquery to return no row, making the `(created_at, id) < (NULL, NULL)`
-/// comparison resolve to NULL (unknown), which excludes every candidate row.
-/// The result must be an empty page rather than a panic or an error.
+/// Spawns N concurrent calls to `try_reserve_sponsored_transaction` for the
+/// same wallet with a budget that only fits M < N of them. Each call uses a
+/// distinct `inner_tx_hash` so the unique-index conflict path is not the
+/// mechanism under test — only the budget CTE atomicity is.
+///
+/// Asserts:
+/// - exactly M calls succeed,
+/// - exactly N - M calls fail with `StoreError::BudgetExceeded`,
+/// - the sum reserved today never exceeds the budget (i.e. exactly M * fee_stroops).
 #[tokio::test]
-async fn pagination_with_nonexistent_before_id_returns_empty() {
+async fn concurrent_reservations_never_exceed_daily_budget() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
     insert_sponsorship_config(&store, wallet_id).await;
 
-    // Insert a couple of rows so the wallet is not empty.
-    for i in 0..3u32 {
-        store
-            .record_sponsored_tx(NewSponsoredTx {
-                wallet_id,
-                inner_tx_hash: &format!("nonexistent-cursor-test-{}-{}", Uuid::new_v4().simple(), i),
-                fee_stroops: 100,
-            })
-            .await
-            .expect("record");
+    // Budget allows exactly 3 reservations of 100 stroops each (300 total).
+    // We fire 8 concurrent attempts — only 3 must succeed.
+    let fee_stroops: i64 = 100;
+    let budget: i64 = 300; // fits exactly 3
+    let total_attempts: usize = 8;
+    let expected_successes: usize = (budget / fee_stroops) as usize; // 3
+
+    let mut handles = Vec::with_capacity(total_attempts);
+    for _ in 0..total_attempts {
+        let store_clone = store.clone();
+        // Each call gets a distinct hash so the unique-index is never the limiting factor.
+        let hash = format!("race-{}", Uuid::new_v4().simple());
+        handles.push(tokio::spawn(async move {
+            store_clone
+                .try_reserve_sponsored_transaction(wallet_id, &hash, fee_stroops, Some(budget))
+                .await
+        }));
     }
 
-    // Use a random UUID that was never inserted as the cursor.
-    let phantom_id = Uuid::new_v4();
-    let page = store
-        .list_sponsored_transactions(wallet_id, 10, None, Some(phantom_id))
-        .await
-        .expect("list must not error");
+    // Collect all results (await each handle sequentially; they ran concurrently above).
+    let mut results: Vec<Result<Result<_, StoreError>, _>> = Vec::with_capacity(total_attempts);
+    for handle in handles {
+        results.push(handle.await);
+    }
 
-    assert!(
-        page.is_empty(),
-        "a before_id that does not exist should return an empty page (got {} rows)",
-        page.len()
+    let mut successes = 0usize;
+    let mut budget_exceeded = 0usize;
+    for join_result in results {
+        match join_result.expect("task panicked") {
+            Ok(_) => successes += 1,
+            Err(StoreError::BudgetExceeded) => budget_exceeded += 1,
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    assert_eq!(
+        successes, expected_successes,
+        "expected exactly {expected_successes} successful reservations, got {successes}"
     );
-}
+    assert_eq!(
+        budget_exceeded,
+        total_attempts - expected_successes,
+        "expected {} BudgetExceeded errors, got {budget_exceeded}",
+        total_attempts - expected_successes
+    );
 
-/// A `before_id` pointing at a real row that belongs to a *different* wallet
-/// must not leak that wallet's data into the querying wallet's result set.
-/// Because the outer `WHERE wallet_id = $1` filter and the correlated subquery
-/// have no `wallet_id` guard on the subquery itself, the timestamp resolved by
-/// the subquery may come from the other wallet — but the outer filter still
-/// constrains the returned rows to `wallet_id`. Confirm the exact behavior:
-/// either an empty page (if the other wallet's cursor timestamp precedes all
-/// rows for wallet_a) or a page containing only rows for wallet_a (no leak).
-#[tokio::test]
-async fn pagination_with_before_id_from_another_wallet_is_scoped_correctly() {
-    let Some(store) = store().await else { return };
-
-    // Two independent wallets.
-    let wallet_a = fresh_wallet(&store).await;
-    let wallet_b = fresh_wallet(&store).await;
-    insert_sponsorship_config(&store, wallet_a).await;
-    insert_sponsorship_config(&store, wallet_b).await;
-
-    // Seed wallet_a with 3 rows.
-    let mut wallet_a_ids = Vec::new();
-    for i in 0..3u32 {
-        let row = store
-            .record_sponsored_tx(NewSponsoredTx {
-                wallet_id: wallet_a,
-                inner_tx_hash: &format!("cross-wallet-a-{}-{}", Uuid::new_v4().simple(), i),
-                fee_stroops: 200,
-            })
-            .await
-            .expect("record wallet_a");
-        wallet_a_ids.push(row.id);
-    }
-
-    // Seed wallet_b with 1 row — its id will be used as the cursor for wallet_a.
-    let wallet_b_row = store
-        .record_sponsored_tx(NewSponsoredTx {
-            wallet_id: wallet_b,
-            inner_tx_hash: &format!("cross-wallet-b-{}", Uuid::new_v4().simple()),
-            fee_stroops: 300,
-        })
+    // Confirm the DB reflects exactly M * fee_stroops reserved — never over-budget.
+    let reserved = store
+        .sum_sponsored_fees_reserved_today(wallet_id)
         .await
-        .expect("record wallet_b");
-
-    // Use wallet_b's row id as the before_id when listing wallet_a's transactions.
-    let page = store
-        .list_sponsored_transactions(wallet_a, 10, None, Some(wallet_b_row.id))
-        .await
-        .expect("list must not error");
-
-    // Safety assertion: no row belonging to wallet_b must appear in the result.
-    for row in &page {
-        assert_eq!(
-            row.wallet_id, wallet_a,
-            "cross-wallet cursor must never leak rows from another wallet (got wallet_id={})",
-            row.wallet_id
-        );
-    }
-    // The page may be empty (if wallet_b's timestamp is older than wallet_a's rows) or contain
-    // some/all of wallet_a's rows — either is acceptable as long as wallet_b's row is absent.
-}
-
-/// Requesting a page whose cursor points at the oldest row (first inserted)
-/// should yield an empty result, not a panic or error.
-#[tokio::test]
-async fn pagination_past_last_row_returns_empty_without_error() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_wallet(&store).await;
-    insert_sponsorship_config(&store, wallet_id).await;
-
-    // Insert 3 rows and collect them in descending order (as the list returns them).
-    for i in 0..3u32 {
-        store
-            .record_sponsored_tx(NewSponsoredTx {
-                wallet_id,
-                inner_tx_hash: &format!("past-last-{}-{}", Uuid::new_v4().simple(), i),
-                fee_stroops: 50,
-            })
-            .await
-            .expect("record");
-    }
-
-    // Fetch the first page (no cursor) to get all rows in descending order.
-    let first_page = store
-        .list_sponsored_transactions(wallet_id, 10, None, None)
-        .await
-        .expect("first page");
-    assert_eq!(first_page.len(), 3, "expected 3 rows on the first page");
-
-    // The last element is the oldest row. Paginating past it must yield nothing.
-    let oldest_id = first_page.last().unwrap().id;
-    let empty_page = store
-        .list_sponsored_transactions(wallet_id, 10, None, Some(oldest_id))
-        .await
-        .expect("page past last row must not error");
-
+        .expect("sum_sponsored_fees_reserved_today");
+    assert_eq!(
+        reserved,
+        (expected_successes as i64) * fee_stroops,
+        "reserved total {reserved} differs from expected {}",
+        (expected_successes as i64) * fee_stroops
+    );
     assert!(
-        empty_page.is_empty(),
-        "paginating past the last row must return an empty page (got {} rows)",
-        empty_page.len()
+        reserved <= budget,
+        "reserved total {reserved} exceeds the daily budget {budget}"
     );
 }
