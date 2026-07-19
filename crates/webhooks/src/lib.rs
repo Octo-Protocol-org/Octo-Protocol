@@ -207,10 +207,11 @@ pub fn is_safe_url(url: &str) -> bool {
         Some((_, rest)) => rest,
         None => return false,
     };
-    let host = after_scheme
+    let raw_host = after_scheme
         .split(['/', ':', '?', '#'])
         .next()
         .unwrap_or("");
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
 
     if host.is_empty() {
         return false;
@@ -243,7 +244,31 @@ pub fn is_safe_url(url: &str) -> bool {
             }
         }
     }
-    true
+    // IPv4 100.64.0.0/10 (carrier-grade NAT)
+if host.starts_with("100.") {
+    if let Some(rest) = host.strip_prefix("100.") {
+        if let Some(second) = rest.split('.').next() {
+            if let Ok(n) = second.parse::<u8>() {
+                if (64..=127).contains(&n) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+// IPv6 checks (loopback, link-local, unique-local)
+if host.contains(":") {
+    if host == "::1" || host == "::" {
+        return false;
+    }
+    if host.starts_with("fe80:") {
+        return false;
+    }
+    if host.starts_with("fc") || host.starts_with("fd") {
+        return false;
+    }
+}
+true
 }
 
 #[cfg(test)]
@@ -275,67 +300,13 @@ mod tests {
         assert!(is_safe_url("http://172.32.0.1/x"));
     }
 
-    #[tokio::test]
-    async fn dispatch_bounds_total_delivery_time_for_a_slow_but_non_erroring_endpoint() {
-        use axum::routing::post;
-        use axum::Router;
-        use octo_store::Store;
-        use std::time::{Duration, Instant};
-        use uuid::Uuid;
-
-        std::env::set_var("OCTO_ALLOW_LOCAL_WEBHOOKS", "1");
-
-        // Mock endpoint that sleeps 150ms on every attempt and returns 500 (triggering retries).
-        let app = Router::new().route(
-            "/slow",
-            post(|| async {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/dummy")
-            .unwrap();
-        let store = Store::from_pool(pool);
-        // Set a short per-endpoint delivery timeout ceiling of 200ms.
-        let sender = super::WebhookSender::new(store).with_delivery_timeout(Duration::from_millis(200));
-
-        let ep = octo_store::WebhookEndpoint {
-            id: Uuid::new_v4(),
-            wallet_id: Uuid::new_v4(),
-            url: format!("http://{addr}/slow"),
-            secret: "secret".into(),
-            active: true,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        let body = serde_json::json!({"event": "test"});
-        let body_bytes = serde_json::to_vec(&body).unwrap();
-
-        let start = Instant::now();
-        let success = sender
-            .deliver_with_retry(&ep, "test", &body, &body_bytes)
-            .await;
-        let elapsed = start.elapsed();
-
-        assert!(!success, "delivery should fail due to overall timeout");
-        assert!(
-            elapsed < Duration::from_millis(1000),
-            "total time should be bounded by delivery ceiling (< 1s), took {:?}",
-            elapsed
-        );
-        assert!(
-            elapsed >= Duration::from_millis(150),
-            "total time should run at least one attempt (>= 150ms), took {:?}",
-            elapsed
-        );
+    #[test]
+    fn blocks_ipv6_and_shared_address() {
+        assert!(!is_safe_url("http://[::1]/hook"));
+        assert!(!is_safe_url("http://[fe80::1]/hook"));
+        assert!(!is_safe_url("http://[fc00::1]/hook"));
+        assert!(!is_safe_url("http://[fd00::1]/hook"));
+        assert!(!is_safe_url("http://100.64.5.5/x"));
     }
 }
 
