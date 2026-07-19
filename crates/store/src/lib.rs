@@ -743,41 +743,24 @@ impl Store {
         Ok(rows)
     }
 
-    /// Get a webhook endpoint by ID.
-    pub async fn get_webhook_endpoint(
-        &self,
-        id: Uuid,
-    ) -> Result<WebhookEndpoint, StoreError> {
-        let row = sqlx::query_as::<_, WebhookEndpoint>(
-            "SELECT * FROM webhook_endpoints WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row)
+    /// Fetch a single webhook endpoint by id, regardless of `active` state.
+    pub async fn get_webhook_endpoint(&self, id: Uuid) -> Result<WebhookEndpoint, StoreError> {
+        sqlx::query_as::<_, WebhookEndpoint>("SELECT * FROM webhook_endpoints WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)
     }
 
-    /// List recent webhook deliveries for a specific endpoint.
-    pub async fn list_webhook_deliveries(
-        &self,
-        endpoint_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<WebhookDelivery>, StoreError> {
-        let rows = sqlx::query_as::<_, WebhookDelivery>(
-            r#"
-            SELECT * FROM webhook_deliveries
-            WHERE endpoint_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(endpoint_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+    /// Deactivate a webhook endpoint so it stops receiving deliveries. A no-op if the id doesn't
+    /// exist (matches the update-by-id convention used elsewhere in this file).
+    pub async fn deactivate_webhook_endpoint(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE webhook_endpoints SET active = false WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
-
 
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.
     pub async fn log_webhook_delivery(

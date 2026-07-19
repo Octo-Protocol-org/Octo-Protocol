@@ -63,6 +63,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::webhooks::list_deliveries),
         )
         .route(
+            "/v1/wallets/:id/webhooks/:endpoint_id",
+            axum::routing::delete(routes::webhooks::delete_webhook),
+        )
+        .route(
             "/v1/wallets/:id/api-key",
             post(routes::apikeys::generate_key).get(routes::apikeys::get_key),
         )
