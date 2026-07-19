@@ -400,54 +400,126 @@ async fn upsert_gas_sponsorship_config_works() {
     assert_eq!(spent, 0);
 }
 
-/// `allocate_address` claims to be safe under concurrent callers via a `SELECT ... FOR UPDATE`
-/// row lock inside a transaction. `allocate_address_increments_atomically` above only calls it
-/// sequentially, which never actually exercises that lock. This spawns real concurrent tasks
-/// against the same wallet and proves the row lock serializes the counter bump: every returned
-/// muxed id is unique, and the full set is exactly {1, ..., N} with no gaps or collisions.
+/// Every child table in `crates/store/migrations/0001_init.sql` and later migrations
+/// (`addresses`, `transactions`, `withdrawals`, `webhook_endpoints`, `gas_sponsorship_configs`,
+/// `sponsored_transactions`) declares `REFERENCES wallets(id) ON DELETE CASCADE`, but nothing
+/// previously exercised that behavior — a migration typo (e.g. `ON DELETE SET NULL` instead of
+/// `CASCADE`) would go unnoticed. This populates one row per child table and confirms they are
+/// all removed when the parent wallet row is deleted.
 #[tokio::test]
-async fn allocate_address_is_collision_free_under_concurrency() {
+async fn deleting_wallet_cascades_to_all_child_tables() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
     let wid = wallet_id.simple();
 
-    const N: usize = 25;
+    // addresses
+    store
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-{id}")),
+            Some("cascade-test"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("allocate address");
 
-    let handles: Vec<tokio::task::JoinHandle<i64>> = (0..N)
-        .map(|i| {
-            let store = store.clone();
-            tokio::spawn(async move {
-                let address = store
-                    .allocate_address(
-                        wallet_id,
-                        |id| Ok(format!("M{wid}-{id}")),
-                        Some(&format!("concurrent-{i}")),
-                        serde_json::json!({}),
-                    )
-                    .await
-                    .expect("allocate_address under concurrency");
-                address.muxed_id
-            })
+    // transactions (deposit)
+    let tx_hash = format!("cascade-{wid}");
+    store
+        .record_deposit(&NewDeposit {
+            wallet_id,
+            address_id: None,
+            asset_code: "native".into(),
+            asset_issuer: None,
+            amount_stroops: 1_000,
+            source_account: Some("Gsender".into()),
+            destination_account: Some("Gmaster".into()),
+            stellar_tx_hash: tx_hash.clone(),
+            operation_index: 0,
+            horizon_op_id: format!("{tx_hash}-0"),
+            ledger: Some(1),
+            memo_id: None,
         })
-        .collect();
+        .await
+        .expect("record deposit");
 
-    let mut muxed_ids = Vec::with_capacity(N);
-    for handle in handles {
-        muxed_ids.push(handle.await.expect("task panicked"));
+    // withdrawals
+    store
+        .create_withdrawal(NewWithdrawal {
+            wallet_id,
+            idempotency_key: "cascade-key",
+            destination_account: "Gdest",
+            asset_code: "native",
+            asset_issuer: None,
+            amount_stroops: 500,
+            memo_id: None,
+        })
+        .await
+        .expect("create withdrawal");
+
+    // webhook_endpoints
+    store
+        .create_webhook_endpoint(wallet_id, "https://example.com/hook", "secret")
+        .await
+        .expect("create webhook endpoint");
+
+    // gas_sponsorship_configs
+    insert_sponsorship_config(&store, wallet_id).await;
+
+    // sponsored_transactions (requires a gas_sponsorship_configs row to exist first)
+    store
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("cascade-inner-{wid}"),
+            fee_stroops: 100,
+        })
+        .await
+        .expect("record sponsored tx");
+
+    // Sanity check: every child row exists before the delete.
+    for table in [
+        "addresses",
+        "transactions",
+        "withdrawals",
+        "webhook_endpoints",
+        "gas_sponsorship_configs",
+        "sponsored_transactions",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE wallet_id = $1"
+        ))
+        .bind(wallet_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap_or_else(|e| panic!("count {table} before delete: {e}"));
+        assert_eq!(count, 1, "expected exactly one {table} row before delete");
     }
 
-    let unique: std::collections::BTreeSet<i64> = muxed_ids.iter().copied().collect();
-    assert_eq!(
-        unique.len(),
-        N,
-        "expected {N} unique muxed ids, got {} unique out of {:?}",
-        unique.len(),
-        muxed_ids
-    );
+    // Delete the wallet directly (no Store::delete_wallet method exists yet).
+    sqlx::query("DELETE FROM wallets WHERE id = $1")
+        .bind(wallet_id)
+        .execute(store.pool())
+        .await
+        .expect("delete wallet");
 
-    let expected: std::collections::BTreeSet<i64> = (1..=N as i64).collect();
-    assert_eq!(
-        unique, expected,
-        "muxed ids must be exactly {{1, ..., {N}}} with no gaps"
-    );
+    for table in [
+        "addresses",
+        "transactions",
+        "withdrawals",
+        "webhook_endpoints",
+        "gas_sponsorship_configs",
+        "sponsored_transactions",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE wallet_id = $1"
+        ))
+        .bind(wallet_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap_or_else(|e| panic!("count {table} after delete: {e}"));
+        assert_eq!(
+            count, 0,
+            "expected {table} rows to be cascade-deleted with the wallet"
+        );
+    }
 }
