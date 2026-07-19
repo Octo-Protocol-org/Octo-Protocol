@@ -21,5 +21,9 @@ master.key
 /data/
 *.log
 
+CLAUDE.md
+PLAN.md
+tasks/
+
 # Keep reference material out of release artifacts but tracked
 # (reference/ is intentionally NOT ignored)

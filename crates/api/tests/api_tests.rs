@@ -41,8 +41,51 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-// ... (باقي الدوال الموجودة أصلاً في ملفك: post, get, get_auth, post_auth, auth_token)
-// احتفظي بباقي الدوال القديمة هنا حتى لتحت (باش ما نكثروش الكود)
+fn get(uri: &str) -> Request<Body> {
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+/// GET with an Authorization bearer token.
+fn get_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// POST with no body but an Authorization bearer token.
+fn post_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Sign up a fresh user via the router and return its bearer token.
+async fn auth_token(app: &axum::Router) -> String {
+    let email = format!("u-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{email}","password":"supersecret"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    body_json(resp).await["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
 
 #[tokio::test]
 async fn test_oversized_body_returns_envelope() {
