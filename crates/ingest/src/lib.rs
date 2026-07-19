@@ -393,4 +393,74 @@ mod tests {
         });
         assert_eq!(memo_id_of(&r), None);
     }
+
+    // --- i64/u64 boundary tests -------------------------------------------
+    //
+    // muxed_id uses i64::try_from(decoded.id).ok() where decoded.id is u64.
+    // Any id above i64::MAX causes try_from to fail and the deposit becomes
+    // unattributed (None) rather than erroring. These tests lock that
+    // documented behavior in as an explicit regression guard.
+    //
+    // NOTE: if this silent-truncation behavior should change, do NOT fix it
+    // here — this file is test-only per issue #60. Raise the concern in the
+    // PR so a maintainer can decide (see the related backend tracking issue).
+
+    #[test]
+    fn muxed_id_at_i64_max_is_attributed() {
+        // i64::MAX fits in u64 and must round-trip through i64::try_from cleanly.
+        let muxed = octo_wallet_core::encode_muxed(BASE, i64::MAX as u64).unwrap();
+        let mut r = rec();
+        r.to_muxed = Some(muxed);
+        assert_eq!(
+            muxed_id_of(BASE, &r),
+            Some(i64::MAX),
+            "a muxed id of exactly i64::MAX must be attributed correctly"
+        );
+    }
+
+    #[test]
+    fn muxed_id_above_i64_max_is_unattributed_not_error() {
+        // i64::MAX + 1 overflows i64::try_from → must return None, not panic.
+        let above_max: u64 = i64::MAX as u64 + 1;
+        let muxed = octo_wallet_core::encode_muxed(BASE, above_max).unwrap();
+        let mut r = rec();
+        r.to_muxed = Some(muxed);
+        assert_eq!(
+            muxed_id_of(BASE, &r),
+            None,
+            "a muxed id above i64::MAX must be silently unattributed (current documented behavior)"
+        );
+    }
+
+    #[test]
+    fn memo_id_at_i64_max_is_attributed() {
+        // "9223372036854775807" is i64::MAX as a decimal string — must parse cleanly.
+        let mut r = rec();
+        r.transaction = Some(TransactionRecord {
+            memo_type: Some("id".into()),
+            memo: Some("9223372036854775807".into()), // i64::MAX
+            ledger: Some(1),
+        });
+        assert_eq!(
+            memo_id_of(&r),
+            Some(i64::MAX),
+            "memo string equal to i64::MAX must be attributed correctly"
+        );
+    }
+
+    #[test]
+    fn memo_id_above_i64_max_is_unattributed_not_error() {
+        // "9223372036854775808" is i64::MAX + 1 — parse::<i64>() fails → must return None.
+        let mut r = rec();
+        r.transaction = Some(TransactionRecord {
+            memo_type: Some("id".into()),
+            memo: Some("9223372036854775808".into()), // i64::MAX + 1
+            ledger: Some(1),
+        });
+        assert_eq!(
+            memo_id_of(&r),
+            None,
+            "memo string one above i64::MAX must be silently unattributed (current documented behavior)"
+        );
+    }
 }
