@@ -13,6 +13,16 @@ use octo_wallet_core::provision_wallet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Shared pagination query parameters used by list_wallets, list_transactions,
+/// and list_addresses. Mirrors `SponsoredTxnQuery`'s limit/before convention.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListParams {
+    /// Maximum rows to return (default 50, max 200).
+    pub limit: Option<i64>,
+    /// Cursor: return rows created before this id (exclusive).
+    pub before: Option<Uuid>,
+}
+
 /// Optional body for wallet creation.
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateWalletRequest {
@@ -47,21 +57,33 @@ pub struct WalletView {
     pub description: Option<String>,
 }
 
-/// Shared page-query params used by all list endpoints.
-#[derive(Debug, Default, Deserialize)]
-pub struct PageQuery {
-    /// Maximum rows to return (default 50, max 200).
-    pub limit: Option<i64>,
-    /// Cursor: return rows created before this id.
-    pub before: Option<Uuid>,
+/// Paginated list response for wallets.
+#[derive(Debug, Serialize)]
+pub struct WalletListResponse {
+    pub data: Vec<WalletView>,
+    /// UUID of the last row in this page, or null if there are no more rows.
+    pub next_cursor: Option<Uuid>,
 }
 
-/// Generic paginated response envelope.
+/// Paginated list response for transactions.
 #[derive(Debug, Serialize)]
-pub struct PageResponse<T> {
-    pub data: Vec<T>,
-    /// UUID of the last row in this page, or null when no more rows exist.
+pub struct TransactionListResponse {
+    pub data: Vec<octo_store::Transaction>,
+    /// UUID of the last row in this page, or null if there are no more rows.
     pub next_cursor: Option<Uuid>,
+}
+
+/// Validate a `limit` query param using the same bounds as `SponsoredTxnQuery`:
+/// default 50, min 1, max 200.
+pub fn validated_limit(limit: Option<i64>) -> Result<i64, ApiError> {
+    let l = limit.unwrap_or(50);
+    if l > 200 {
+        return Err(ApiError::BadRequest("limit must not exceed 200".into()));
+    }
+    if l < 1 {
+        return Err(ApiError::BadRequest("limit must be at least 1".into()));
+    }
+    Ok(l)
 }
 
 /// `POST /v1/wallets` — create a master wallet for the authenticated user.
@@ -136,26 +158,34 @@ pub async fn get_balances(
     Ok(Envelope::ok(balances))
 }
 
-/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals, paginated.
-///
-/// Query params: `?limit=50&before=<uuid>`
+/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet,
+/// with optional `?limit=` and `?before=` cursor pagination.
 pub async fn list_transactions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Query(q): Query<PageQuery>,
-) -> ApiResult<Json<Envelope<PageResponse<octo_store::Transaction>>>> {
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<Envelope<TransactionListResponse>>> {
     authorize_wallet(&headers, &state, id).await?;
     let _ = state.store().get_wallet(id).await?;
 
     let limit = validated_limit(q.limit)?;
+
+    // Fetch limit+1 to detect whether a next page exists.
     let rows = state
         .store()
-        .list_transactions_page(id, limit + 1, q.before)
+        .list_transactions(id, limit + 1, q.before)
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    Ok(Envelope::ok(make_page(rows, limit)))
+    let has_more = rows.len() > limit as usize;
+    let mut data = rows;
+    if has_more {
+        data.truncate(limit as usize);
+    }
+    let next_cursor = if has_more { data.last().map(|r| r.id) } else { None };
+
+    Ok(Envelope::ok(TransactionListResponse { data, next_cursor }))
 }
 
 fn to_view(w: octo_store::Wallet) -> WalletView {
@@ -182,62 +212,33 @@ pub async fn get_wallet(
     Ok(Envelope::ok(to_view(w)))
 }
 
-/// `GET /v1/wallets` — list the authenticated user's wallets, paginated.
-///
-/// Query params: `?limit=50&before=<uuid>`
+/// `GET /v1/wallets` — list the authenticated user's wallets, with optional
+/// `?limit=` and `?before=` cursor pagination.
 pub async fn list_wallets(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> ApiResult<Json<Envelope<Vec<WalletView>>>> {
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<Envelope<WalletListResponse>>> {
     let user_id = authenticate(&headers, &state).await?;
-    let wallets = state
+
+    let limit = validated_limit(q.limit)?;
+
+    // Fetch limit+1 to detect whether a next page exists.
+    let rows = state
         .store()
-        .list_wallets_for_user_page(user_id, limit + 1, q.before)
+        .list_wallets_for_user(user_id, limit + 1, q.before)
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    let page = make_page(rows, limit);
-    Ok(Envelope::ok(PageResponse {
-        data: page.data.into_iter().map(to_view).collect(),
-        next_cursor: page.next_cursor,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-/// Validate and clamp the `limit` query param (default 50, max 200).
-pub fn validated_limit(raw: Option<i64>) -> ApiResult<i64> {
-    let limit = raw.unwrap_or(50);
-    if limit < 1 {
-        return Err(ApiError::BadRequest("limit must be at least 1".into()));
-    }
-    if limit > 200 {
-        return Err(ApiError::BadRequest("limit must not exceed 200".into()));
-    }
-    Ok(limit)
-}
-
-/// Build a `PageResponse<T>` from `limit + 1` fetched rows: truncate to `limit` and derive
-/// `next_cursor` from the last kept row if there were more.
-pub fn make_page<T: HasId>(mut rows: Vec<T>, limit: i64) -> PageResponse<T> {
     let has_more = rows.len() > limit as usize;
+    let mut wallets = rows;
     if has_more {
-        rows.truncate(limit as usize);
+        wallets.truncate(limit as usize);
     }
-    let next_cursor = if has_more { rows.last().map(|r| r.id()) } else { None };
-    PageResponse { data: rows, next_cursor }
-}
+    let next_cursor = if has_more { wallets.last().map(|w| w.id) } else { None };
 
-/// Trait so `make_page` can read the `id` field generically.
-pub trait HasId {
-    fn id(&self) -> Uuid;
-}
-
-impl HasId for octo_store::Wallet {
-    fn id(&self) -> Uuid { self.id }
-}
-impl HasId for octo_store::Transaction {
-    fn id(&self) -> Uuid { self.id }
+    Ok(Envelope::ok(WalletListResponse {
+        data: wallets.into_iter().map(to_view).collect(),
+        next_cursor,
+    }))
 }

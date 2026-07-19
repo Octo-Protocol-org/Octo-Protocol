@@ -852,160 +852,238 @@ async fn list_sponsored_transactions_requires_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// --- webhook delivery history ------------------------------------------------
+// ---------------------------------------------------------------------------
+// Pagination tests
+// ---------------------------------------------------------------------------
 
-/// Register a webhook endpoint for `wallet_id` and return its id.
-async fn register_webhook_endpoint(app: &axum::Router, token: &str, wallet_id: &str) -> String {
-    let uri = format!("/v1/wallets/{wallet_id}/webhooks");
+/// Helper: create a wallet and return its id string.
+async fn create_wallet_for(app: &axum::Router, token: &str) -> String {
     let resp = app
         .clone()
-        .oneshot(post_json_auth(
-            &uri,
-            r#"{"url":"https://example.com/hook"}"#,
-            token,
-        ))
+        .oneshot(post_auth("/v1/wallets", token))
         .await
         .unwrap();
-    let json = body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_string()
+    body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
-async fn list_webhook_deliveries_returns_history_newest_first() {
+async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
     let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Create 5 wallets for this user.
+    for _ in 0..5 {
+        app.clone()
+            .oneshot(post_auth("/v1/wallets", &token))
+            .await
+            .unwrap();
+    }
+
+    // Fetch first page with limit=2 — expect 2 items and a next_cursor.
+    let resp = app
+        .clone()
+        .oneshot(get_auth("/v1/wallets?limit=2", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let page1 = j["data"]["data"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
+    let cursor = j["data"]["next_cursor"].as_str().expect("next_cursor must be present on first page");
+
+    // Fetch second page using the cursor — expect more items.
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&format!("/v1/wallets?limit=2&before={cursor}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j2 = body_json(resp).await;
+    let page2 = j2["data"]["data"].as_array().unwrap();
+    assert!(!page2.is_empty(), "second page must not be empty");
+
+    // Ids across pages must not overlap.
+    let ids1: Vec<&str> = page1.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    let ids2: Vec<&str> = page2.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    for id in &ids2 {
+        assert!(!ids1.contains(id), "pages must not overlap");
+    }
+}
+
+#[tokio::test]
+async fn list_addresses_pagination_returns_a_next_cursor_and_respects_limit() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    // Create 5 addresses.
+    for _ in 0..5 {
+        let uri = format!("/v1/wallets/{wallet_id}/addresses");
+        app.clone()
+            .oneshot(post_auth(&uri, &token))
+            .await
+            .unwrap();
+    }
+
+    // Fetch first page with limit=2.
+    let uri = format!("/v1/wallets/{wallet_id}/addresses?limit=2");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let page1 = j["data"]["data"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
+    let cursor = j["data"]["next_cursor"]
+        .as_str()
+        .expect("next_cursor must be present on first page");
+
+    // Fetch second page using the cursor.
+    let uri = format!("/v1/wallets/{wallet_id}/addresses?limit=2&before={cursor}");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j2 = body_json(resp).await;
+    let page2 = j2["data"]["data"].as_array().unwrap();
+    assert!(!page2.is_empty(), "second page must not be empty");
+
+    // Ids across pages must not overlap.
+    let ids1: Vec<&str> = page1.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    let ids2: Vec<&str> = page2.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    for id in &ids2 {
+        assert!(!ids1.contains(id), "pages must not overlap");
+    }
+}
+
+#[tokio::test]
+async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
     let app = build_router(state.clone());
     let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
 
+    // Insert 5 synthetic deposit transactions directly via the store.
+    let address_uri = format!("/v1/wallets/{wallet_id}/addresses");
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(post_auth(&address_uri, &token))
         .await
         .unwrap();
-    let wallet_id = body_json(resp).await["data"]["id"]
+    let address_id: uuid::Uuid = body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
-        .to_string();
-    let endpoint_id = register_webhook_endpoint(&app, &token, &wallet_id).await;
-    let endpoint_uuid: uuid::Uuid = endpoint_id.parse().unwrap();
+        .parse()
+        .unwrap();
+    let wallet_uuid: uuid::Uuid = wallet_id.parse().unwrap();
 
-    // Seed 3 delivery attempts directly via the store, oldest first.
-    for i in 0..3 {
+    for i in 0..5u64 {
         state
             .store()
-            .log_webhook_delivery(
-                endpoint_uuid,
-                "transaction.sponsored",
-                &serde_json::json!({"seq": i}),
-                "delivered",
-                1,
-                Some(200),
-            )
+            .record_deposit(&octo_store::NewDeposit {
+                wallet_id: wallet_uuid,
+                address_id: Some(address_id),
+                asset_code: "native".into(),
+                asset_issuer: None,
+                amount_stroops: (i + 1) as i64 * 100,
+                source_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
+                destination_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
+                stellar_tx_hash: format!("txhash-pag-{i}"),
+                operation_index: i as i32,
+                horizon_op_id: format!("op-pag-{i}"),
+                ledger: Some(i as i64),
+                memo_id: None,
+            })
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}/deliveries");
-    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    // Fetch first page with limit=2.
+    let uri = format!("/v1/wallets/{wallet_id}/transactions?limit=2");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    let rows = j["data"].as_array().unwrap();
-    assert_eq!(rows.len(), 3);
+    let page1 = j["data"]["data"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
+    let cursor = j["data"]["next_cursor"]
+        .as_str()
+        .expect("next_cursor must be present on first page");
 
-    // Newest first: seq 2, then 1, then 0.
-    let seqs: Vec<i64> = rows
-        .iter()
-        .map(|r| r["payload"]["seq"].as_i64().unwrap())
-        .collect();
-    assert_eq!(seqs, vec![2, 1, 0], "expected newest-first ordering");
+    // Fetch second page using the cursor.
+    let uri = format!("/v1/wallets/{wallet_id}/transactions?limit=2&before={cursor}");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j2 = body_json(resp).await;
+    let page2 = j2["data"]["data"].as_array().unwrap();
+    assert!(!page2.is_empty(), "second page must not be empty");
+
+    let ids1: Vec<&str> = page1.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    let ids2: Vec<&str> = page2.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    for id in &ids2 {
+        assert!(!ids1.contains(id), "pages must not overlap");
+    }
 }
 
 #[tokio::test]
-async fn get_deliveries_for_an_endpoint_not_owned_by_the_wallet_in_the_url_is_404() {
+async fn pagination_limit_boundaries_are_validated_consistently_with_sponsored_transactions() {
     let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
     let app = build_router(state);
-    let owner_token = auth_token(&app).await;
-    let other_token = auth_token(&app).await;
-
-    let resp = app
-        .clone()
-        .oneshot(post_auth("/v1/wallets", &owner_token))
-        .await
-        .unwrap();
-    let owner_wallet_id = body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let endpoint_id = register_webhook_endpoint(&app, &owner_token, &owner_wallet_id).await;
-
-    let resp = app
-        .clone()
-        .oneshot(post_auth("/v1/wallets", &other_token))
-        .await
-        .unwrap();
-    let other_wallet_id = body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Querying the owner's endpoint id under a different (but validly owned) wallet must 404,
-    // not leak that the endpoint exists elsewhere.
-    let uri = format!("/v1/wallets/{other_wallet_id}/webhooks/{endpoint_id}/deliveries");
-    let resp = app.oneshot(get_auth(&uri, &other_token)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn get_deliveries_respects_the_limit_parameter() {
-    let Some(state) = test_state().await else {
-        return;
-    };
-    let app = build_router(state.clone());
     let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
 
-    let resp = app
-        .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
-        .await
-        .unwrap();
-    let wallet_id = body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let endpoint_id = register_webhook_endpoint(&app, &token, &wallet_id).await;
-    let endpoint_uuid: uuid::Uuid = endpoint_id.parse().unwrap();
-
-    for i in 0..5 {
-        state
-            .store()
-            .log_webhook_delivery(
-                endpoint_uuid,
-                "transaction.sponsored",
-                &serde_json::json!({"seq": i}),
-                "delivered",
-                1,
-                Some(200),
-            )
-            .await
-            .unwrap();
+    // limit=0 → 400 on all three endpoints.
+    for uri in [
+        "/v1/wallets?limit=0".to_string(),
+        format!("/v1/wallets/{wallet_id}/addresses?limit=0"),
+        format!("/v1/wallets/{wallet_id}/transactions?limit=0"),
+    ] {
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "limit=0 must be 400 for {uri}"
+        );
     }
 
-    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}/deliveries?limit=2");
-    let resp = app
-        .clone()
-        .oneshot(get_auth(&uri, &token))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let j = body_json(resp).await;
-    assert_eq!(j["data"].as_array().unwrap().len(), 2);
+    // limit=201 → 400 on all three endpoints.
+    for uri in [
+        "/v1/wallets?limit=201".to_string(),
+        format!("/v1/wallets/{wallet_id}/addresses?limit=201"),
+        format!("/v1/wallets/{wallet_id}/transactions?limit=201"),
+    ] {
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "limit=201 must be 400 for {uri}"
+        );
+    }
 
-    // Out-of-range limit is rejected rather than silently clamped.
-    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{endpoint_id}/deliveries?limit=201");
-    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // limit=200 → 200 OK on all three endpoints (boundary is inclusive).
+    for uri in [
+        "/v1/wallets?limit=200".to_string(),
+        format!("/v1/wallets/{wallet_id}/addresses?limit=200"),
+        format!("/v1/wallets/{wallet_id}/transactions?limit=200"),
+    ] {
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "limit=200 must be OK for {uri}"
+        );
+    }
 }

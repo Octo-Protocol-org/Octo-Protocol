@@ -7,7 +7,7 @@
 use crate::auth::authorize_wallet;
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
-use crate::routes::wallets::{make_page, validated_limit, HasId, PageQuery, PageResponse};
+use crate::routes::wallets::ListParams;
 use crate::state::AppState;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -41,10 +41,12 @@ pub struct AddressView {
     pub metadata: serde_json::Value,
 }
 
-impl HasId for AddressView {
-    fn id(&self) -> Uuid {
-        self.id
-    }
+/// Paginated list response for addresses.
+#[derive(Debug, Serialize)]
+pub struct AddressListResponse {
+    pub data: Vec<AddressView>,
+    /// UUID of the last row in this page, or null if there are no more rows.
+    pub next_cursor: Option<Uuid>,
 }
 
 /// `POST /v1/wallets/{id}/addresses`
@@ -103,27 +105,33 @@ pub async fn create_address(
     Ok((status, json))
 }
 
-/// `GET /v1/wallets/{id}/addresses` — paginated address list.
-///
-/// Query params: `?limit=50&before=<uuid>`
+/// `GET /v1/wallets/{id}/addresses` — list deposit addresses for a wallet, with optional
+/// `?limit=` and `?before=` cursor pagination.
 pub async fn list_addresses(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
-    Query(q): Query<PageQuery>,
-) -> ApiResult<Json<Envelope<PageResponse<AddressView>>>> {
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<Envelope<AddressListResponse>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
 
-    let limit = validated_limit(q.limit)?;
+    let limit = crate::routes::wallets::validated_limit(q.limit)?;
+
+    // Fetch limit+1 to detect whether a next page exists.
     let rows = state
         .store()
-        .list_addresses_page(wallet_id, limit + 1, q.before)
-        .await
-        .map_err(|_| ApiError::Internal)?;
+        .list_addresses(wallet_id, limit + 1, q.before)
+        .await?;
 
-    let base = wallet.stellar_account_g.clone();
-    let views: Vec<AddressView> = rows
+    let has_more = rows.len() > limit as usize;
+    let mut items = rows;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = if has_more { items.last().map(|a| a.id) } else { None };
+
+    let views = items
         .into_iter()
         .map(|a| AddressView {
             id: a.id,
@@ -135,5 +143,8 @@ pub async fn list_addresses(
         })
         .collect();
 
-    Ok(Envelope::ok(make_page(views, limit)))
+    Ok(Envelope::ok(AddressListResponse {
+        data: views,
+        next_cursor,
+    }))
 }
