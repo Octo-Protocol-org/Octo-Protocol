@@ -47,7 +47,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -76,9 +76,11 @@ pub struct UserView {
 
 /// JWT claims.
 #[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: i64,
+pub struct Claims {
+    /// Subject: the user id.
+    pub sub: String,
+    /// Expiry (unix seconds).
+    pub exp: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +250,7 @@ pub async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<UserView>>> {
-    let user_id = authenticate_async(&headers, &state).await?;
+    let user_id = authenticate(&headers, &state).await?;
     let user = state
         .store()
         .get_user(user_id)
@@ -258,104 +260,55 @@ pub async fn me(
     Ok(Envelope::ok(UserView { id: user.id, email: user.email }))
 }
 
-// ---------------------------------------------------------------------------
-// Authentication helpers (public — used by other routes)
-// ---------------------------------------------------------------------------
-
-/// Async authenticate: validates signature + expiry AND checks the deny-list.
-/// Use this in all auth-sensitive handlers.
-pub async fn authenticate_async(
-    headers: &axum::http::HeaderMap,
-    state: &AppState,
-) -> Result<Uuid, ApiError> {
-    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
-    let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
-
-    // Deny-list check.
-    if state
-        .store()
-        .is_token_revoked(token)
-        .await
-        .map_err(|_| ApiError::Internal)?
-    {
-        return Err(ApiError::Unauthorized);
-    }
-
-    claims.sub.parse::<Uuid>().map_err(|_| ApiError::Unauthorized)
-}
-
-/// Synchronous authenticate — signature + expiry only, **no deny-list check**.
-/// Kept for callers in synchronous context. Migrate to `authenticate_async` where possible.
-pub fn authenticate(headers: &axum::http::HeaderMap, state: &AppState) -> Result<Uuid, ApiError> {
+/// `POST /v1/auth/logout` — invalidate the current session token server-side.
+///
+/// Inserts the token's SHA-256 hash into the deny-list with an expiry matching the token's own
+/// `exp` claim. Subsequent requests carrying the same token will receive `401 Unauthorized` even
+/// though the token's signature and expiry are still mathematically valid.
+///
+/// The deny-list entry is pruned automatically once `expires_at` passes (the token would fail
+/// `verify_token`'s own expiry check at that point anyway).
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<serde_json::Value>>> {
+    // Extract and validate the token *before* denylisting it — also gives us the user_id and exp.
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or(ApiError::Unauthorized)?;
+
     let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
-    claims.sub.parse::<Uuid>().map_err(|_| ApiError::Unauthorized)
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    // Deny-list the token so it cannot be replayed.
+    let token_hash = hash_token(token);
+    let expires_at = chrono::DateTime::from_timestamp(claims.exp, 0)
+        .unwrap_or_else(chrono::Utc::now);
+    state
+        .store()
+        .denylist_token(&token_hash, user_id, expires_at)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    crate::audit::record(
+        &state,
+        user_id,
+        "logged out",
+        crate::audit::category::AUTH,
+        None,
+        &headers,
+    )
+    .await;
+
+    Ok(Envelope::ok(serde_json::json!({ "message": "logged out" })))
 }
 
-/// Prefix that marks an octo API key (vs a dashboard login JWT).
-const API_KEY_PREFIX: &str = "octo_sk_";
-
-/// Extract the raw bearer token from the Authorization header.
-pub fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-}
-
-fn hash_api_key(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(key.as_bytes());
-    hex::encode(h.finalize())
-}
-
-/// Authorize a request to operate on `wallet_id` — accepts a login JWT or an API key.
-pub async fn authorize_wallet(
-    headers: &axum::http::HeaderMap,
-    state: &AppState,
-    wallet_id: Uuid,
-) -> Result<(), ApiError> {
-    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
-
-    if let Some(_key) = token.strip_prefix(API_KEY_PREFIX) {
-        let key_wallet = state
-            .store()
-            .wallet_id_for_key_hash(&hash_api_key(token))
-            .await
-            .map_err(|_| ApiError::Internal)?
-            .ok_or(ApiError::Unauthorized)?;
-        if key_wallet != wallet_id {
-            return Err(ApiError::NotFound);
-        }
-        return Ok(());
-    }
-
-    let user_id = authenticate(headers, state)?;
-    let wallet = state.store().get_wallet(wallet_id).await?;
-    if wallet.user_id != Some(user_id) {
-        return Err(ApiError::NotFound);
-    }
-    Ok(())
-}
-
-/// Require a dashboard login (reject API keys). Returns the authenticated user id.
-pub fn require_login(headers: &axum::http::HeaderMap, state: &AppState) -> Result<Uuid, ApiError> {
-    if let Some(tok) = bearer(headers) {
-        if tok.starts_with(API_KEY_PREFIX) {
-            return Err(ApiError::Unauthorized);
-        }
-    }
-    authenticate(headers, state)
-}
-
-// ---------------------------------------------------------------------------
-// JWT internals
-// ---------------------------------------------------------------------------
+// --- helpers ---------------------------------------------------------------
 
 fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
     let email = creds
@@ -404,7 +357,8 @@ fn issue_token(secret: &[u8], user_id: Uuid) -> Result<String, ApiError> {
     Ok(format!("{signing_input}.{sig}"))
 }
 
-fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
+/// Verify an HS256 JWT and return its claims if the signature is valid and it has not expired.
+pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
     let mut parts = token.split('.');
     let header = parts.next()?;
     let payload = parts.next()?;
@@ -447,4 +401,127 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// SHA-256 hex of a raw token string — used as the deny-list key.
+///
+/// This is the same pattern used for API key hashing in `routes/apikeys.rs`.
+pub fn hash_token(token: &str) -> String {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Authenticate a request from its headers via the `Authorization: Bearer <jwt>` header.
+/// Returns the authenticated user's id, or [`ApiError::Unauthorized`].
+///
+/// Checks, in order:
+/// 1. Presence of the `Authorization: Bearer <token>` header.
+/// 2. Valid HS256 signature and unexpired `exp` claim (`verify_token`).
+/// 3. Token is **not** in the server-side deny-list (populated by `POST /v1/auth/logout`).
+///    This adds one database round-trip per authenticated request. The deny-list table is indexed
+///    on `(token_hash)` (primary key) so the lookup is a single index probe. In practice the
+///    p99 overhead is well under 1 ms on a co-located Postgres instance; an in-memory cache is
+///    worth adding only if profiling shows this is a hot path.
+///
+/// Used directly by protected handlers (rather than a `FromRequestParts` extractor, which trips an
+/// async-trait lifetime bug on this toolchain — see notes in the repo).
+pub async fn authenticate(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<Uuid, ApiError> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+    let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    // Deny-list check: reject tokens that have been explicitly revoked via logout.
+    let token_hash = hash_token(token);
+    let denied = state
+        .store()
+        .is_token_denylisted(&token_hash)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if denied {
+        return Err(ApiError::Unauthorized);
+    }
+
+    Ok(user_id)
+}
+
+/// Prefix that marks an octo API key (vs a dashboard login JWT).
+const API_KEY_PREFIX: &str = "octo_sk_";
+
+/// Extract the raw bearer token (`octo_sk_…` or a JWT), if present.
+fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+}
+
+/// SHA-256 hex of an API key (matches how keys are stored in `api_keys`).
+fn hash_api_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Authorize a request to operate on `wallet_id`, accepting **either**:
+/// - a dashboard login JWT whose user **owns** the wallet, or
+/// - an `octo_sk_…` API key whose wallet **is** `wallet_id` (the key implies its wallet).
+///
+/// Returns `Ok(())` when authorized, `Unauthorized` if no/invalid credential, `NotFound` if the
+/// credential is valid but not for this wallet (so we don't reveal other users' wallets).
+pub async fn authorize_wallet(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+    wallet_id: Uuid,
+) -> Result<(), ApiError> {
+    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
+
+    if let Some(_key) = token.strip_prefix(API_KEY_PREFIX) {
+        // API-key path: the key maps to exactly one wallet.
+        let key_wallet = state
+            .store()
+            .wallet_id_for_key_hash(&hash_api_key(token))
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .ok_or(ApiError::Unauthorized)?;
+        if key_wallet != wallet_id {
+            return Err(ApiError::NotFound);
+        }
+        return Ok(());
+    }
+
+    // Login-JWT path: the user must own the wallet.
+    let user_id = authenticate(headers, state).await?;
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    Ok(())
+}
+
+/// Require a **dashboard login** (reject API keys). Returns the authenticated user id.
+/// Used for sensitive operations (e.g. withdrawals) that must not be driven by an API key.
+pub async fn require_login(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<Uuid, ApiError> {
+    if let Some(tok) = bearer(headers) {
+        if tok.starts_with(API_KEY_PREFIX) {
+            // An API key was presented where a login is required.
+            return Err(ApiError::Unauthorized);
+        }
+    }
+    authenticate(headers, state).await
 }

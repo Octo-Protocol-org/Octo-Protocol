@@ -1,26 +1,22 @@
--- 0008_token_denylist.sql
+-- Token deny-list: server-side JWT revocation for logout.
 --
--- Token deny-list for JWT session revocation.
+-- JWTs are stateless by design, but a captured token would otherwise remain valid for up to 7 days
+-- after the user logs out. This table provides a bounded deny-list keyed on a SHA-256 hash of the
+-- token (the raw token is never stored). Entries expire naturally: a background job or a periodic
+-- DELETE can prune rows where expires_at < now(), keeping the table small.
 --
--- Design (see docs/threat-model.md and PR for #127):
---  * Revoked tokens are stored by their full token string (or a hash — we store the raw token
---    here for simplicity; a SHA-256 hash would reduce storage but requires the caller to hash
---    before inserting. The token is already a signed opaque string with no plaintext secret in it,
---    so storing it verbatim is safe).
---  * expires_at mirrors the token's own `exp` claim so a scheduled job (or a simple WHERE clause)
---    can purge rows that are past their natural expiry — a token past `exp` would be rejected by
---    verify_token() anyway, so its deny-list row serves no purpose after that point.
---  * The PRIMARY KEY on token ensures O(1) lookup and deduplication (revoking an already-revoked
---    token is a no-op).
+-- Security note: only the hash is stored, so a database breach does not expose tokens that could
+-- be replayed against the API.
 
-CREATE TABLE IF NOT EXISTS token_denylist (
-    -- The full JWT string. Already a compact, non-secret opaque value.
-    token       TEXT PRIMARY KEY,
-    -- UTC timestamp when the token's `exp` claim fires. Used to prune stale rows.
+CREATE TABLE token_denylist (
+    -- SHA-256 hex of the raw JWT — the lookup key.
+    token_hash  TEXT        PRIMARY KEY,
+    -- Mirrors the token's own `exp` claim so pruning is safe and deterministic.
     expires_at  TIMESTAMPTZ NOT NULL,
-    -- When the revocation was recorded (audit trail).
-    revoked_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- Informational: which user revoked this token (CASCADE so old user rows don't block pruning).
+    user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Partial index to make the periodic purge query efficient.
-CREATE INDEX IF NOT EXISTS idx_denylist_expires ON token_denylist (expires_at);
+-- Fast expiry-based pruning: DELETE FROM token_denylist WHERE expires_at < now()
+CREATE INDEX idx_token_denylist_expires ON token_denylist(expires_at);

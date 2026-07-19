@@ -70,7 +70,7 @@ pub async fn create_wallet(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<CreateWalletResponse>>)> {
-    let user_id = authenticate(&headers, &state)?;
+    let user_id = authenticate(&headers, &state).await?;
     let req: CreateWalletRequest = parse_optional(&body)?;
     let label = req.label;
     let description = req.description;
@@ -188,12 +188,9 @@ pub async fn get_wallet(
 pub async fn list_wallets(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<PageQuery>,
-) -> ApiResult<Json<Envelope<PageResponse<WalletView>>>> {
-    let user_id = authenticate(&headers, &state)?;
-
-    let limit = validated_limit(q.limit)?;
-    let rows = state
+) -> ApiResult<Json<Envelope<Vec<WalletView>>>> {
+    let user_id = authenticate(&headers, &state).await?;
+    let wallets = state
         .store()
         .list_wallets_for_user_page(user_id, limit + 1, q.before)
         .await

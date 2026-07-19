@@ -22,7 +22,7 @@ pub async fn list_audit_logs(
     headers: HeaderMap,
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<Envelope<Vec<octo_store::AuditLog>>>> {
-    let user_id = authenticate(&headers, &state)?;
+    let user_id = authenticate(&headers, &state).await?;
     let category = q.category.filter(|c| !c.is_empty() && c != "all");
     let search = q.search.filter(|s| !s.is_empty());
 

@@ -187,3 +187,161 @@ async fn short_password_rejected() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// Logout / deny-list tests
+// ---------------------------------------------------------------------------
+
+/// Helper: sign up a fresh user and return (cloneable app, token).
+async fn signup_and_get_token(state: AppState) -> (axum::Router, String) {
+    let app = build_router(state);
+    let email = unique_email();
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    let token = body_json(resp).await["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (app, token)
+}
+
+/// `POST /v1/auth/logout` must return 401 when no bearer token is supplied.
+#[tokio::test]
+async fn logout_requires_authentication() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/logout")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// After logout the same token must be rejected on all subsequent authenticated requests.
+#[tokio::test]
+async fn logout_invalidates_the_current_token_for_subsequent_requests() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let (app, token) = signup_and_get_token(state).await;
+
+    // Token is valid before logout.
+    let pre = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pre.status(), StatusCode::OK, "token should be valid before logout");
+
+    // Logout — expect 200.
+    let logout_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/logout")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_resp.status(), StatusCode::OK, "logout should succeed");
+
+    // The same token must now be rejected.
+    let post = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        post.status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked token must be rejected even though signature and expiry are still valid"
+    );
+}
+
+/// A token that has been deny-listed must be rejected by `authenticate` even when its
+/// HS256 signature is valid and the `exp` claim has not yet passed.
+///
+/// This test inserts the token hash directly via `Store::denylist_token` (bypassing the logout
+/// route) to prove the check in `authenticate` works independently of the handler.
+#[tokio::test]
+async fn denylisted_token_is_rejected_even_though_its_signature_and_expiry_are_still_valid() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let (app, token) = signup_and_get_token(state.clone()).await;
+
+    // Confirm the token is valid before we manually deny-list it.
+    let before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.status(), StatusCode::OK, "token must be valid before deny-listing");
+
+    // Decode the token to get user_id and exp, then insert into deny-list directly.
+    let claims = octo_api::auth::verify_token(state.jwt_secret(), &token)
+        .expect("token must be decodable");
+    let user_id: uuid::Uuid = claims.sub.parse().unwrap();
+    let expires_at = chrono::DateTime::from_timestamp(claims.exp, 0)
+        .unwrap_or_else(chrono::Utc::now);
+    let token_hash = octo_api::auth::hash_token(&token);
+    state
+        .store()
+        .denylist_token(&token_hash, user_id, expires_at)
+        .await
+        .expect("denylist_token must succeed");
+
+    // Now the token must be rejected — signature and expiry are still valid.
+    let after = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        StatusCode::UNAUTHORIZED,
+        "deny-listed token must be rejected regardless of signature/expiry validity"
+    );
+}
