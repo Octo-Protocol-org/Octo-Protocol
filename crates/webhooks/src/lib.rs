@@ -163,10 +163,11 @@ pub fn is_safe_url(url: &str) -> bool {
         Some((_, rest)) => rest,
         None => return false,
     };
-    let host = after_scheme
+    let raw_host = after_scheme
         .split(['/', ':', '?', '#'])
         .next()
         .unwrap_or("");
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
 
     if host.is_empty() {
         return false;
@@ -199,7 +200,31 @@ pub fn is_safe_url(url: &str) -> bool {
             }
         }
     }
-    true
+    // IPv4 100.64.0.0/10 (carrier-grade NAT)
+if host.starts_with("100.") {
+    if let Some(rest) = host.strip_prefix("100.") {
+        if let Some(second) = rest.split('.').next() {
+            if let Ok(n) = second.parse::<u8>() {
+                if (64..=127).contains(&n) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+// IPv6 checks (loopback, link-local, unique-local)
+if host.contains(":") {
+    if host == "::1" || host == "::" {
+        return false;
+    }
+    if host.starts_with("fe80:") {
+        return false;
+    }
+    if host.starts_with("fc") || host.starts_with("fd") {
+        return false;
+    }
+}
+true
 }
 
 #[cfg(test)]
@@ -229,5 +254,14 @@ mod tests {
     fn allows_172_outside_private_block() {
         assert!(is_safe_url("http://172.15.0.1/x"));
         assert!(is_safe_url("http://172.32.0.1/x"));
+    }
+
+    #[test]
+    fn blocks_ipv6_and_shared_address() {
+        assert!(!is_safe_url("http://[::1]/hook"));
+        assert!(!is_safe_url("http://[fe80::1]/hook"));
+        assert!(!is_safe_url("http://[fc00::1]/hook"));
+        assert!(!is_safe_url("http://[fd00::1]/hook"));
+        assert!(!is_safe_url("http://100.64.5.5/x"));
     }
 }
