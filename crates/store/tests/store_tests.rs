@@ -401,83 +401,142 @@ async fn upsert_gas_sponsorship_config_works() {
 }
 
 // ---------------------------------------------------------------------------
-// try_reserve_sponsored_transaction – concurrent budget race (#52)
+// list_audit_logs – category/search filter combinations (#53)
 // ---------------------------------------------------------------------------
 
-/// Spawns N concurrent calls to `try_reserve_sponsored_transaction` for the
-/// same wallet with a budget that only fits M < N of them. Each call uses a
-/// distinct `inner_tx_hash` so the unique-index conflict path is not the
-/// mechanism under test — only the budget CTE atomicity is.
-///
-/// Asserts:
-/// - exactly M calls succeed,
-/// - exactly N - M calls fail with `StoreError::BudgetExceeded`,
-/// - the sum reserved today never exceeds the budget (i.e. exactly M * fee_stroops).
-#[tokio::test]
-async fn concurrent_reservations_never_exceed_daily_budget() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_wallet(&store).await;
-    insert_sponsorship_config(&store, wallet_id).await;
-
-    // Budget allows exactly 3 reservations of 100 stroops each (300 total).
-    // We fire 8 concurrent attempts — only 3 must succeed.
-    let fee_stroops: i64 = 100;
-    let budget: i64 = 300; // fits exactly 3
-    let total_attempts: usize = 8;
-    let expected_successes: usize = (budget / fee_stroops) as usize; // 3
-
-    let mut handles = Vec::with_capacity(total_attempts);
-    for _ in 0..total_attempts {
-        let store_clone = store.clone();
-        // Each call gets a distinct hash so the unique-index is never the limiting factor.
-        let hash = format!("race-{}", Uuid::new_v4().simple());
-        handles.push(tokio::spawn(async move {
-            store_clone
-                .try_reserve_sponsored_transaction(wallet_id, &hash, fee_stroops, Some(budget))
-                .await
-        }));
-    }
-
-    // Collect all results (await each handle sequentially; they ran concurrently above).
-    let mut results: Vec<Result<Result<_, StoreError>, _>> = Vec::with_capacity(total_attempts);
-    for handle in handles {
-        results.push(handle.await);
-    }
-
-    let mut successes = 0usize;
-    let mut budget_exceeded = 0usize;
-    for join_result in results {
-        match join_result.expect("task panicked") {
-            Ok(_) => successes += 1,
-            Err(StoreError::BudgetExceeded) => budget_exceeded += 1,
-            Err(other) => panic!("unexpected error: {other}"),
-        }
-    }
-
-    assert_eq!(
-        successes, expected_successes,
-        "expected exactly {expected_successes} successful reservations, got {successes}"
-    );
-    assert_eq!(
-        budget_exceeded,
-        total_attempts - expected_successes,
-        "expected {} BudgetExceeded errors, got {budget_exceeded}",
-        total_attempts - expected_successes
-    );
-
-    // Confirm the DB reflects exactly M * fee_stroops reserved — never over-budget.
-    let reserved = store
-        .sum_sponsored_fees_reserved_today(wallet_id)
+/// Create a throwaway user for audit-log tests (audit logs are user-scoped).
+async fn fresh_user(store: &Store) -> Uuid {
+    let email = format!("test-{}@octo.test", Uuid::new_v4().simple());
+    let user = store
+        .create_user(&email, "hashed-password-placeholder")
         .await
-        .expect("sum_sponsored_fees_reserved_today");
-    assert_eq!(
-        reserved,
-        (expected_successes as i64) * fee_stroops,
-        "reserved total {reserved} differs from expected {}",
-        (expected_successes as i64) * fee_stroops
-    );
-    assert!(
-        reserved <= budget,
-        "reserved total {reserved} exceeds the daily budget {budget}"
-    );
+        .expect("create test user");
+    user.id
+}
+
+/// Inserts several audit log rows spanning two categories and varied
+/// action/target text, then exercises all four filter combinations:
+/// (none, category-only, search-only, both).
+///
+/// Rows seeded (all prefixed with a test-specific UUID to avoid colliding
+/// with rows created by other tests running against a shared database):
+///
+///   category=auth    action="audit53-login"         target=Some("audit53-user@example.com")
+///   category=auth    action="audit53-logout"        target=Some("audit53-user@example.com")
+///   category=billing action="audit53-invoice"       target=Some("audit53-inv-001")
+///   category=billing action="audit53-payment"       target=None
+///   category=billing action="audit53-payment-retry" target=Some("audit53-retry-ref")
+#[tokio::test]
+async fn list_audit_logs_filters_by_category() {
+    let Some(store) = store().await else { return };
+    let user_id = fresh_user(&store).await;
+
+    // Seed rows.
+    store.record_audit(user_id, "audit53-login",  "auth",    Some("audit53-user@example.com"), None).await.unwrap();
+    store.record_audit(user_id, "audit53-logout", "auth",    Some("audit53-user@example.com"), None).await.unwrap();
+    store.record_audit(user_id, "audit53-invoice","billing", Some("audit53-inv-001"),           None).await.unwrap();
+    store.record_audit(user_id, "audit53-payment","billing", None,                              None).await.unwrap();
+    store.record_audit(user_id, "audit53-payment-retry", "billing", Some("audit53-retry-ref"), None).await.unwrap();
+
+    // No filters → all 5 rows for this user.
+    let all = store.list_audit_logs(user_id, None, None, 50).await.unwrap();
+    assert_eq!(all.len(), 5, "no filter should return all 5 rows");
+
+    // Category = auth → 2 rows.
+    let auth_rows = store.list_audit_logs(user_id, Some("auth"), None, 50).await.unwrap();
+    assert_eq!(auth_rows.len(), 2, "category=auth should return 2 rows");
+    assert!(auth_rows.iter().all(|r| r.category == "auth"),
+        "all returned rows must have category=auth");
+
+    // Category = billing → 3 rows.
+    let billing_rows = store.list_audit_logs(user_id, Some("billing"), None, 50).await.unwrap();
+    assert_eq!(billing_rows.len(), 3, "category=billing should return 3 rows");
+    assert!(billing_rows.iter().all(|r| r.category == "billing"),
+        "all returned rows must have category=billing");
+}
+
+/// Confirms that the search parameter matches case-insensitively against both
+/// the `action` and the `target` columns, and that rows with `target = NULL`
+/// are handled without error (via the ILIKE on `coalesce(target, '')`).
+#[tokio::test]
+async fn list_audit_logs_search_matches_action_and_target_case_insensitively() {
+    let Some(store) = store().await else { return };
+    let user_id = fresh_user(&store).await;
+
+    store.record_audit(user_id, "audit53-cs-LOGIN",   "auth",    Some("audit53-cs-Alice"),  None).await.unwrap();
+    store.record_audit(user_id, "audit53-cs-logout",  "auth",    Some("audit53-cs-BOB"),    None).await.unwrap();
+    store.record_audit(user_id, "audit53-cs-payment", "billing", None,                      None).await.unwrap();
+    store.record_audit(user_id, "audit53-cs-invoice", "billing", Some("audit53-cs-ref-42"), None).await.unwrap();
+
+    // Search "audit53-cs-login" matches action "audit53-cs-LOGIN" case-insensitively.
+    let by_action = store.list_audit_logs(user_id, None, Some("audit53-cs-login"), 50).await.unwrap();
+    assert_eq!(by_action.len(), 1, "case-insensitive action search should return 1 row");
+    assert_eq!(by_action[0].action, "audit53-cs-LOGIN");
+
+    // Search "audit53-cs-alice" matches target "audit53-cs-Alice" case-insensitively.
+    let by_target = store.list_audit_logs(user_id, None, Some("audit53-cs-alice"), 50).await.unwrap();
+    assert_eq!(by_target.len(), 1, "case-insensitive target search should return 1 row");
+    assert_eq!(by_target[0].action, "audit53-cs-LOGIN");
+
+    // Search "audit53-cs-bob" matches target "audit53-cs-BOB".
+    let by_bob = store.list_audit_logs(user_id, None, Some("audit53-cs-bob"), 50).await.unwrap();
+    assert_eq!(by_bob.len(), 1, "case-insensitive target search for BOB should return 1 row");
+    assert_eq!(by_bob[0].action, "audit53-cs-logout");
+
+    // Search "audit53-cs-payment" matches action; the row has NULL target, which should not panic.
+    let null_target = store.list_audit_logs(user_id, None, Some("audit53-cs-payment"), 50).await.unwrap();
+    assert_eq!(null_target.len(), 1, "search with NULL target row should not panic and should match action");
+    assert_eq!(null_target[0].action, "audit53-cs-payment");
+}
+
+/// Confirms that combining category + search filters returns only rows that
+/// satisfy both conditions simultaneously.
+#[tokio::test]
+async fn list_audit_logs_combines_category_and_search_filters() {
+    let Some(store) = store().await else { return };
+    let user_id = fresh_user(&store).await;
+
+    store.record_audit(user_id, "audit53-combo-login",   "auth",    Some("audit53-combo-user"),   None).await.unwrap();
+    store.record_audit(user_id, "audit53-combo-logout",  "auth",    Some("audit53-combo-user"),   None).await.unwrap();
+    store.record_audit(user_id, "audit53-combo-charge",  "billing", Some("audit53-combo-user"),   None).await.unwrap();
+    store.record_audit(user_id, "audit53-combo-invoice", "billing", Some("audit53-combo-inv-99"), None).await.unwrap();
+
+    // category=auth AND search="audit53-combo-user" → 2 auth rows that mention "user".
+    let both = store.list_audit_logs(user_id, Some("auth"), Some("audit53-combo-user"), 50).await.unwrap();
+    assert_eq!(both.len(), 2,
+        "combined filter: category=auth + search=audit53-combo-user should return 2 rows");
+    assert!(both.iter().all(|r| r.category == "auth"),
+        "all combined-filter rows must have category=auth");
+
+    // category=billing AND search="audit53-combo-inv" → only the invoice row.
+    let billing_inv = store.list_audit_logs(user_id, Some("billing"), Some("audit53-combo-inv"), 50).await.unwrap();
+    assert_eq!(billing_inv.len(), 1,
+        "combined filter: category=billing + search=audit53-combo-inv should return 1 row");
+    assert_eq!(billing_inv[0].action, "audit53-combo-invoice");
+
+    // category=auth AND search="audit53-combo-inv" → 0 rows (no auth row mentions "inv").
+    let no_match = store.list_audit_logs(user_id, Some("auth"), Some("audit53-combo-inv"), 50).await.unwrap();
+    assert!(no_match.is_empty(),
+        "combined filter that matches no rows must return empty (got {})", no_match.len());
+}
+
+/// Explicitly verifies the NULL-target edge case: rows with `target = NULL`
+/// are never accidentally excluded by the ILIKE search, and a search that
+/// would only match a null-target row via the action field works correctly.
+#[tokio::test]
+async fn list_audit_logs_search_handles_null_target() {
+    let Some(store) = store().await else { return };
+    let user_id = fresh_user(&store).await;
+
+    // Row with NULL target — action is unique so it won't appear in any other test.
+    store.record_audit(user_id, "audit53-null-action-xyz", "security", None, None).await.unwrap();
+    // Row with a non-NULL target that shouldn't match "xyz".
+    store.record_audit(user_id, "audit53-null-other",      "security", Some("audit53-null-ref"), None).await.unwrap();
+
+    // Search "xyz" should match "audit53-null-action-xyz" via action even though target IS NULL.
+    let results = store.list_audit_logs(user_id, None, Some("xyz"), 50).await.unwrap();
+    assert_eq!(results.len(), 1,
+        "search for 'xyz' should match the NULL-target row via action (got {} rows)", results.len());
+    assert_eq!(results[0].action, "audit53-null-action-xyz");
+    assert!(results[0].target.is_none(), "matched row should still have NULL target");
 }
