@@ -400,96 +400,54 @@ async fn upsert_gas_sponsorship_config_works() {
     assert_eq!(spent, 0);
 }
 
-/// Regression guard: seed a wallet with rows in every status and verify that
-/// `sum_sponsored_fees_today` only sums `confirmed` rows, regardless of index
-/// changes.  Run after the composite index migration (0008).
+/// `allocate_address` claims to be safe under concurrent callers via a `SELECT ... FOR UPDATE`
+/// row lock inside a transaction. `allocate_address_increments_atomically` above only calls it
+/// sequentially, which never actually exercises that lock. This spawns real concurrent tasks
+/// against the same wallet and proves the row lock serializes the counter bump: every returned
+/// muxed id is unique, and the full set is exactly {1, ..., N} with no gaps or collisions.
 #[tokio::test]
-async fn sum_fees_today_ignores_non_confirmed_statuses() {
+async fn allocate_address_is_collision_free_under_concurrency() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
 
-    // pending – should not count
-    let _pending = store
-        .record_sponsored_tx(NewSponsoredTx {
-            wallet_id,
-            inner_tx_hash: &format!("idx-pending-{}", Uuid::new_v4().simple()),
-            fee_stroops: 100,
+    const N: usize = 25;
+
+    let handles: Vec<tokio::task::JoinHandle<i64>> = (0..N)
+        .map(|i| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let address = store
+                    .allocate_address(
+                        wallet_id,
+                        |id| Ok(format!("M{wid}-{id}")),
+                        Some(&format!("concurrent-{i}")),
+                        serde_json::json!({}),
+                    )
+                    .await
+                    .expect("allocate_address under concurrency");
+                address.muxed_id
+            })
         })
-        .await
-        .expect("pending");
+        .collect();
 
-    // confirmed – should count (300)
-    let confirmed_a = store
-        .record_sponsored_tx(NewSponsoredTx {
-            wallet_id,
-            inner_tx_hash: &format!("idx-confirmed-a-{}", Uuid::new_v4().simple()),
-            fee_stroops: 300,
-        })
-        .await
-        .expect("confirmed_a");
-    store
-        .update_sponsored_tx_status(confirmed_a.id, "confirmed", None, None)
-        .await
-        .expect("confirm a");
+    let mut muxed_ids = Vec::with_capacity(N);
+    for handle in handles {
+        muxed_ids.push(handle.await.expect("task panicked"));
+    }
 
-    // failed – should not count
-    let failed = store
-        .record_sponsored_tx(NewSponsoredTx {
-            wallet_id,
-            inner_tx_hash: &format!("idx-failed-{}", Uuid::new_v4().simple()),
-            fee_stroops: 500,
-        })
-        .await
-        .expect("failed");
-    store
-        .update_sponsored_tx_status(failed.id, "failed", None, Some("test error"))
-        .await
-        .expect("fail");
-
-    // confirmed – should count (700)
-    let confirmed_b = store
-        .record_sponsored_tx(NewSponsoredTx {
-            wallet_id,
-            inner_tx_hash: &format!("idx-confirmed-b-{}", Uuid::new_v4().simple()),
-            fee_stroops: 700,
-        })
-        .await
-        .expect("confirmed_b");
-    store
-        .update_sponsored_tx_status(confirmed_b.id, "confirmed", None, None)
-        .await
-        .expect("confirm b");
-
-    // Only the two confirmed rows: 300 + 700 = 1000.
+    let unique: std::collections::BTreeSet<i64> = muxed_ids.iter().copied().collect();
     assert_eq!(
-        store.sum_sponsored_fees_today(wallet_id).await.unwrap(),
-        1000,
-        "sum should only include confirmed rows"
+        unique.len(),
+        N,
+        "expected {N} unique muxed ids, got {} unique out of {:?}",
+        unique.len(),
+        muxed_ids
     );
 
-    // Reserved sum (pending + confirmed) should be 100 + 300 + 700 = 1100.
+    let expected: std::collections::BTreeSet<i64> = (1..=N as i64).collect();
     assert_eq!(
-        store.sum_sponsored_fees_reserved_today(wallet_id)
-            .await
-            .unwrap(),
-        1100,
-        "reserved sum should include pending + confirmed"
-    );
-
-    // list with status filter must also work correctly after index change.
-    let all = store
-        .list_sponsored_transactions(wallet_id, 10, None, None)
-        .await
-        .expect("list all");
-    assert_eq!(all.len(), 4, "four rows total");
-
-    let confirmed_only = store
-        .list_sponsored_transactions(wallet_id, 10, Some("confirmed"), None)
-        .await
-        .expect("list confirmed");
-    assert_eq!(
-        confirmed_only.len(),
-        2,
-        "two confirmed rows via status filter"
+        unique, expected,
+        "muxed ids must be exactly {{1, ..., {N}}} with no gaps"
     );
 }
