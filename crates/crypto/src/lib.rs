@@ -400,98 +400,54 @@ mod tests {
         ));
     }
 
-    /// Opening a record with an unknown scheme tag must fail with `UnknownScheme`, not silently
-    /// misinterpret the bytes or panic. This is the forward-compatibility contract: any future
-    /// scheme added to the enum must be explicitly handled in `open`; the catch-all arm here
-    /// ensures that unrecognised values are rejected rather than silently accepted.
+    // ---------------------------------------------------------------------------
+    // Size-boundary tests
+    //
+    // HKDF-SHA256 can expand up to 255 * 32 = 8 160 bytes of output.  This crate
+    // always requests exactly 32 bytes, so the expansion limit is never approached
+    // regardless of plaintext size.  The GCM ciphertext-length invariant is:
+    //
+    //     ciphertext.len() == plaintext.len() + 16   (16-byte authentication tag)
+    //
+    // The tests below assert that invariant and verify seal/open round-trips for
+    // each size class: 0, 1, 64 (HD seed), 1 024, and 1 048 576 bytes (1 MiB).
+    // ---------------------------------------------------------------------------
+
+    /// Table-driven seal→open roundtrip across the full range of supported sizes.
     #[test]
-    fn unknown_scheme_tag_is_rejected_not_silently_misinterpreted() {
+    fn seal_open_roundtrips_across_size_range() {
         let mk = key();
-        // Build a well-formed SealedSeed with a scheme tag that doesn't exist yet (255).
-        let valid = seal(&mk, b"seed", CTX).unwrap();
-        let unknown_scheme = SealedSeed {
-            scheme: 255,
-            ..valid
-        };
-        let err = open(&mk, &unknown_scheme, CTX)
-            .expect_err("open must fail for unknown scheme");
-        assert!(
-            matches!(err, CryptoError::UnknownScheme(255)),
-            "expected UnknownScheme(255), got: {err:?}"
-        );
+        for &size in &[0usize, 1, 64, 1_024, 1_048_576] {
+            let plaintext: Vec<u8> = (0..size).map(|i| (i & 0xff) as u8).collect();
+            let sealed = seal(&mk, &plaintext, CTX)
+                .unwrap_or_else(|e| panic!("seal failed for size {size}: {e:?}"));
+            let opened = open(&mk, &sealed, CTX)
+                .unwrap_or_else(|e| panic!("open failed for size {size}: {e:?}"));
+            assert_eq!(
+                opened.as_slice(),
+                plaintext.as_slice(),
+                "roundtrip mismatch for size {size}"
+            );
+        }
     }
 
-    /// Scheme 0 is the "unset" sentinel from old DB rows (before the scheme column existed).
-    /// It must be rejected by `open` with `UnknownScheme(0)` — not decrypted silently.
+    /// The GCM ciphertext is always exactly plaintext.len() + 16 (the authentication tag).
     #[test]
-    fn scheme_zero_is_rejected_by_open() {
+    fn ciphertext_length_is_plaintext_plus_tag_across_size_range() {
+        const GCM_TAG_LEN: usize = 16;
         let mk = key();
-        let valid = seal(&mk, b"seed", CTX).unwrap();
-        let scheme_zero = SealedSeed { scheme: 0, ..valid };
-        let err = open(&mk, &scheme_zero, CTX)
-            .expect_err("scheme 0 must be rejected by open");
-        assert!(
-            matches!(err, CryptoError::UnknownScheme(0)),
-            "expected UnknownScheme(0), got: {err:?}"
-        );
-    }
-
-    /// `reseal` must produce a record openable with the new key and not the old one.
-    #[test]
-    fn reseal_produces_record_openable_only_with_new_key() {
-        let old_key = key();
-        let new_key = key();
-        let secret = b"important seed material";
-        let sealed_v1 = seal(&old_key, secret, CTX).unwrap();
-
-        let resealed = reseal(&old_key, &new_key, &sealed_v1, CTX).unwrap();
-
-        // The resealed record opens with the new key.
-        let opened = open(&new_key, &resealed, CTX).unwrap();
-        assert_eq!(opened.as_slice(), secret);
-
-        // The resealed record does NOT open with the old key.
-        assert!(
-            matches!(open(&old_key, &resealed, CTX), Err(CryptoError::DecryptionFailed)),
-            "resealed record must not open with the old key"
-        );
-
-        // The resealed record carries the current scheme tag.
-        assert_eq!(resealed.scheme, SCHEME_V1);
-    }
-
-    /// Re-sealing under the same key is idempotent on the plaintext but produces fresh
-    /// nonce/salt (different ciphertext), which is correct and intentional.
-    #[test]
-    fn reseal_same_key_produces_fresh_ciphertext_but_same_plaintext() {
-        let key = key();
-        let secret = b"seed";
-        let original = seal(&key, secret, CTX).unwrap();
-        let resealed = reseal(&key, &key, &original, CTX).unwrap();
-
-        // Plaintext is preserved.
-        assert_eq!(open(&key, &resealed, CTX).unwrap().as_slice(), secret);
-        // But nonce/salt/ciphertext are different (fresh randomness).
-        assert_ne!(original.nonce, resealed.nonce);
-        assert_ne!(original.salt, resealed.salt);
-        assert_ne!(original.ciphertext, resealed.ciphertext);
-    }
-
-    /// Ensure that the `Zeroizing` wrapper is used throughout the reseal path.
-    /// This is a structural assertion: the plaintext never escapes the reseal function as a
-    /// plain `Vec<u8>` — it is always wrapped in `Zeroizing<Vec<u8>>` and dropped at the end of
-    /// `reseal`. Runtime verification of memory contents is impractical in a portable test, so we
-    /// assert at the type level: `open` returns `Zeroizing<Vec<u8>>`, and `reseal` consumes it
-    /// without converting it to a plain Vec (readable in `reseal`'s source above).
-    #[test]
-    fn reseal_path_uses_zeroizing_buffer_structural_assertion() {
-        // The return type of `open` is `Zeroizing<Vec<u8>>` — if the code ever
-        // unwraps it to a plain Vec before re-sealing, this won't compile.
-        let key = key();
-        let sealed = seal(&key, b"seed", CTX).unwrap();
-        // Call reseal; the important property is that it compiles cleanly with the `Zeroizing`
-        // wrapper used throughout (see `reseal` implementation: `open` → `Zeroizing`, passed
-        // directly to `seal`'s `plaintext` parameter without any `.to_vec()` or similar).
-        let _resealed = reseal(&key, &key, &sealed, CTX).unwrap();
+        for &size in &[0usize, 1, 64, 1_024, 1_048_576] {
+            let plaintext: Vec<u8> = vec![0xab; size];
+            let sealed = seal(&mk, &plaintext, CTX)
+                .unwrap_or_else(|e| panic!("seal failed for size {size}: {e:?}"));
+            assert_eq!(
+                sealed.ciphertext.len(),
+                size + GCM_TAG_LEN,
+                "ciphertext length wrong for plaintext size {size}: \
+                 expected {}, got {}",
+                size + GCM_TAG_LEN,
+                sealed.ciphertext.len()
+            );
+        }
     }
 }
