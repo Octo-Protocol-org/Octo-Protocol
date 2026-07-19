@@ -367,3 +367,97 @@ async fn upsert_gas_sponsorship_config_works() {
         .expect("sum");
     assert_eq!(spent, 0);
 }
+
+/// Regression guard: seed a wallet with rows in every status and verify that
+/// `sum_sponsored_fees_today` only sums `confirmed` rows, regardless of index
+/// changes.  Run after the composite index migration (0008).
+#[tokio::test]
+async fn sum_fees_today_ignores_non_confirmed_statuses() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // pending – should not count
+    let _pending = store
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("idx-pending-{}", Uuid::new_v4().simple()),
+            fee_stroops: 100,
+        })
+        .await
+        .expect("pending");
+
+    // confirmed – should count (300)
+    let confirmed_a = store
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("idx-confirmed-a-{}", Uuid::new_v4().simple()),
+            fee_stroops: 300,
+        })
+        .await
+        .expect("confirmed_a");
+    store
+        .update_sponsored_tx_status(confirmed_a.id, "confirmed", None, None)
+        .await
+        .expect("confirm a");
+
+    // failed – should not count
+    let failed = store
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("idx-failed-{}", Uuid::new_v4().simple()),
+            fee_stroops: 500,
+        })
+        .await
+        .expect("failed");
+    store
+        .update_sponsored_tx_status(failed.id, "failed", None, Some("test error"))
+        .await
+        .expect("fail");
+
+    // confirmed – should count (700)
+    let confirmed_b = store
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("idx-confirmed-b-{}", Uuid::new_v4().simple()),
+            fee_stroops: 700,
+        })
+        .await
+        .expect("confirmed_b");
+    store
+        .update_sponsored_tx_status(confirmed_b.id, "confirmed", None, None)
+        .await
+        .expect("confirm b");
+
+    // Only the two confirmed rows: 300 + 700 = 1000.
+    assert_eq!(
+        store.sum_sponsored_fees_today(wallet_id).await.unwrap(),
+        1000,
+        "sum should only include confirmed rows"
+    );
+
+    // Reserved sum (pending + confirmed) should be 100 + 300 + 700 = 1100.
+    assert_eq!(
+        store.sum_sponsored_fees_reserved_today(wallet_id)
+            .await
+            .unwrap(),
+        1100,
+        "reserved sum should include pending + confirmed"
+    );
+
+    // list with status filter must also work correctly after index change.
+    let all = store
+        .list_sponsored_transactions(wallet_id, 10, None, None)
+        .await
+        .expect("list all");
+    assert_eq!(all.len(), 4, "four rows total");
+
+    let confirmed_only = store
+        .list_sponsored_transactions(wallet_id, 10, Some("confirmed"), None)
+        .await
+        .expect("list confirmed");
+    assert_eq!(
+        confirmed_only.len(),
+        2,
+        "two confirmed rows via status filter"
+    );
+}

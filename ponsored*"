@@ -1,0 +1,5 @@
+[33mb49fc2d[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Add regression test for sum_sponsored_fees_today and create composite index for sponsored_transactions
+[33m5687b13[m Merge pull request #34 from Senorespecial/fix/ci/lockfile-locked
+[33madc4db0[m Merge pull request #40 from observerr411/feat/gas-sponsorship/sponsored-tx-table
+[33mfee9e8e[m Merge pull request #39 from observerr411/feat/gas-sponsorship/wallet-sponsorship-settings
+[33mb5cf2ba[m Merge pull request #38 from observerr411/feat/gas-sponsorship/dashboard-overview-page
