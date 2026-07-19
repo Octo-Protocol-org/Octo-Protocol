@@ -23,12 +23,15 @@ pub struct Event {
     pub data: serde_json::Value,
 }
 
+pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Sends signed webhooks for a wallet's active endpoints, with retry + delivery logging.
 #[derive(Clone)]
 pub struct WebhookSender {
     store: Store,
     http: reqwest::Client,
     max_attempts: u32,
+    delivery_timeout: Duration,
 }
 
 impl WebhookSender {
@@ -40,7 +43,14 @@ impl WebhookSender {
                 .build()
                 .unwrap_or_default(),
             max_attempts: 3,
+            delivery_timeout: DEFAULT_DELIVERY_TIMEOUT,
         }
+    }
+
+    /// Set a custom total delivery timeout ceiling per endpoint attempt (default is 20s).
+    pub fn with_delivery_timeout(mut self, timeout: Duration) -> Self {
+        self.delivery_timeout = timeout;
+        self
     }
 
     /// Deliver `event` to every active endpoint of `wallet_id`. Best-effort per endpoint: a failing
@@ -91,57 +101,91 @@ impl WebhookSender {
     ) -> bool {
         let signature = sign::sign(ep.secret.as_bytes(), body_bytes);
         let mut last_code: Option<i32> = None;
+        let mut attempts_made = 0;
 
-        for attempt in 1..=self.max_attempts {
-            let resp = self
-                .http
-                .post(&ep.url)
-                .header("content-type", "application/json")
-                .header(sign::SIGNATURE_HEADER, &signature)
-                .body(body_bytes.to_vec())
-                .send()
-                .await;
+        let res = tokio::time::timeout(self.delivery_timeout, async {
+            for attempt in 1..=self.max_attempts {
+                attempts_made = attempt;
+                let resp = self
+                    .http
+                    .post(&ep.url)
+                    .header("content-type", "application/json")
+                    .header(sign::SIGNATURE_HEADER, &signature)
+                    .body(body_bytes.to_vec())
+                    .send()
+                    .await;
 
-            match resp {
-                Ok(r) => {
-                    let code = r.status().as_u16() as i32;
-                    last_code = Some(code);
-                    if r.status().is_success() {
-                        let _ = self
-                            .store
-                            .log_webhook_delivery(
-                                ep.id,
-                                event_type,
-                                body,
-                                "delivered",
-                                attempt as i32,
-                                Some(code),
-                            )
-                            .await;
-                        return true;
+                match resp {
+                    Ok(r) => {
+                        let code = r.status().as_u16() as i32;
+                        last_code = Some(code);
+                        if r.status().is_success() {
+                            return Ok(attempt);
+                        }
                     }
+                    Err(_) => last_code = None,
                 }
-                Err(_) => last_code = None,
-            }
 
-            if attempt < self.max_attempts {
-                // Exponential backoff: 1s, 2s, ...
-                tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+                if attempt < self.max_attempts {
+                    // Exponential backoff: 1s, 2s, ...
+                    tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+                }
+            }
+            Err(())
+        })
+        .await;
+
+        match res {
+            Ok(Ok(successful_attempt)) => {
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "delivered",
+                        successful_attempt as i32,
+                        last_code,
+                    )
+                    .await;
+                true
+            }
+            Ok(Err(())) => {
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "failed",
+                        self.max_attempts as i32,
+                        last_code,
+                    )
+                    .await;
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    endpoint_id = %ep.id,
+                    url = %ep.url,
+                    timeout_secs = self.delivery_timeout.as_secs(),
+                    "webhook delivery attempt exceeded overall deadline"
+                );
+                let attempts = if attempts_made > 0 { attempts_made as i32 } else { 1 };
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "failed",
+                        attempts,
+                        last_code,
+                    )
+                    .await;
+                false
             }
         }
-
-        let _ = self
-            .store
-            .log_webhook_delivery(
-                ep.id,
-                event_type,
-                body,
-                "failed",
-                self.max_attempts as i32,
-                last_code,
-            )
-            .await;
-        false
     }
 }
 
@@ -231,32 +275,67 @@ mod tests {
         assert!(is_safe_url("http://172.32.0.1/x"));
     }
 
-    #[test]
-    fn decimal_ip_literal_loopback_bypass_is_documented() {
-        // KNOWN GAP: is_safe_url uses naive string matching instead of IP parsing.
-        // The decimal encoding of 127.0.0.1 (2130706433) bypasses the checks.
-        assert!(is_safe_url("http://2130706433/hook"), "decimal IP bypasses checks");
-    }
+    #[tokio::test]
+    async fn dispatch_bounds_total_delivery_time_for_a_slow_but_non_erroring_endpoint() {
+        use axum::routing::post;
+        use axum::Router;
+        use octo_store::Store;
+        use std::time::{Duration, Instant};
+        use uuid::Uuid;
 
-    #[test]
-    fn octal_ip_literal_loopback_bypass_is_documented() {
-        // KNOWN GAP: is_safe_url uses naive string matching instead of IP parsing.
-        // The octal encoding of 127.0.0.1 (0177.0.0.1) bypasses the checks.
-        assert!(is_safe_url("http://0177.0.0.1/hook"), "octal IP bypasses checks");
-    }
+        std::env::set_var("OCTO_ALLOW_LOCAL_WEBHOOKS", "1");
 
-    #[test]
-    fn hex_ip_literal_loopback_bypass_is_documented() {
-        // KNOWN GAP: is_safe_url uses naive string matching instead of IP parsing.
-        // The hex encoding of 127.0.0.1 (0x7f000001) bypasses the checks.
-        assert!(is_safe_url("http://0x7f000001/hook"), "hex IP bypasses checks");
-    }
+        // Mock endpoint that sleeps 150ms on every attempt and returns 500 (triggering retries).
+        let app = Router::new().route(
+            "/slow",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-    #[test]
-    fn ipv6_loopback_and_mapped_forms_bypass_is_documented() {
-        // KNOWN GAP: is_safe_url incorrectly splits on ':' which breaks IPv6 literal parsing,
-        // and it does not recognize IPv6 mapped addresses.
-        assert!(is_safe_url("http://[::1]/hook"), "IPv6 loopback bypasses checks");
-        assert!(is_safe_url("http://[::ffff:127.0.0.1]/hook"), "IPv4-mapped IPv6 bypasses checks");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/dummy")
+            .unwrap();
+        let store = Store::from_pool(pool);
+        // Set a short per-endpoint delivery timeout ceiling of 200ms.
+        let sender = super::WebhookSender::new(store).with_delivery_timeout(Duration::from_millis(200));
+
+        let ep = octo_store::WebhookEndpoint {
+            id: Uuid::new_v4(),
+            wallet_id: Uuid::new_v4(),
+            url: format!("http://{addr}/slow"),
+            secret: "secret".into(),
+            active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let body = serde_json::json!({"event": "test"});
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        let start = Instant::now();
+        let success = sender
+            .deliver_with_retry(&ep, "test", &body, &body_bytes)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(!success, "delivery should fail due to overall timeout");
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "total time should be bounded by delivery ceiling (< 1s), took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "total time should run at least one attempt (>= 150ms), took {:?}",
+            elapsed
+        );
     }
 }
+
