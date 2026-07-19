@@ -101,8 +101,8 @@ pub struct WebhookEndpoint {
     pub created_at: DateTime<Utc>,
 }
 
-/// A logged attempt to deliver a webhook event.
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+/// A single webhook delivery attempt (append-only log).
+#[derive(Debug, Clone, FromRow, Serialize)]
 pub struct WebhookDelivery {
     pub id: Uuid,
     pub endpoint_id: Uuid,
@@ -114,7 +114,6 @@ pub struct WebhookDelivery {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
-
 
 /// An audit-log entry (append-only record of account activity).
 #[derive(Debug, Clone, FromRow, Serialize)]
