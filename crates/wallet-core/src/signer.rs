@@ -627,6 +627,108 @@ mod tests {
         assert!(!signed.envelope_xdr.is_empty());
     }
 
+    // ── Credit-asset branch of sign_payment (#42) ────────────────────────────
+
+    #[test]
+    fn signs_credit_asset_payment_alphanum4() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // USDC is 4 chars → AlphaNum4; use DEST as the issuer (a valid G... address).
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 10_000_000,
+            asset: Some(("USDC", DEST)),
+            memo_id: None,
+            sequence: 1,
+        };
+        let signed = sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        let env =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match env {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match &e.tx.operations[0].body {
+                    stellar_base::xdr::OperationBody::Payment(pay) => {
+                        assert!(
+                            matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum4(_)),
+                            "4-char code must produce CreditAlphanum4 asset"
+                        );
+                    }
+                    _ => panic!("expected Payment operation"),
+                }
+            }
+            _ => panic!("expected Tx envelope"),
+        }
+    }
+
+    #[test]
+    fn signs_credit_asset_payment_alphanum12() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // "LONGTOKEN" is 9 chars (5-12 range) → AlphaNum12.
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 10_000_000,
+            asset: Some(("LONGTOKEN", DEST)),
+            memo_id: None,
+            sequence: 1,
+        };
+        let signed = sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        let env =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match env {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match &e.tx.operations[0].body {
+                    stellar_base::xdr::OperationBody::Payment(pay) => {
+                        assert!(
+                            matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum12(_)),
+                            "9-char code must produce CreditAlphanum12 asset"
+                        );
+                    }
+                    _ => panic!("expected Payment operation"),
+                }
+            }
+            _ => panic!("expected Tx envelope"),
+        }
+    }
+
+    #[test]
+    fn rejects_credit_asset_with_invalid_issuer() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 1,
+            asset: Some(("USDC", "not-a-valid-G-address")),
+            memo_id: None,
+            sequence: 1,
+        };
+        assert!(matches!(
+            sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+            Err(WalletError::InvalidAddress)
+        ));
+    }
+
+    #[test]
+    fn rejects_credit_asset_with_invalid_code() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // Empty string and a 13-char code are both outside the 1-12 byte range
+        // that Asset::new_credit accepts, so both must map to WalletError::InvalidAddress.
+        for bad_code in ["", "TOOLONGASSET1X"] {
+            let req = PaymentRequest {
+                destination: DEST,
+                stroops: 1,
+                asset: Some((bad_code, DEST)),
+                memo_id: None,
+                sequence: 1,
+            };
+            assert!(
+                matches!(
+                    sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+                    Err(WalletError::InvalidAddress)
+                ),
+                "code {:?} should be rejected",
+                bad_code
+            );
+        }
+    }
+
     // ── Helper: build a signed inner payment envelope XDR ────────────────────
 
     fn make_inner_xdr(source_index: u32, seq: i64) -> String {
