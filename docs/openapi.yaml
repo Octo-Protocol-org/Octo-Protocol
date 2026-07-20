@@ -8,14 +8,30 @@ servers:
 paths:
   /v1/wallets:
     post:
-      summary: Create a master wallet
+      summary: Create a master wallet (non-custodial)
+      description: >
+        Registers a wallet from a keypair the CLIENT generated. The server never receives the
+        private key or mnemonic — only the public account. `encrypted_backup` is an opaque blob
+        the client encrypted under the user's password; the server stores it verbatim for
+        new-device recovery and cannot decrypt it.
       operationId: createWallet
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required:
+                - public_key
               properties:
+                public_key:
+                  type: string
+                  description: The client-generated Stellar account (`G...`).
+                encrypted_backup:
+                  type: string
+                  nullable: true
+                  description: >
+                    Opaque client-encrypted seed backup. Never decryptable by the server.
                 label:
                   type: string
                 description:
@@ -199,7 +215,8 @@ components:
             - id
             - network
             - address
-            - recovery_mnemonic
+            - custody
+            - funded
           properties:
             id:
               type: string
@@ -208,8 +225,18 @@ components:
               type: string
             address:
               type: string
-            recovery_mnemonic:
+            custody:
               type: string
+              enum: [client, server]
+              description: >
+                `client` for non-custodial wallets (the server holds no key for this account).
+                `server` is legacy, pre-cutover.
+            funded:
+              type: boolean
+              description: Whether the account was funded on-chain (testnet friendbot).
+          # NOTE: `recovery_mnemonic` was previously listed here as REQUIRED. It no longer exists
+          # and must not come back: the client generates the mnemonic and the server never sees
+          # it. Documenting it would contradict the non-custodial guarantee.
     WalletViewResponse:
       type: object
       required:

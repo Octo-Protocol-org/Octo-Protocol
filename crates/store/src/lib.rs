@@ -270,6 +270,9 @@ impl Store {
 
     /// Attach a gas-tank fee account to a client-custody wallet: stores the tank's sealed seed
     /// and public account. The tank only ever holds fee float — never customer funds.
+    ///
+    /// `sealed_scheme` must be written alongside the seed: the `wallets_gas_tank_has_seed` CHECK
+    /// requires it, and key rotation (`bin/migrate-keys`) needs the tag to know how to open it.
     pub async fn set_gas_tank(
         &self,
         wallet_id: Uuid,
@@ -277,12 +280,13 @@ impl Store {
         sealed_ciphertext: &[u8],
         sealed_nonce: &[u8],
         sealed_salt: &[u8],
+        sealed_scheme: i16,
     ) -> Result<Wallet, StoreError> {
         sqlx::query_as::<_, Wallet>(
             r#"
             UPDATE wallets
             SET gas_tank_account_g = $2, sealed_ciphertext = $3, sealed_nonce = $4,
-                sealed_salt = $5, updated_at = now()
+                sealed_salt = $5, sealed_scheme = $6, updated_at = now()
             WHERE id = $1 AND custody = 'client' AND gas_tank_account_g IS NULL
             RETURNING *
             "#,
@@ -292,6 +296,7 @@ impl Store {
         .bind(sealed_ciphertext)
         .bind(sealed_nonce)
         .bind(sealed_salt)
+        .bind(sealed_scheme)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::Conflict) // already has a tank, or not a client wallet

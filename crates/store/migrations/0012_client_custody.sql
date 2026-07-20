@@ -15,6 +15,10 @@
 ALTER TABLE wallets ALTER COLUMN sealed_ciphertext DROP NOT NULL;
 ALTER TABLE wallets ALTER COLUMN sealed_nonce DROP NOT NULL;
 ALTER TABLE wallets ALTER COLUMN sealed_salt DROP NOT NULL;
+-- sealed_scheme (added in 0008_scheme_version.sql) is meaningless without a sealed seed to tag,
+-- so it must be nullable too — a client-custody row with no gas tank has no scheme at all.
+ALTER TABLE wallets ALTER COLUMN sealed_scheme DROP NOT NULL;
+ALTER TABLE wallets ALTER COLUMN sealed_scheme DROP DEFAULT;
 
 ALTER TABLE wallets ADD COLUMN custody TEXT NOT NULL DEFAULT 'server';
 ALTER TABLE wallets ADD COLUMN encrypted_backup TEXT;
@@ -22,14 +26,16 @@ ALTER TABLE wallets ADD COLUMN encrypted_backup TEXT;
 -- its seed then lives in sealed_* (account index 0).
 ALTER TABLE wallets ADD COLUMN gas_tank_account_g TEXT;
 
--- A server-custody row must always carry its seed.
+-- A server-custody row must always carry its seed (and the scheme tag for that seed).
 ALTER TABLE wallets ADD CONSTRAINT wallets_server_custody_has_seed CHECK (
     custody <> 'server'
-    OR (sealed_ciphertext IS NOT NULL AND sealed_nonce IS NOT NULL AND sealed_salt IS NOT NULL)
+    OR (sealed_ciphertext IS NOT NULL AND sealed_nonce IS NOT NULL AND sealed_salt IS NOT NULL
+        AND sealed_scheme IS NOT NULL)
 );
 
--- A gas tank is only meaningful with its seed present.
+-- A gas tank is only meaningful with its seed (and scheme tag) present.
 ALTER TABLE wallets ADD CONSTRAINT wallets_gas_tank_has_seed CHECK (
     gas_tank_account_g IS NULL
-    OR (sealed_ciphertext IS NOT NULL AND sealed_nonce IS NOT NULL AND sealed_salt IS NOT NULL)
+    OR (sealed_ciphertext IS NOT NULL AND sealed_nonce IS NOT NULL AND sealed_salt IS NOT NULL
+        AND sealed_scheme IS NOT NULL)
 );

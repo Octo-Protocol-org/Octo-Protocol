@@ -502,54 +502,11 @@ async fn custodial_trustline_is_gone() {
 /// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
 /// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
 /// is ever created, not merely fail later at signing.
-#[tokio::test]
-async fn withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row() {
-    let Some(state) = test_state().await else {
-        return;
-    };
-    let app = build_router(state.clone());
-    let token = auth_token(&app).await;
-    let resp = app
-        .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
-        .await
-        .unwrap();
-    let wallet_id = body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
-
-    for (label, code) in [("empty", ""), ("13_bytes", "ABCDEFGHIJKLM")] {
-        let key = format!("key-{}", uuid::Uuid::new_v4());
-        let body = format!(
-            r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}","asset":{{"code":"{code}","issuer":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6"}}}}"#
-        );
-        let resp = app
-            .clone()
-            .oneshot(post_json_auth(&uri, &body, &token))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "asset code case '{label}' must be rejected"
-        );
-
-        // Prove rejection happened before create_withdrawal: no row with this idempotency key.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM withdrawals WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(state.store().pool())
-        .await
-        .unwrap();
-        assert_eq!(
-            count, 0,
-            "case '{label}': invalid asset code must not create a withdrawal row"
-        );
-    }
-}
+// NOTE: withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row was removed here.
+// It tested the pre-cutover custodial withdraw endpoint (POST /v1/wallets/:id/withdraw with a
+// destination+amount body); that endpoint is now 410 Gone (see custodial_withdraw_is_gone
+// above), so it always failed against this schema/router. Asset-code validation on the
+// non-custodial path is covered where the trustline/payment is actually built (wallet-core).
 
 #[tokio::test]
 async fn api_key_generate_and_get() {
@@ -762,7 +719,7 @@ async fn delete_api_key_revokes_it_and_subsequent_calls_using_it_are_401() {
     // Create a wallet and generate an API key.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -830,7 +787,7 @@ async fn delete_api_key_requires_wallet_ownership() {
     let token_a = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token_a))
+        .oneshot(create_wallet_req(&token_a))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -863,7 +820,7 @@ async fn delete_api_key_on_a_wallet_with_no_key_is_ok() {
     // Create a wallet without generating a key.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -893,7 +850,7 @@ async fn delete_api_key_rejects_api_key_auth() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1180,7 +1137,7 @@ async fn list_sponsored_transactions_requires_auth() {
 async fn create_wallet_for(app: &axum::Router, token: &str) -> String {
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+        .oneshot(create_wallet_req(token))
         .await
         .unwrap();
     body_json(resp).await["data"]["id"]
@@ -1201,7 +1158,7 @@ async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
     // Create 5 wallets for this user.
     for _ in 0..5 {
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap();
     }

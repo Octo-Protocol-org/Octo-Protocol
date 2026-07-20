@@ -95,8 +95,16 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let spec = load_openapi_spec();
     let token = auth_token(&app).await;
 
-    // 1. Success case: Create wallet
+    // 1. Success case: Create wallet.
+    //
+    // Non-custodial contract: the client generates the keypair and sends only the public key.
+    // `public_key` is required — a body with just label/description is now a 400.
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
     let req_body = serde_json::json!({
+        "public_key": account,
         "label": "drift-test-wallet",
         "description": "testing schema drift"
     });
@@ -118,16 +126,16 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     // Validate the documented 201 response shape.
     validate_response(&spec, "~1v1~1wallets", "post", "201", &body_json);
 
-    // 2. Error case: Missing required fields or bad payload to an endpoint, e.g. withdrawing without funds
+    // 2. Error case: the error envelope must match the documented ErrorResponse shape.
+    //
+    // The custodial withdraw endpoint is a tombstone since the non-custodial cutover, so any
+    // request to it is 410 Gone. That is still a real error response, which is what this part of
+    // the drift test is checking.
     let wallet_id = body_json["data"]["id"].as_str().unwrap();
 
-    // Withdraw with missing required 'asset' code/issuer
     let withdraw_body = serde_json::json!({
         "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         "amount_stroops": 100,
-        "asset": {
-            "code": "USDC" // missing issuer
-        }
     });
 
     let withdraw_req = Request::builder()
@@ -139,8 +147,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let withdraw_res = app.clone().oneshot(withdraw_req).await.unwrap();
-    // Validation failures map to ApiError::BadRequest -> 400 across this API (there is no 422).
-    assert_eq!(withdraw_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(withdraw_res.status(), StatusCode::GONE);
     
     let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024).await.unwrap();
     let w_json: Value = serde_json::from_slice(&w_bytes).unwrap();

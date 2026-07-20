@@ -228,6 +228,7 @@ pub async fn create_gas_tank(
             &provisioned.sealed.ciphertext,
             &provisioned.sealed.nonce,
             &provisioned.sealed.salt,
+            i16::from(provisioned.sealed.scheme),
         )
         .await?;
 
