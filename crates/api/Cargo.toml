@@ -17,6 +17,8 @@ octo-resilience.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+# Needed to downcast RequestBodyLimitLayer's error to LengthLimitError (413 handling).
+http-body-util = "0.1"
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -42,4 +44,9 @@ sqlx.workspace = true
 stellar-base.workspace = true
 dotenvy = "0.15"
 reqwest.workspace = true
-wiremock = "0.6"
+# Pinned: newer 0.6.x requires edition2024 (Rust >= 1.85), but rust-toolchain.toml pins 1.84.1,
+# so an unpinned "0.6" resolves to a version this project's own toolchain cannot build.
+wiremock = "=0.6.2"
+# OpenAPI contract drift tests (docs/openapi.yaml) — validate live responses against the spec.
+serde_yaml = "0.9"
+jsonschema = "0.26"

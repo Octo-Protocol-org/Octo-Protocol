@@ -105,6 +105,7 @@ impl Ingestor {
             wallet_id,
             account_g,
             webhooks: None,
+            tracker: None,
         }
     }
 
@@ -327,6 +328,9 @@ pub struct Supervisor {
     webhooks: WebhookSender,
     network: &'static str,
     tracker: LastPollTracker,
+    /// Retry/circuit config handed to each per-wallet `Ingestor` built in `tick`.
+    retry: octo_resilience::RetryPolicy,
+    circuit: octo_resilience::CircuitBreaker,
 }
 
 impl Supervisor {
@@ -336,12 +340,36 @@ impl Supervisor {
         webhooks: WebhookSender,
         network: &'static str,
     ) -> Self {
+        // Same defaults the rest of the workspace uses for Horizon clients: open after 5
+        // consecutive failures, probe again after 30s.
+        Self::new_with_resilience(
+            store,
+            horizon_url,
+            webhooks,
+            network,
+            octo_resilience::RetryPolicy::default(),
+            octo_resilience::CircuitBreaker::new(5, Duration::from_secs(30)),
+        )
+    }
+
+    /// Like [`Supervisor::new`] but with explicit resilience configuration (used by
+    /// `bin/server`, which reads retry/circuit settings from env vars).
+    pub fn new_with_resilience(
+        store: Store,
+        horizon_url: String,
+        webhooks: WebhookSender,
+        network: &'static str,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
+    ) -> Self {
         Self {
             store,
             horizon_url,
             webhooks,
             network,
             tracker: LastPollTracker::new(),
+            retry,
+            circuit,
         }
     }
 

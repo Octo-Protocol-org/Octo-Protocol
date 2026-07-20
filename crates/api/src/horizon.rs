@@ -280,15 +280,13 @@ impl Horizon {
     /// Returns the result even when the transaction failed on-chain (`successful == false`) so the
     /// caller can record the failure; only transport/HTTP errors return `Err`.
     pub async fn submit_transaction(&self, envelope_xdr: &str) -> Result<SubmitResult, ApiError> {
+        // NOTE: an eager, unwrapped POST used to sit here ahead of the resilience-wrapped call
+        // below. It fired a *duplicate* submission on every call and referenced `http`/`xdr`
+        // locals that were never bound (so this did not compile). Removed — the single submit
+        // now happens inside `execute`, with SUBMIT_TIMEOUT applied to that request.
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .form(&[("tx", envelope_xdr)])
-            .timeout(SUBMIT_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
+        let http = self.http.clone();
+        let xdr = envelope_xdr.to_string();
 
         let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
             let url = url.clone();
@@ -298,6 +296,7 @@ impl Horizon {
                 let resp = http
                     .post(&url)
                     .form(&[("tx", &xdr)])
+                    .timeout(SUBMIT_TIMEOUT)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
@@ -433,6 +432,13 @@ mod tests {
                 .build()
                 .unwrap(),
             base_url,
+            // This test exercises the transport timeout, so keep resilience out of the way:
+            // a single attempt and a breaker that won't trip within the test.
+            retry: RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            circuit: CircuitBreaker::new(u32::MAX, Duration::from_secs(60)),
         };
 
         let result = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;

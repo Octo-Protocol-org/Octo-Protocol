@@ -17,7 +17,7 @@
 //! does not apply here.
 
 use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Errors talking to Horizon.
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +31,10 @@ pub enum HorizonError {
 }
 
 /// One payment record from Horizon (the fields octo needs).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is derived so tests can round-trip these through a mock Horizon server that
+/// returns Horizon-shaped JSON; production only ever deserializes them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PaymentRecord {
     /// The operation TOID — globally unique; used as the idempotent dedup key.
     pub id: String,
@@ -68,7 +71,9 @@ pub struct PaymentRecord {
 }
 
 /// The joined transaction fields we use.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is derived for the same test-only reason as [`PaymentRecord`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransactionRecord {
     #[serde(default)]
     pub memo_type: Option<String>,

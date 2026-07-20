@@ -18,7 +18,7 @@ mod models;
 pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, DenylistedToken, GasSponsorshipConfig, NewDeposit, NewSponsoredTx,
-    SponsoredTransaction, Transaction, User, Wallet, WebhookEndpoint, Withdrawal,
+    SponsoredTransaction, Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint, Withdrawal,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -287,33 +287,6 @@ impl Store {
 
     /// Paginated version of [`list_wallets_for_user`]: returns at most `limit` rows, newest first.
     /// Pass the last page's final wallet id as `before_id` to fetch the next page.
-    pub async fn list_wallets_for_user_page(
-        &self,
-        user_id: Uuid,
-        limit: i64,
-        before_id: Option<Uuid>,
-    ) -> Result<Vec<Wallet>, StoreError> {
-        let rows = sqlx::query_as::<_, Wallet>(
-            r#"
-            SELECT * FROM wallets
-            WHERE user_id = $1
-              AND ($2::uuid IS NULL OR (created_at, id) < (
-                    SELECT created_at, id FROM wallets WHERE id = $2
-                  ))
-            ORDER BY created_at DESC, id DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(user_id)
-        .bind(before_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// Paginated version of [`list_wallets_for_user`]: returns at most `limit` rows created
-    /// before the row with `before_id` (keyset pagination, most-recent-first).
     pub async fn list_wallets_for_user_page(
         &self,
         user_id: Uuid,
@@ -1053,6 +1026,39 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Fetch a single webhook endpoint by id. `NotFound` if it does not exist.
+    ///
+    /// Callers must still check `wallet_id` before returning data, so that an endpoint belonging
+    /// to another wallet is reported as 404 rather than 403 (no existence leak).
+    pub async fn get_webhook_endpoint(&self, id: Uuid) -> Result<WebhookEndpoint, StoreError> {
+        sqlx::query_as::<_, WebhookEndpoint>("SELECT * FROM webhook_endpoints WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// An endpoint's delivery history, newest first, capped at `limit` rows.
+    pub async fn list_webhook_deliveries(
+        &self,
+        endpoint_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<WebhookDelivery>, StoreError> {
+        let rows = sqlx::query_as::<_, WebhookDelivery>(
+            r#"
+            SELECT * FROM webhook_deliveries
+            WHERE endpoint_id = $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(endpoint_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.

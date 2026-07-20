@@ -252,7 +252,9 @@ pub enum CallKind {
 /// - `Ok(T)` — the call succeeded.
 /// - `Err(ResilienceError::Circuit)` — the circuit was open (no network call made).
 /// - `Err(ResilienceError::Exhausted(e))` — all attempts failed; `e` is the last error.
-pub async fn execute<F, Fut, T, E>(
+// NOTE: no `F` type parameter here — the closure is taken as `impl FnMut() -> Fut`, so a
+// declared-but-unused `F` would be uninferable and every call site would fail with E0282.
+pub async fn execute<Fut, T, E>(
     circuit: &CircuitBreaker,
     policy: &RetryPolicy,
     kind: CallKind,
@@ -605,7 +607,7 @@ mod tests {
         };
 
         // Open the circuit.
-        let _ = execute::<_, _, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
+        let _ = execute::<_, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
             Err("open it")
         })
         .await;

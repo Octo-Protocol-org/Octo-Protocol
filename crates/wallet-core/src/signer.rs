@@ -763,7 +763,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -809,7 +808,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -840,7 +838,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -868,7 +865,6 @@ mod tests {
                 &FeeBumpRequest {
                     inner_xdr: "",
                     max_base_fee_stroops: 200,
-                    sequence: 0
                 },
             ),
             Err(WalletError::InvalidXdr)
@@ -891,7 +887,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap()
@@ -906,8 +901,8 @@ mod tests {
                 0,
                 &FeeBumpRequest {
                     inner_xdr: &fee_bump_xdr,
-                    max_base_fee_stroops: 200,
-                    sequence: 0
+                    max_base_fee_stroops: 200
+                    
                 },
             ),
             Err(WalletError::InvalidXdr)
@@ -928,8 +923,8 @@ mod tests {
                 0,
                 &FeeBumpRequest {
                     inner_xdr: &inner_xdr,
-                    max_base_fee_stroops: 200,
-                    sequence: 0
+                    max_base_fee_stroops: 200
+                    
                 },
             ),
             Err(WalletError::SeedDecryption)
@@ -952,7 +947,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: max_base_fee,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -982,7 +976,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         );
         assert!(result.is_ok());

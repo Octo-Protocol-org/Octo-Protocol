@@ -69,6 +69,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: Some("testnet-wallet"),
             user_id: None,
             description: None,
@@ -83,6 +84,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: Some("mainnet-wallet"),
             user_id: None,
             description: None,

@@ -175,7 +175,7 @@ pub async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    let user_id = authenticate(&headers, &state)?;
+    let user_id = authenticate(&headers, &state).await?;
     let user = state
         .store()
         .get_user(user_id)

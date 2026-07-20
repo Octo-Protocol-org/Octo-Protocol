@@ -56,13 +56,9 @@ pub struct WithdrawResponse {
     pub amount_stroops: i64,
 }
 
-/// A Stellar asset code must be 1-12 ASCII alphanumeric characters (the `AssetCode4`/
-/// `AssetCode12` rules).
-fn is_valid_asset_code(code: &str) -> bool {
-    !code.is_empty()
-        && code.len() <= 12
-        && code.bytes().all(|b| b.is_ascii_alphanumeric())
-}
+// NOTE: asset-code validation lives in wallet-core (`is_valid_asset_code`, imported above) —
+// PR #159 consolidated it into one shared, fuzz-cross-validated primitive. The local duplicate
+// that this merge left behind has been removed.
 
 /// `POST /v1/wallets/:id/withdraw`
 pub async fn withdraw(

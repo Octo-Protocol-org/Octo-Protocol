@@ -79,6 +79,7 @@ async fn deposit_fires_signed_webhook() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"n",
             sealed_salt: b"s",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,

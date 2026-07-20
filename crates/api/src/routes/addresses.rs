@@ -115,6 +115,8 @@ pub async fn list_addresses(
 ) -> ApiResult<Json<Envelope<AddressListResponse>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
+    // Every address view echoes the wallet's base (G...) account alongside its muxed form.
+    let base = wallet.stellar_account_g.clone();
 
     let limit = crate::routes::wallets::validated_limit(q.limit)?;
 

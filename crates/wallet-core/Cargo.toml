@@ -23,3 +23,5 @@ sha2.workspace = true
 
 [dev-dependencies]
 base64 = { workspace = true }
+# Property-based coverage in asset.rs / derive.rs (SEP-0005 derivation, asset-code validation).
+proptest.workspace = true

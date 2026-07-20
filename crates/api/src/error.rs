@@ -120,3 +120,23 @@ impl<T: Serialize> Envelope<T> {
         )
     }
 }
+
+impl Envelope<Option<()>> {
+    /// Build an error envelope so failures raised in middleware (e.g. an oversized body
+    /// rejected before any handler runs) use the same `{statusCode, message, data}` shape as
+    /// every other response.
+    pub fn error(
+        status: StatusCode,
+        message: String,
+        data: Option<()>,
+    ) -> (StatusCode, Json<Envelope<Option<()>>>) {
+        (
+            status,
+            Json(Envelope {
+                status_code: status.as_u16(),
+                message,
+                data,
+            }),
+        )
+    }
+}
