@@ -708,8 +708,10 @@ mod tests {
     #[test]
     fn rejects_credit_asset_with_invalid_code() {
         let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
-        // Empty string and a 13-char code are both outside the 1-12 byte range
-        // that Asset::new_credit accepts, so both must map to WalletError::InvalidAddress.
+        // Empty string and a 13-char code are both outside the 1-12 byte range that
+        // Asset::new_credit accepts. Since the shared `is_valid_asset_code` primitive landed,
+        // these are rejected up front as InvalidAssetCode (previously the generic
+        // InvalidAddress, which conflated a bad code with a bad issuer).
         for bad_code in ["", "TOOLONGASSET1X"] {
             let req = PaymentRequest {
                 destination: DEST,
@@ -721,7 +723,7 @@ mod tests {
             assert!(
                 matches!(
                     sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
-                    Err(WalletError::InvalidAddress)
+                    Err(WalletError::InvalidAssetCode)
                 ),
                 "code {:?} should be rejected",
                 bad_code

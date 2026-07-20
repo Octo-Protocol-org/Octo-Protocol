@@ -21,8 +21,8 @@ paths:
                 description:
                   type: string
       responses:
-        "200":
-          description: OK
+        "201":
+          description: Created
           content:
             application/json:
               schema:
@@ -381,11 +381,13 @@ components:
       required:
         - statusCode
         - message
-        - error
+        - data
       properties:
         statusCode:
           type: integer
         message:
           type: string
-        error:
-          type: string
+        # Errors use the same {statusCode, message, data} envelope as success responses;
+        # `data` is null. (The spec previously documented a non-existent `error` field.)
+        data:
+          nullable: true

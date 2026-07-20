@@ -50,16 +50,6 @@ fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
-fn signup_request(body: String) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri("/v1/auth/signup")
-        .header("content-type", "application/json")
-        .header("content-length", body.len())
-        .body(Body::from(body))
-        .unwrap()
-}
-
 fn body_limit_request(body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -210,11 +200,11 @@ async fn addresses_return_both_forms_and_share_base() {
     assert_ne!(muxed[0], muxed[1], "distinct muxed addresses");
     assert_eq!(memo_ids, vec![1, 2], "ids allocated sequentially from 1");
 
-    // List returns both.
+    // List returns both. The paginated envelope is {data: {data: [...], next_cursor}}.
     let uri = format!("/v1/wallets/{wallet_id}/addresses");
     let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
     let list = body_json(resp).await;
-    assert_eq!(list["data"].as_array().unwrap().len(), 2);
+    assert_eq!(list["data"]["data"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -240,7 +230,8 @@ async fn transactions_endpoint_returns_list() {
     let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    assert_eq!(j["data"].as_array().unwrap().len(), 0);
+    // Paginated envelope: {data: {data: [...], next_cursor}}.
+    assert_eq!(j["data"]["data"].as_array().unwrap().len(), 0);
 
     // Unknown wallet (authed user) → 404.
     let uri = format!("/v1/wallets/{}/transactions", uuid::Uuid::new_v4());
@@ -1218,9 +1209,13 @@ async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit()
                 amount_stroops: (i + 1) as i64 * 100,
                 source_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
                 destination_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
-                stellar_tx_hash: format!("txhash-pag-{i}"),
+                // Deposits are idempotent on horizon_op_id, which is globally unique. A fixed
+                // literal here made the second run of this test a silent no-op (the inserts
+                // dedup against the previous run's rows), so it only passed on a fresh DB.
+                // Scope the keys to this wallet to keep the test re-runnable.
+                stellar_tx_hash: format!("txhash-pag-{wallet_uuid}-{i}"),
                 operation_index: i as i32,
-                horizon_op_id: format!("op-pag-{i}"),
+                horizon_op_id: format!("op-pag-{wallet_uuid}-{i}"),
                 ledger: Some(i as i64),
                 memo_id: None,
             })

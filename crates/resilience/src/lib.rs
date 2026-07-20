@@ -238,15 +238,39 @@ pub enum CallKind {
     Submit,
 }
 
+/// Whether a given error is worth retrying.
+///
+/// Without this, `execute` would retry *every* failure — including permanent ones like a 404.
+/// That both wastes attempts and, worse, lets a handful of legitimate "not found" responses trip
+/// the circuit breaker, so the caller sees `Circuit` instead of the real error.
+///
+/// Error types passed to [`execute`] implement this to say which failures are transient.
+pub trait Retriable {
+    /// `true` if this error is transient and the call may be retried.
+    fn is_retriable(&self) -> bool;
+}
+
+// Convenience impls for error types used directly in tests.
+impl Retriable for &str {
+    fn is_retriable(&self) -> bool {
+        true
+    }
+}
+
+impl Retriable for () {
+    fn is_retriable(&self) -> bool {
+        true
+    }
+}
+
 /// Execute `f` with retry-and-circuit-breaker protection.
 ///
 /// - If `kind == CallKind::Submit`, `f` is attempted at most **once** regardless of the retry
 ///   policy (the circuit breaker still applies).
 /// - If `kind == CallKind::ReadOnly`, `f` is retried up to `policy.max_attempts` times with
-///   exponential backoff.
+///   exponential backoff, stopping early on an error that reports itself non-retriable.
 ///
-/// The closure receives no arguments and must return `Ok(T)` on success or `Err(E)` on a
-/// retriable/circuit-tripping failure.
+/// The closure receives no arguments and must return `Ok(T)` on success or `Err(E)` on failure.
 ///
 /// Returns:
 /// - `Ok(T)` — the call succeeded.
@@ -262,7 +286,7 @@ pub async fn execute<Fut, T, E>(
 ) -> Result<T, ResilienceError<E>>
 where
     Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
+    E: std::fmt::Debug + Retriable,
 {
     circuit.check().map_err(|_| ResilienceError::Circuit)?;
 
@@ -280,6 +304,12 @@ where
                 return Ok(val);
             }
             Err(e) => {
+                // A permanent error (e.g. Horizon 404) is the *answer*, not a fault: retrying it
+                // wastes attempts and would let a few of them trip the breaker, masking the real
+                // error behind `Circuit`. Return it immediately without counting a failure.
+                if !e.is_retriable() {
+                    return Err(ResilienceError::Exhausted(e));
+                }
                 circuit.on_failure();
                 // Re-check: if this failure just opened the circuit, stop retrying.
                 if circuit.check().is_err() {

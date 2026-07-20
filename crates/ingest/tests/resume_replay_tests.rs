@@ -17,7 +17,7 @@ use axum::routing::get;
 use axum::Router;
 use octo_ingest::horizon::{PaymentRecord, TransactionRecord};
 use octo_ingest::{Ingestor, Processed};
-use octo_store::{NewWallet, Store};
+use octo_store::Store;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex, Once};
 use uuid::Uuid;
@@ -106,7 +106,7 @@ async fn mock_payments_handler(
 async fn start_mock_horizon(state: MockState) -> (String, Arc<Mutex<usize>>) {
     let call_count = state.call_count.clone();
     let app = Router::new()
-        .route("/accounts/{account}/payments", get(mock_payments_handler))
+        .route("/accounts/:account/payments", get(mock_payments_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -161,8 +161,13 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
         return;
     };
 
-    // Build a page of 3 records.
-    let records: Vec<PaymentRecord> = (1..=3).map(|i| make_record(&format!("op-resume-{i}"))).collect();
+    // Build a page of 3 records. The op ids must be unique per run: deposits dedup on the
+    // Horizon operation id, so fixed literals make a re-run against the same DB record nothing
+    // (this test then sees 0 processed instead of 3). Same `run_id` scheme as the reorder test.
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let records: Vec<PaymentRecord> = (1..=3)
+        .map(|i| make_record(&format!("op-resume-{run_id}-{i}")))
+        .collect();
     let last_cursor = records.last().unwrap().paging_token.clone();
 
     let mock_state = MockState {

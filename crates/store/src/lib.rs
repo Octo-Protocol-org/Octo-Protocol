@@ -23,7 +23,6 @@ pub use models::{
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -801,6 +800,28 @@ impl Store {
         fee_stroops: i64,
         daily_budget_stroops: Option<i64>,
     ) -> Result<SponsoredTransaction, StoreError> {
+        // The read-then-insert below must be serialized per wallet. A bare conditional CTE is NOT
+        // enough: under READ COMMITTED every concurrent transaction computes `spent` from a
+        // snapshot taken before the others' inserts are visible, so N requests can each see the
+        // same total and all pass the budget guard (observed: 11 reservations against a 10-slot
+        // budget under 20 concurrent requests).
+        //
+        // A transaction-scoped advisory lock keyed on the wallet id makes the check-and-insert
+        // mutually exclusive for that wallet, while leaving other wallets fully parallel. The
+        // lock is released automatically when the transaction commits or rolls back.
+        let mut tx = self.pool.begin().await?;
+
+        // Fold the wallet UUID into a stable i64 lock key.
+        let lock_key = {
+            let b = wallet_id.as_bytes();
+            i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                ^ i64::from_be_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+
         let result = sqlx::query_as::<_, SponsoredTransaction>(
             r#"
             WITH spent AS (
@@ -821,8 +842,13 @@ impl Store {
         .bind(inner_tx_hash)
         .bind(fee_stroops)
         .bind(daily_budget_stroops)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await;
+
+        // Commit before returning so the reservation (and the lock release) are durable.
+        if result.is_ok() {
+            tx.commit().await?;
+        }
 
         match result {
             // A row means the insert (and budget check) succeeded.

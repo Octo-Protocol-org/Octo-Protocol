@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     );
 
     // Shared state (includes the API's Horizon client wired with resilience).
-    let state = AppState::new_with_resilience(
+    let mut state = AppState::new_with_resilience(
         store.clone(),
         cfg.master_key,
         cfg.network,
@@ -56,6 +56,12 @@ async fn main() -> Result<()> {
         resilience.circuit_breaker(),
     )
     .with_jwt_secret(cfg.jwt_secret.clone());
+    // MASTER_KEY_NEXT, when set, activates zero-downtime key rotation: already-migrated rows
+    // (by sealed_scheme) sign with this key; un-migrated rows still use `master_key`. Without
+    // this call the parsed env var was read into config and then never used anywhere.
+    if let Some(next) = cfg.master_key_next {
+        state = state.with_master_key_next(next);
+    }
 
     // Ingest supervisor (background task) — uses its own HorizonPayments client with the same
     // resilience config (separate circuit-breaker instance so ingest and API failures are counted

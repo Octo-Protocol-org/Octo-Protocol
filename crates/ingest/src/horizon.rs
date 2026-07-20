@@ -199,6 +199,15 @@ enum IngestFetchError {
     Permanent,
 }
 
+impl octo_resilience::Retriable for IngestFetchError {
+    fn is_retriable(&self) -> bool {
+        // Only transport failures are transient. A decode failure or a permanent status will
+        // repeat identically on a retry, and retrying them would also count toward opening the
+        // circuit breaker.
+        matches!(self, IngestFetchError::Transport)
+    }
+}
+
 impl std::fmt::Display for IngestFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

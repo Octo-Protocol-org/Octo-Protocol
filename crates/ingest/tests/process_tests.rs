@@ -52,6 +52,12 @@ async fn setup() -> Option<(Store, Ingestor, Uuid)> {
 }
 
 fn base_record(id: &str) -> PaymentRecord {
+    // Deposits dedup on the Horizon operation id, which is globally unique and persists in the
+    // DB. A fixed literal here made every one of these tests a `Duplicate` on the second run
+    // against the same database, so they only passed on a fresh DB. Suffix a per-run uuid to
+    // keep them re-runnable while preserving the readable prefix.
+    let id = format!("{id}-{}", Uuid::new_v4().simple());
+    let id = id.as_str();
     PaymentRecord {
         id: id.into(),
         paging_token: id.into(),

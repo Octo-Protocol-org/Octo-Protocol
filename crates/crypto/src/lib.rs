@@ -24,7 +24,17 @@
 // conversions on amounts are bugs. Deny them (tests may unwrap freely).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![deny(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// Tests may panic and build fixtures with lossy casts; the production bans above still apply to
+// all non-test code.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::cast_possible_truncation
+    )
+)]
 
 mod error;
 

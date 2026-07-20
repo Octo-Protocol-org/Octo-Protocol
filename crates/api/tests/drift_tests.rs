@@ -41,12 +41,48 @@ fn validate_response(spec: &Value, path: &str, method: &str, status: &str, respo
         .pointer(&format!("/paths/{}/{}/responses/{}/content/application~1json/schema", path, method, status))
         .expect("Schema not found in OpenAPI spec");
 
+    // The response schema is usually a `$ref` into `#/components/schemas/...`. Validating the
+    // bare sub-schema leaves that pointer unresolvable, so splice it into a document that still
+    // carries `components` and let the validator resolve the reference.
+    let mut doc = schema.clone();
+    if let (Some(obj), Some(components)) = (doc.as_object_mut(), spec.get("components")) {
+        obj.insert("components".to_string(), components.clone());
+    }
+    let schema = &doc;
+
     let validator = Validator::new(schema).expect("Invalid JSON schema");
     let result = validator.validate(response_body);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);
         panic!("Response did not match OpenAPI schema for {} {} {}", method, path, status);
     }
+}
+
+/// Sign up a fresh user and return its bearer token. Every /v1/wallets route is authenticated,
+/// so the drift test needs a real token or it only ever exercises the 401 path.
+async fn auth_token(app: &axum::Router) -> String {
+    let email = format!("drift-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    json["data"]["token"]
+        .as_str()
+        .expect("signup must return a token")
+        .to_string()
 }
 
 #[tokio::test]
@@ -57,27 +93,30 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     };
     let app = build_router(state);
     let spec = load_openapi_spec();
+    let token = auth_token(&app).await;
 
     // 1. Success case: Create wallet
     let req_body = serde_json::json!({
         "label": "drift-test-wallet",
         "description": "testing schema drift"
     });
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/v1/wallets")
         .header("Content-Type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::from(req_body.to_string()))
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // Wallet creation returns 201 Created (Envelope::created), not 200.
+    assert_eq!(response.status(), StatusCode::CREATED);
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
 
-    // Validate 200 response shape
-    validate_response(&spec, "~1v1~1wallets", "post", "200", &body_json);
+    // Validate the documented 201 response shape.
+    validate_response(&spec, "~1v1~1wallets", "post", "201", &body_json);
 
     // 2. Error case: Missing required fields or bad payload to an endpoint, e.g. withdrawing without funds
     let wallet_id = body_json["data"]["id"].as_str().unwrap();
@@ -95,17 +134,25 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .method("POST")
         .uri(format!("/v1/wallets/{}/withdraw", wallet_id))
         .header("Content-Type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::from(withdraw_body.to_string()))
         .unwrap();
 
     let withdraw_res = app.clone().oneshot(withdraw_req).await.unwrap();
-    assert_eq!(withdraw_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Validation failures map to ApiError::BadRequest -> 400 across this API (there is no 422).
+    assert_eq!(withdraw_res.status(), StatusCode::BAD_REQUEST);
     
     let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024).await.unwrap();
     let w_json: Value = serde_json::from_slice(&w_bytes).unwrap();
 
-    let error_schema = spec.pointer("/components/schemas/ErrorResponse").expect("ErrorResponse schema not found");
-    let error_validator = Validator::new(error_schema).expect("Invalid JSON schema");
+    let mut error_schema = spec
+        .pointer("/components/schemas/ErrorResponse")
+        .expect("ErrorResponse schema not found")
+        .clone();
+    if let (Some(obj), Some(components)) = (error_schema.as_object_mut(), spec.get("components")) {
+        obj.insert("components".to_string(), components.clone());
+    }
+    let error_validator = Validator::new(&error_schema).expect("Invalid JSON schema");
     let result = error_validator.validate(&w_json);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);
@@ -116,6 +163,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let get_wallet_req = Request::builder()
         .method("GET")
         .uri(format!("/v1/wallets/{}", wallet_id))
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
 

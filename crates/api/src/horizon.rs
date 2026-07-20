@@ -239,35 +239,59 @@ impl Horizon {
     /// Fetch balances, sequence, and reserve inputs for an account in a single Horizon call.
     /// `NotFound` if the account does not exist on-chain yet.
     pub async fn account_info(&self, account_g: &str) -> Result<AccountInfo, ApiError> {
+        // This is a read-only call, so it goes through the same retry + circuit-breaker path as
+        // `balances`. (It previously issued a bare, unwrapped GET, so a transient 5xx from
+        // Horizon failed immediately instead of being retried.)
         let url = format!(
             "{}/accounts/{}",
             self.base_url.trim_end_matches('/'),
             account_g
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ApiError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(ApiError::Internal);
-        }
-        let account: AccountResponse = resp.json().await.map_err(|_| ApiError::Internal)?;
-        let sequence = account
-            .sequence
-            .parse::<i64>()
-            .map_err(|_| ApiError::Internal)?;
-        Ok(AccountInfo {
-            balances: account.balances,
-            sequence,
-            subentry_count: account.subentry_count,
-            num_sponsoring: account.num_sponsoring,
-            num_sponsored: account.num_sponsored,
+        let http = self.http.clone();
+
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let url = url.clone();
+            let http = http.clone();
+            async move {
+                let resp = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| FetchError::Transport)?;
+
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(FetchError::NotFound);
+                }
+                if resp.status().is_server_error() {
+                    return Err(FetchError::Transport); // retriable
+                }
+                if !resp.status().is_success() {
+                    return Err(FetchError::Permanent);
+                }
+
+                let account: AccountResponse =
+                    resp.json().await.map_err(|_| FetchError::Permanent)?;
+                let sequence = account
+                    .sequence
+                    .parse::<i64>()
+                    .map_err(|_| FetchError::Permanent)?;
+                Ok(AccountInfo {
+                    balances: account.balances,
+                    sequence,
+                    subentry_count: account.subentry_count,
+                    num_sponsoring: account.num_sponsoring,
+                    num_sponsored: account.num_sponsored,
+                })
+            }
         })
+        .await;
+
+        match result {
+            Ok(info) => Ok(info),
+            Err(ResilienceError::Circuit) => Err(ApiError::Internal),
+            Err(ResilienceError::Exhausted(FetchError::NotFound)) => Err(ApiError::NotFound),
+            Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
+        }
     }
 
     /// Submit a signed transaction (base64 XDR envelope) to Horizon.
@@ -347,6 +371,15 @@ enum FetchError {
     Permanent,
     /// `POST /transactions` returned no parseable hash — tx rejected. Permanent.
     TxRejected,
+}
+
+impl octo_resilience::Retriable for FetchError {
+    fn is_retriable(&self) -> bool {
+        // Only transport-level failures (network error, timeout, 5xx) are worth another attempt.
+        // 404 / other 4xx / a rejected tx are settled answers — retrying them would also let a
+        // few of them trip the circuit breaker and mask the real error.
+        matches!(self, FetchError::Transport)
+    }
 }
 
 impl std::fmt::Display for FetchError {

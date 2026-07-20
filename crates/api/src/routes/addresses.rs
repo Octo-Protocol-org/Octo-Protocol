@@ -5,7 +5,7 @@
 //! `docs/deposit-model.md`).
 
 use crate::auth::authorize_wallet;
-use crate::error::{ApiError, ApiResult, Envelope};
+use crate::error::{ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::routes::wallets::ListParams;
 use crate::state::AppState;

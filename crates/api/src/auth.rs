@@ -47,7 +47,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
-use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -81,6 +80,11 @@ pub struct Claims {
     pub sub: String,
     /// Expiry (unix seconds).
     pub exp: i64,
+    /// Unique token id. Without it, two tokens issued for the same user within the same second
+    /// are byte-identical, so "rotating" a token on refresh would hand back the same string —
+    /// and denylisting the old one would revoke the new one too.
+    #[serde(default)]
+    pub jti: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +187,25 @@ pub async fn refresh(
         .map_err(|_| ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
 
+    // Rotate, don't just re-issue: deny-list the presented token so a refreshed session leaves
+    // exactly one live token. Without this a leaked token stayed valid for its full TTL even
+    // after the user refreshed.
+    if let Some(old_token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        if let Some(claims) = verify_token(state.jwt_secret(), old_token) {
+            let expires_at =
+                chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
+            state
+                .store()
+                .denylist_token(&hash_token(old_token), user.id, expires_at)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+        }
+    }
+
     crate::audit::record(
         &state,
         user.id,
@@ -245,6 +268,17 @@ pub async fn logout(
 
     // Deny-list the token so it cannot be replayed.
     let token_hash = hash_token(token);
+
+    // A signature check alone is not enough: an already-revoked token would otherwise "log out"
+    // again and get a 200. Reject it the same way every authenticated route does.
+    if state
+        .store()
+        .is_token_denylisted(&token_hash)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    {
+        return Err(ApiError::Unauthorized);
+    }
     let expires_at = chrono::DateTime::from_timestamp(claims.exp, 0)
         .unwrap_or_else(chrono::Utc::now);
     state
@@ -308,7 +342,11 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 fn issue_token(secret: &[u8], user_id: Uuid) -> Result<String, ApiError> {
-    let claims = Claims { sub: user_id.to_string(), exp: now_secs() + TOKEN_TTL_SECS };
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: now_secs() + TOKEN_TTL_SECS,
+        jti: Uuid::new_v4().simple().to_string(),
+    };
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
     let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
     let sig = sign_hs256(secret, signing_input.as_bytes());
@@ -333,11 +371,6 @@ pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
         return None;
     }
     Some(claims)
-}
-
-/// Extract the `exp` claim from a structurally valid, unexpired token.
-fn token_exp(secret: &[u8], token: &str) -> Option<i64> {
-    verify_token(secret, token).map(|c| c.exp)
 }
 
 fn sign_hs256(secret: &[u8], input: &[u8]) -> String {

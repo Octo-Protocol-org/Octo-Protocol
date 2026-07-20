@@ -8,7 +8,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use octo_store::WebhookDelivery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
