@@ -349,6 +349,125 @@ async fn get_unknown_wallet_is_404() {
 }
 
 #[tokio::test]
+async fn signing_info_requires_auth_and_a_real_wallet() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/signing-info");
+
+    // Unauthenticated → 401. (The success path needs a funded on-chain account and is covered by
+    // horizon_live_tests, which only runs with OCTO_LIVE_TESTS=1 — so the auth/404 guards are
+    // asserted here, where they run on every CI build.)
+    let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Another user must not learn whether this wallet exists.
+    let other = auth_token(&app).await;
+    let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown wallet → 404.
+    let unknown = format!("/v1/wallets/{}/signing-info", uuid::Uuid::new_v4());
+    let resp = app.oneshot(get_auth(&unknown, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn health_is_public_and_ok() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    // The liveness probe must not require auth — a load balancer has no token.
+    let resp = app.oneshot(get("/health")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn backup_round_trips_the_opaque_blob_verbatim() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // The blob is ciphertext the CLIENT produced; the server must store and return it byte-for
+    // byte without interpreting it.
+    let blob = "v1.YmFzZTY0LWNpcGhlcnRleHQ=.bm9uY2U=.c2FsdA==";
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    let body = format!(r#"{{"public_key":"{account}","encrypted_backup":"{blob}"}}"#);
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth("/v1/wallets", &body, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let uri = format!("/v1/wallets/{wallet_id}/backup");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["wallet_id"].as_str().unwrap(), wallet_id);
+    assert_eq!(
+        data["encrypted_backup"].as_str().unwrap(),
+        blob,
+        "the backup blob must come back exactly as the client stored it"
+    );
+}
+
+#[tokio::test]
+async fn backup_is_null_when_the_client_stored_none() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // encrypted_backup is optional — a user may decline server-side backup entirely.
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/backup");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await["data"]["encrypted_backup"].is_null());
+}
+
+#[tokio::test]
+async fn backup_rejects_api_key_auth_and_other_users() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/backup");
+
+    // An API key must not be able to pull the key backup: it is the one artifact that, combined
+    // with the user's password, reconstructs the signing key. Dashboard login only.
+    let key = api_key_for(&app, &token, &wallet_id).await;
+    let resp = app.clone().oneshot(get_auth(&uri, &key)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "API keys must not read the key backup"
+    );
+
+    // Another logged-in user gets 404 (not 403) so wallet existence isn't leaked.
+    let other = auth_token(&app).await;
+    let resp = app.oneshot(get_auth(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn unauthenticated_request_is_401() {
     let Some(state) = test_state().await else {
         return;
