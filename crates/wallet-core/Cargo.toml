@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Custodial signing helpers (sign_payment / sign_change_trust) survive ONLY as test fixtures
+# after the non-custodial cutover. Production binaries must never enable this feature — user
+# wallets carry no server-side seed, so these functions have nothing legitimate to sign.
+test-fixtures = []
+
 [dependencies]
 octo-crypto.workspace = true
 stellar-strkey.workspace = true

@@ -99,12 +99,25 @@ async fn main() -> Result<()> {
         );
 
         for wallet in &batch {
+            // Client-custody wallets hold no server-side seed (the user's key never reaches us),
+            // so there is nothing to reseal. Only rows that actually carry sealed material —
+            // legacy server-custody wallets and gas-tank fee accounts — are rotated.
+            let (Some(ciphertext), Some(nonce), Some(salt), Some(scheme)) = (
+                wallet.sealed_ciphertext.as_ref(),
+                wallet.sealed_nonce.as_ref(),
+                wallet.sealed_salt.as_ref(),
+                wallet.sealed_scheme,
+            ) else {
+                tracing::debug!(wallet_id = %wallet.id, "skipping wallet with no sealed seed");
+                continue;
+            };
+
             // Build the SealedSeed from the current DB values.
             let sealed = octo_crypto::SealedSeed::from_parts_with_scheme(
-                wallet.sealed_ciphertext.clone(),
-                &wallet.sealed_nonce,
-                &wallet.sealed_salt,
-                wallet.sealed_scheme as u8,
+                ciphertext.clone(),
+                nonce,
+                salt,
+                scheme as u8,
             )
             .with_context(|| format!("from_parts wallet {}", wallet.id))?;
 
@@ -124,7 +137,7 @@ async fn main() -> Result<()> {
                     &new_sealed.nonce,
                     &new_sealed.salt,
                     SCHEME_V1 as i16,
-                    wallet.sealed_scheme,
+                    scheme,
                 )
                 .await
                 .with_context(|| format!("reseal_wallet DB update for {}", wallet.id))?;

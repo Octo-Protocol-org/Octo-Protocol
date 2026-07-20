@@ -74,7 +74,7 @@ fn is_op_allowed(body: &OperationBody) -> bool {
     )
 }
 
-fn op_type_name(body: &OperationBody) -> &'static str {
+pub(crate) fn op_type_name(body: &OperationBody) -> &'static str {
     match body {
         OperationBody::CreateAccount(_) => "CreateAccount",
         OperationBody::Payment(_) => "Payment",

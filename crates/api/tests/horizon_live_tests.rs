@@ -52,14 +52,6 @@ fn post_auth(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn get_auth(uri: &str, token: &str) -> Request<Body> {
-    Request::builder()
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
 fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -109,15 +101,17 @@ async fn create_wallet_funds_and_has_balance() {
     let app = build_router(state);
     let token = auth_token(&app).await;
 
-    // Create a wallet — should friendbot-fund on testnet.
+    // Client generates the key; server friendbot-funds the supplied account on testnet.
+    let account = DalekKeyPair::random().unwrap().public_key().account_id();
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/wallets")
+                .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
                 .unwrap(),
         )
         .await
@@ -131,7 +125,13 @@ async fn create_wallet_funds_and_has_balance() {
 
     // Balances should now include a positive native XLM balance.
     let resp = app
-        .oneshot(get_auth(&format!("/v1/wallets/{id}/balances"), &token))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/wallets/{id}/balances"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -149,18 +149,21 @@ async fn create_wallet_funds_and_has_balance() {
     );
 }
 
-/// Create a friendbot-funded wallet and return its `(id, address, owner_token)`. The token is
-/// needed because `/withdraw` is a login-only route (see `crate::auth::require_login`).
-async fn create_funded_wallet(app: &axum::Router) -> (String, String, String) {
+/// Create a non-custodial wallet from a caller-generated keypair, friendbot-funded on testnet.
+/// Returns `(wallet_id, account_g, keypair, owner_token)` so the test can sign + relay locally.
+async fn create_funded_wallet(app: &axum::Router) -> (String, String, DalekKeyPair, String) {
     let token = auth_token(app).await;
+    let kp = DalekKeyPair::random().unwrap();
+    let account = kp.public_key().account_id();
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/wallets")
+                .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
                 .unwrap(),
         )
         .await
@@ -169,198 +172,70 @@ async fn create_funded_wallet(app: &axum::Router) -> (String, String, String) {
     (
         w["data"]["id"].as_str().unwrap().to_string(),
         w["data"]["address"].as_str().unwrap().to_string(),
+        kp,
         token,
     )
 }
 
-fn withdraw_req(wallet_id: &str, token: &str, body: String) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(format!("/v1/wallets/{wallet_id}/withdraw"))
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(body))
-        .unwrap()
-}
-
 #[tokio::test]
-async fn withdraw_sends_xlm_on_chain() {
+async fn submit_signed_sends_xlm_on_chain() {
     let Some(state) = live_state().await else {
         eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
         return;
     };
     let app = build_router(state);
 
-    // Two funded wallets: A withdraws to B's account.
-    let (wallet_a, _addr_a, token_a) = create_funded_wallet(&app).await;
-    let (_wallet_b, addr_b, _token_b) = create_funded_wallet(&app).await;
+    // Two funded wallets: A pays B. A signs the payment CLIENT-SIDE (the server never holds A's
+    // key) and relays it through submit-signed.
+    let (wallet_a, addr_a, kp_a, token_a) = create_funded_wallet(&app).await;
+    let (_wallet_b, addr_b, _kp_b, _token_b) = create_funded_wallet(&app).await;
 
-    // Withdraw 1 XLM (10_000_000 stroops) from A to B.
-    let key = uuid::Uuid::new_v4().to_string();
-    let body = format!(
-        r#"{{"destination":"{addr_b}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
-    );
+    // Build + sign a 1 XLM payment locally, using signing-info for the sequence number.
+    let seq = sequence_with_retry("https://horizon-testnet.stellar.org", &addr_a).await;
+    let dest = stellar_base::crypto::PublicKey::from_account_id(&addr_b).unwrap();
+    let op = Operation::new_payment()
+        .with_destination(dest)
+        .with_amount(stellar_base::amount::Stroops::new(10_000_000))
+        .unwrap()
+        .with_asset(stellar_base::asset::Asset::new_native())
+        .build()
+        .unwrap();
+    let mut tx = Transaction::builder(kp_a.public_key(), seq + 1, MIN_BASE_FEE)
+        .add_operation(op)
+        .into_transaction()
+        .unwrap();
+    tx.sign(kp_a.as_ref(), &stellar_base::network::Network::new_test())
+        .unwrap();
+    let signed_xdr = tx.into_envelope().xdr_base64().unwrap();
+
+    let body = format!(r#"{{"transaction_xdr":"{signed_xdr}"}}"#);
     let resp = app
         .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, body))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/wallets/{wallet_a}/submit-signed"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token_a}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
         .await
         .unwrap();
 
     assert_eq!(
         resp.status(),
         StatusCode::CREATED,
-        "withdraw should be accepted"
+        "submit-signed should be accepted"
     );
     let out = body_json(resp).await;
     assert_eq!(
         out["data"]["status"], "confirmed",
-        "withdrawal must confirm on-chain: {out}"
+        "client-signed payment must confirm on-chain: {out}"
     );
     assert!(
         out["data"]["stellar_tx_hash"].as_str().is_some(),
         "a tx hash must be returned"
-    );
-}
-
-#[tokio::test]
-async fn withdraw_rejects_insufficient_balance_key_stays_unconsumed() {
-    let Some(state) = live_state().await else {
-        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
-        return;
-    };
-    let app = build_router(state);
-
-    let (wallet_a, _addr_a, token_a) = create_funded_wallet(&app).await;
-    let (_wallet_b, addr_b, _token_b) = create_funded_wallet(&app).await;
-    let key = uuid::Uuid::new_v4().to_string();
-
-    // Friendbot funds with far less than this; must be rejected pre-flight.
-    let too_much = format!(
-        r#"{{"destination":"{addr_b}","amount_stroops":9223372036854775807,"idempotency_key":"{key}"}}"#
-    );
-    let resp = app
-        .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, too_much))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "insufficient balance must be rejected pre-flight"
-    );
-
-    // Same idempotency key, corrected amount -> must succeed (key was never consumed).
-    let corrected = format!(
-        r#"{{"destination":"{addr_b}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
-    );
-    let resp = app
-        .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, corrected))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CREATED,
-        "retry with the same key must succeed once the request is corrected"
-    );
-}
-
-#[tokio::test]
-async fn withdraw_rejects_reserve_breach_key_stays_unconsumed() {
-    let Some(state) = live_state().await else {
-        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
-        return;
-    };
-    let app = build_router(state);
-
-    let (wallet_a, addr_a, token_a) = create_funded_wallet(&app).await;
-    let (_wallet_b, addr_b, _token_b) = create_funded_wallet(&app).await;
-    let key = uuid::Uuid::new_v4().to_string();
-
-    let horizon = octo_api::horizon::Horizon::new("https://horizon-testnet.stellar.org");
-    let native_balance = loop {
-        if let Ok(info) = horizon.account_info(&addr_a).await {
-            break info.native_balance_stroops();
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    };
-
-    // Draining down to (near) zero leaves nothing for the 1 XLM base reserve.
-    let breaches_reserve = native_balance - 200; // just short of the whole balance + fee
-    let body = format!(
-        r#"{{"destination":"{addr_b}","amount_stroops":{breaches_reserve},"idempotency_key":"{key}"}}"#
-    );
-    let resp = app
-        .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, body))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "a withdrawal that breaches the minimum reserve must be rejected pre-flight"
-    );
-
-    // Same idempotency key, a modest amount that respects the reserve -> must succeed.
-    let corrected = format!(
-        r#"{{"destination":"{addr_b}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
-    );
-    let resp = app
-        .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, corrected))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CREATED,
-        "retry with the same key must succeed once the request respects the reserve"
-    );
-}
-
-#[tokio::test]
-async fn withdraw_rejects_nonexistent_destination_key_stays_unconsumed() {
-    let Some(state) = live_state().await else {
-        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
-        return;
-    };
-    let app = build_router(state);
-
-    let (wallet_a, _addr_a, token_a) = create_funded_wallet(&app).await;
-    let key = uuid::Uuid::new_v4().to_string();
-
-    // A freshly generated keypair that has never been funded/created on-chain.
-    let unfunded = DalekKeyPair::random().expect("random keypair");
-    let unfunded_g = unfunded.public_key().account_id();
-
-    let body = format!(
-        r#"{{"destination":"{unfunded_g}","amount_stroops":10000000,"idempotency_key":"{key}"}}"#
-    );
-    let resp = app
-        .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, body.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "a payment to a non-existent destination account must be rejected pre-flight"
-    );
-
-    // Fund the destination, then retry with the same idempotency key -> must succeed.
-    octo_api::horizon::friendbot_fund("https://friendbot.stellar.org", &unfunded_g)
-        .await
-        .expect("fund destination account");
-    sequence_with_retry("https://horizon-testnet.stellar.org", &unfunded_g).await;
-
-    let resp = app
-        .clone()
-        .oneshot(withdraw_req(&wallet_a, &token_a, body))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CREATED,
-        "retry with the same key must succeed once the destination exists"
     );
 }
 
@@ -449,17 +324,39 @@ async fn sponsored_webhook_fires_on_confirmation() {
 
     // One user owns both the wallet and its webhook registration throughout.
     let token = auth_token(&app).await;
+    let account = DalekKeyPair::random().unwrap().public_key().account_id();
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let wallet = body_json(resp).await;
     let wallet_id = wallet["data"]["id"].as_str().unwrap().to_string();
-    let master_g = wallet["data"]["address"].as_str().unwrap().to_string();
+
+    // The fee-bump is paid by the wallet's gas tank (a server-held fee account); provision +
+    // friendbot-fund it, and use its address as the inner-tx recipient/sponsor reference.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let tank = body_json(resp).await;
+    let master_g = tank["data"]["gas_tank_address"].as_str().unwrap().to_string();
     assert_eq!(
-        wallet["data"]["funded"], true,
-        "the sponsoring wallet must be friendbot-funded to pay the fee-bump fee"
+        tank["data"]["funded"], true,
+        "the gas tank must be friendbot-funded to pay the fee-bump fee"
     );
     enable_sponsorship(&state, &wallet_id).await;
 

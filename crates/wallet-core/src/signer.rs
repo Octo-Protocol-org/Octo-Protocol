@@ -10,18 +10,28 @@
 //! - The decrypted seed and the derived keypair live only for the duration of `sign_payment` and
 //!   are zeroized on drop.
 
-use crate::address::is_valid_account;
-use crate::asset::is_valid_asset_code;
 use crate::derive::WalletSeed;
 use crate::error::WalletError;
 use octo_crypto::{open, SealedSeed, MASTER_KEY_LEN};
-use stellar_base::amount::Stroops;
-use stellar_base::asset::Asset;
 use stellar_base::crypto::{DalekKeyPair, MuxedEd25519PublicKey, PublicKey};
-use stellar_base::memo::Memo;
 use stellar_base::network::Network;
+
+// Used only by the feature-gated custodial signing fixtures below.
+#[cfg(any(test, feature = "test-fixtures"))]
+use crate::address::is_valid_account;
+#[cfg(any(test, feature = "test-fixtures"))]
+use crate::asset::is_valid_asset_code;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::amount::Stroops;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::asset::Asset;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::memo::Memo;
+#[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::operations::Operation;
+#[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::transaction::{Transaction, MIN_BASE_FEE};
+#[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::xdr::XDRSerialize;
 
 /// Which Stellar network a signature targets.
@@ -42,6 +52,14 @@ impl StellarNetwork {
     }
 
     /// The crypto context string bound into seed encryption for this network.
+    /// The canonical network passphrase (what clients must sign against).
+    pub fn passphrase(self) -> &'static str {
+        match self {
+            StellarNetwork::Public => "Public Global Stellar Network ; September 2015",
+            StellarNetwork::Testnet => "Test SDF Network ; September 2015",
+        }
+    }
+
     pub fn crypto_context(self) -> &'static [u8] {
         match self {
             StellarNetwork::Public => b"octo:mainnet",
@@ -68,6 +86,11 @@ impl StellarNetwork {
 }
 
 /// A single payment to build and sign from the master account.
+///
+/// **Test fixture only** since the non-custodial cutover: production code has no server-held
+/// user seed to sign with. Kept (feature-gated) so validation tests can fabricate real signed
+/// envelopes.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub struct PaymentRequest<'a> {
     /// Destination account (`G...`) or muxed (`M...`) address.
     pub destination: &'a str,
@@ -120,6 +143,9 @@ pub fn account_id_from_sealed(
 ///
 /// Only a Payment operation is ever constructed — no other operation type can be produced by this
 /// function, which is the core anti-"signing-oracle" guarantee.
+///
+/// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn sign_payment(
     master_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
@@ -172,6 +198,85 @@ pub fn sign_payment(
         .map_err(|_| WalletError::Signing)?;
 
     // DalekKeyPair derefs to the inner KeyPair, which is what sign() accepts.
+    tx.sign(keypair.as_ref(), &network.to_base())
+        .map_err(|_| WalletError::Signing)?;
+
+    let envelope_xdr = tx
+        .into_envelope()
+        .xdr_base64()
+        .map_err(|_| WalletError::Signing)?;
+
+    Ok(SignedPayment {
+        envelope_xdr,
+        source_account,
+    })
+}
+
+/// A trustline (ChangeTrust) to build and sign from the master account.
+///
+/// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub struct ChangeTrustRequest<'a> {
+    /// Asset code to trust (e.g. `"USDC"`). 1–12 ASCII chars.
+    pub asset_code: &'a str,
+    /// The asset issuer account (`G...`).
+    pub asset_issuer: &'a str,
+    /// Trust limit in **stroops**. `None` => the protocol maximum (unlimited).
+    /// `Some(0)` removes the trustline (only allowed when the balance is zero).
+    pub limit_stroops: Option<i64>,
+    /// The master account's current sequence number (fetched from Horizon by the caller).
+    pub sequence: i64,
+}
+
+/// Build and sign a ChangeTrust (trustline) operation from the master account.
+///
+/// This only ever constructs Octo's own operation — here a single ChangeTrust — so it cannot be
+/// used as a "sign anything" oracle.
+///
+/// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn sign_change_trust(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    network: StellarNetwork,
+    account_index: u32,
+    req: &ChangeTrustRequest<'_>,
+) -> Result<SignedPayment, WalletError> {
+    if let Some(limit) = req.limit_stroops {
+        if limit < 0 {
+            return Err(WalletError::InvalidAmount);
+        }
+    }
+    if !is_valid_account(req.asset_issuer) {
+        return Err(WalletError::InvalidAddress);
+    }
+
+    let keypair = keypair_from_sealed(master_key, sealed, network, account_index)?;
+    let source = keypair.public_key();
+    let source_account = source.account_id();
+
+    let issuer_pk =
+        PublicKey::from_account_id(req.asset_issuer).map_err(|_| WalletError::InvalidAddress)?;
+    // `with_asset` takes a ChangeTrustAsset; a credit `Asset` converts via `From<Asset>`.
+    let asset: Asset =
+        Asset::new_credit(req.asset_code, issuer_pk).map_err(|_| WalletError::InvalidAddress)?;
+
+    // Stellar encodes a *missing* limit as 0, which means "remove the trustline" — not
+    // "unlimited". So map "no limit requested" to the protocol maximum (i64::MAX) to establish
+    // an unlimited trustline. An explicit 0 is preserved (caller intends to remove).
+    let limit = req.limit_stroops.unwrap_or(i64::MAX);
+    let change_trust = Operation::new_change_trust()
+        .with_asset(asset.into())
+        .with_limit(Some(Stroops::new(limit)))
+        .map_err(|_| WalletError::InvalidAmount)?
+        .build()
+        .map_err(|_| WalletError::Signing)?;
+
+    let mut tx = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
+        .add_operation(change_trust)
+        .into_transaction()
+        .map_err(|_| WalletError::Signing)?;
+
     tx.sign(keypair.as_ref(), &network.to_base())
         .map_err(|_| WalletError::Signing)?;
 
@@ -352,6 +457,7 @@ pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
 }
 
 /// Parse a destination that may be a `G...` account or an `M...` muxed address.
+#[cfg(any(test, feature = "test-fixtures"))]
 fn parse_destination(dest: &str) -> Result<stellar_base::crypto::MuxedAccount, WalletError> {
     if let Ok(mux) = MuxedEd25519PublicKey::from_account_id(dest) {
         return Ok(mux.into());
@@ -414,6 +520,48 @@ mod tests {
             }
             _ => panic!("unexpected envelope variant"),
         }
+    }
+
+    #[test]
+    fn signs_change_trust_and_produces_valid_envelope() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let req = ChangeTrustRequest {
+            asset_code: "USDC",
+            asset_issuer: DEST,
+            limit_stroops: None, // unlimited
+            sequence: 1,
+        };
+        let signed =
+            sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        assert_eq!(signed.source_account, MASTER_ACCOUNT_0);
+        let env = stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr)
+            .expect("signed envelope must be valid XDR");
+        match env {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                assert_eq!(e.signatures.len(), 1, "must be signed once");
+                // A `None` limit must serialize as i64::MAX (unlimited), NOT 0 —
+                // 0 means "remove trustline" and yields op_invalid_limit on-chain.
+                match &e.tx.operations[0].body {
+                    stellar_base::xdr::OperationBody::ChangeTrust(op) => {
+                        assert_eq!(op.limit, i64::MAX, "unlimited trustline limit");
+                    }
+                    _ => panic!("expected a ChangeTrust op"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn change_trust_rejects_bad_issuer() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let req = ChangeTrustRequest {
+            asset_code: "USDC",
+            asset_issuer: "not-an-account",
+            limit_stroops: None,
+            sequence: 1,
+        };
+        assert!(sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req).is_err());
     }
 
     #[test]

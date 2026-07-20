@@ -12,6 +12,7 @@ mod json;
 pub mod routes;
 pub mod sponsor_validation;
 mod state;
+pub mod submit_validation;
 
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
@@ -83,9 +84,28 @@ pub fn build_router(state: AppState) -> Router {
                 .get(routes::apikeys::get_key)
                 .delete(routes::apikeys::delete_key),
         )
+        // Custodial signing tombstones (410 Gone since the non-custodial cutover).
         .route(
             "/v1/wallets/:id/withdraw",
             post(routes::withdrawals::withdraw),
+        )
+        .route(
+            "/v1/wallets/:id/trustlines",
+            post(routes::trustlines::add_trustline),
+        )
+        // Non-custodial path: clients sign locally and relay through these.
+        .route(
+            "/v1/wallets/:id/submit-signed",
+            post(routes::submit::submit_signed),
+        )
+        .route(
+            "/v1/wallets/:id/signing-info",
+            get(routes::submit::signing_info),
+        )
+        .route("/v1/wallets/:id/backup", get(routes::wallets::get_backup))
+        .route(
+            "/v1/wallets/:id/gas-tank",
+            post(routes::wallets::create_gas_tank),
         )
         .route(
             "/v1/wallets/:id/sponsorship",

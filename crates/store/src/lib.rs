@@ -33,7 +33,8 @@ pub struct Store {
     pool: PgPool,
 }
 
-/// Parameters for creating a master wallet.
+/// Parameters for creating a server-custody wallet (legacy wallets and gas-tank fee accounts —
+/// the only rows that carry a server-held sealed seed).
 pub struct NewWallet<'a> {
     pub network: &'a str,
     pub stellar_account_g: &'a str,
@@ -42,6 +43,18 @@ pub struct NewWallet<'a> {
     pub sealed_salt: &'a [u8],
     /// Scheme version tag for the sealed seed. Use `octo_crypto::SCHEME_V1`.
     pub sealed_scheme: i16,
+    pub label: Option<&'a str>,
+    pub user_id: Option<Uuid>,
+    pub description: Option<&'a str>,
+}
+
+/// Parameters for creating a non-custodial (client-custody) wallet: the client generated the
+/// keypair and sends only the public account plus an opaque password-encrypted backup blob the
+/// server cannot decrypt.
+pub struct NewClientWallet<'a> {
+    pub network: &'a str,
+    pub stellar_account_g: &'a str,
+    pub encrypted_backup: Option<&'a str>,
     pub label: Option<&'a str>,
     pub user_id: Option<Uuid>,
     pub description: Option<&'a str>,
@@ -236,8 +249,8 @@ impl Store {
             r#"
             INSERT INTO wallets
                 (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
-                 sealed_scheme, label, user_id, description)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 sealed_scheme, label, user_id, description, custody)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'server')
             RETURNING *
             "#,
         )
@@ -250,6 +263,60 @@ impl Store {
         .bind(new.label)
         .bind(new.user_id)
         .bind(new.description)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from_sqlx_conflict)
+    }
+
+    /// Attach a gas-tank fee account to a client-custody wallet: stores the tank's sealed seed
+    /// and public account. The tank only ever holds fee float — never customer funds.
+    pub async fn set_gas_tank(
+        &self,
+        wallet_id: Uuid,
+        gas_tank_account_g: &str,
+        sealed_ciphertext: &[u8],
+        sealed_nonce: &[u8],
+        sealed_salt: &[u8],
+    ) -> Result<Wallet, StoreError> {
+        sqlx::query_as::<_, Wallet>(
+            r#"
+            UPDATE wallets
+            SET gas_tank_account_g = $2, sealed_ciphertext = $3, sealed_nonce = $4,
+                sealed_salt = $5, updated_at = now()
+            WHERE id = $1 AND custody = 'client' AND gas_tank_account_g IS NULL
+            RETURNING *
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(gas_tank_account_g)
+        .bind(sealed_ciphertext)
+        .bind(sealed_nonce)
+        .bind(sealed_salt)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::Conflict) // already has a tank, or not a client wallet
+    }
+
+    /// Create a non-custodial wallet: no seed is stored; the server can never sign for it.
+    pub async fn create_client_wallet(
+        &self,
+        new: NewClientWallet<'_>,
+    ) -> Result<Wallet, StoreError> {
+        sqlx::query_as::<_, Wallet>(
+            r#"
+            INSERT INTO wallets
+                (network, stellar_account_g, label, user_id, description, custody,
+                 encrypted_backup)
+            VALUES ($1, $2, $3, $4, $5, 'client', $6)
+            RETURNING *
+            "#,
+        )
+        .bind(new.network)
+        .bind(new.stellar_account_g)
+        .bind(new.label)
+        .bind(new.user_id)
+        .bind(new.description)
+        .bind(new.encrypted_backup)
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::from_sqlx_conflict)
@@ -646,6 +713,43 @@ impl Store {
 
     /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
     /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
+    /// Record a confirmed/failed outbound transfer in the `transactions` history (the table the
+    /// dashboard lists). Withdrawals previously lived only in `withdrawals`, which is why they
+    /// never showed up in "recent transactions".
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_withdrawal_transaction(
+        &self,
+        wallet_id: Uuid,
+        asset_code: &str,
+        asset_issuer: Option<&str>,
+        amount_stroops: i64,
+        source_account: &str,
+        destination_account: &str,
+        stellar_tx_hash: Option<&str>,
+        status: &str,
+    ) -> Result<Transaction, StoreError> {
+        let row = sqlx::query_as::<_, Transaction>(
+            r#"
+            INSERT INTO transactions
+                (wallet_id, direction, asset_code, asset_issuer, amount_stroops,
+                 source_account, destination_account, stellar_tx_hash, status)
+            VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8)
+            RETURNING *
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(asset_code)
+        .bind(asset_issuer)
+        .bind(amount_stroops)
+        .bind(source_account)
+        .bind(destination_account)
+        .bind(stellar_tx_hash)
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn create_withdrawal(
         &self,
         new: NewWithdrawal<'_>,

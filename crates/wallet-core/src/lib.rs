@@ -32,5 +32,14 @@ pub use error::WalletError;
 pub use provision::{import_wallet, provision_wallet, ProvisionedWallet};
 pub use signer::{
     account_id_from_sealed, compute_inner_tx_hash, inner_operation_count, sign_fee_bump,
-    sign_payment, FeeBumpRequest, PaymentRequest, SignedPayment, StellarNetwork,
+    FeeBumpRequest, SignedPayment, StellarNetwork,
 };
+
+// Payment signing is a TEST FIXTURE ONLY since the non-custodial cutover: production code paths
+// must never sign for a user wallet, which carries no server-side seed. Validation tests use it
+// to fabricate the kind of real signed envelope a client would submit.
+//
+// (`sign_change_trust`/`ChangeTrustRequest` were removed with the cutover — trustlines are now
+// built and signed client-side and relayed via /submit-signed.)
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use signer::{sign_payment, PaymentRequest};

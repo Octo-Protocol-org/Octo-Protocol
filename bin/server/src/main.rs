@@ -1,12 +1,8 @@
 //! octo service entry point.
 //!
-//! Loads configuration from the environment (`.env` supported), connects and migrates the
-//! database, then runs two things in one process:
-//!   1. the REST API (axum), and
-//!   2. the deposit ingest supervisor (polls Horizon for all wallets).
-//!
-//! These can later be split into separate processes for scale without code changes — the ingest
-//! cursor makes the worker restart-safe and independently runnable.
+// Loads config from env, connects & migrates the DB, then runs both the REST API (axum)
+// and the deposit ingest supervisor (polls Horizon for all wallets) in one process.
+// Can be split for scale — ingest cursor makes the worker restart-safe and rerunnable.
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
@@ -150,14 +146,8 @@ impl Config {
         let master_key = AppState::decode_master_key(&master_key_b64)
             .map_err(|_| anyhow::anyhow!("MASTER_KEY must be base64-encoded 32 bytes"))?;
 
-        // During a key-rotation window, MASTER_KEY_NEXT can be set alongside MASTER_KEY.
-        // The server reads it here and passes it to AppState so that signing paths can try the
-        // new key first, then fall back to the old key for rows not yet migrated by
-        // `octo-migrate-keys`. Once the migration tool reports 0 remaining rows, MASTER_KEY
-        // should be updated to the new value and MASTER_KEY_NEXT removed.
-        //
-        // Security note: both keys must be treated with the same care as MASTER_KEY. They should
-        // come from the same KMS/secrets manager; neither should ever be written to disk or logs.
+        // During key rotation, MASTER_KEY_NEXT lets the server sign with the new key (if present)
+        // and fall back to the old key for unmigrated rows. Both must remain secure at all times.
         let master_key_next = std::env::var("MASTER_KEY_NEXT")
             .ok()
             .map(|b64| {

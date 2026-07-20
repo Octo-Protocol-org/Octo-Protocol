@@ -79,6 +79,22 @@ fn post_auth(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// `POST /v1/wallets` under the non-custodial contract: the "client" (this test) generates the
+/// keypair and sends only the public key.
+fn create_wallet_req(token: &str) -> Request<Body> {
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    Request::builder()
+        .method("POST")
+        .uri("/v1/wallets")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+        .unwrap()
+}
+
 /// Sign up a fresh user via the router and return its bearer token.
 async fn auth_token(app: &axum::Router) -> String {
     let email = format!("u-{}@octo.test", uuid::Uuid::new_v4().simple());
@@ -138,8 +154,8 @@ async fn test_oversized_body_returns_envelope() {
         return;
     };
     let app = build_router(state);
-    
-    // إرسال طلب كبير جداً (أكبر من الحد المسموح به عادة)
+
+    // Send a body far larger than the configured limit.
     let resp = app
         .oneshot(
             Request::builder()
@@ -152,14 +168,95 @@ async fn test_oversized_body_returns_envelope() {
         .await
         .unwrap();
 
-    // A body over the configured limit is rejected before any handler runs.
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-    // The rejection carries a non-empty explanatory body. (It is axum's own DefaultBodyLimit
-    // rejection, which is plain text rather than the JSON envelope handlers return — asserting
-    // on the status and a non-empty body keeps this robust either way.)
+    // The oversized rejection must still use the standard response envelope, not a bare 413.
     let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     assert!(!bytes.is_empty(), "413 response should explain itself");
+}
+
+#[tokio::test]
+async fn create_wallet_is_non_custodial_and_stores_no_seed() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+
+    // The client generates the keypair and sends only the public key.
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(
+                    r#"{{"label":"acme","public_key":"{account}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(
+        data["address"].as_str().unwrap(),
+        account,
+        "the wallet account must be exactly the client-supplied public key"
+    );
+    assert_eq!(data["custody"], "client");
+    assert!(
+        data.get("recovery_mnemonic").is_none() || data["recovery_mnemonic"].is_null(),
+        "no mnemonic is ever returned — the client generated it"
+    );
+
+    // The custody kill-test: the server holds NO seed for this wallet.
+    let wallet_id = data["id"].as_str().unwrap();
+    let (custody, has_seed): (String, bool) = sqlx::query_as(
+        "SELECT custody, (sealed_ciphertext IS NOT NULL OR sealed_nonce IS NOT NULL \
+         OR sealed_salt IS NOT NULL) FROM wallets WHERE id = $1::uuid",
+    )
+    .bind(wallet_id)
+    .fetch_one(state.store().pool())
+    .await
+    .unwrap();
+    assert_eq!(custody, "client");
+    assert!(!has_seed, "no seed material may be stored for a client wallet");
+}
+
+#[tokio::test]
+async fn create_wallet_rejects_bad_public_key() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Missing public_key → 400.
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth("/v1/wallets", r#"{"label":"x"}"#, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Malformed public_key → 400.
+    let resp = app
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            r#"{"public_key":"not-a-stellar-account"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -173,7 +270,7 @@ async fn addresses_return_both_forms_and_share_base() {
     // Create a wallet (empty body is allowed).
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet = body_json(resp).await;
@@ -217,7 +314,7 @@ async fn transactions_endpoint_returns_list() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -305,25 +402,55 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn withdraw_requires_destination_amount_and_idempotency_key() {
+async fn custodial_withdraw_is_gone() {
     let Some(state) = test_state().await else {
         return;
     };
     let app = build_router(state);
     let token = auth_token(&app).await;
-    // Create a wallet to target.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
 
-    // Missing everything.
+    // The custodial withdraw endpoint was removed in the non-custodial cutover: it now returns
+    // 410 Gone, pointing callers at submit-signed. The server holds no user key to sign with.
+    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"k"}"#;
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/withdraw"),
+            body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn submit_signed_requires_transaction_xdr() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(&token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/submit-signed");
+
+    // Empty body → 400.
     let resp = app
         .clone()
         .oneshot(post_json_auth(&uri, "{}", &token))
@@ -331,62 +458,44 @@ async fn withdraw_requires_destination_amount_and_idempotency_key() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Missing idempotency key (has dest + amount).
-    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100}"#;
+    // Garbage XDR → 400.
     let resp = app
-        .oneshot(post_json_auth(&uri, body, &token))
+        .oneshot(post_json_auth(
+            &uri,
+            r#"{"transaction_xdr":"not-valid-xdr"}"#,
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn withdraw_duplicate_idempotency_key_conflicts_before_signing() {
+async fn custodial_trustline_is_gone() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state.clone());
+    let app = build_router(state);
     let token = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
 
-    // Pre-insert a withdrawal with a known idempotency key (simulating a prior request) so the
-    // second attempt conflicts at create_withdrawal BEFORE any Horizon/signing happens.
-    let key = format!("key-{}", uuid::Uuid::new_v4());
-    state
-        .store()
-        .create_withdrawal(octo_store::NewWithdrawal {
-            wallet_id: wallet_id.parse().unwrap(),
-            idempotency_key: &key,
-            destination_account: "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6",
-            asset_code: "native",
-            asset_issuer: None,
-            amount_stroops: 100,
-            memo_id: None,
-        })
-        .await
-        .unwrap();
-
-    let body = format!(
-        r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}"}}"#
-    );
     let resp = app
-        .oneshot(post_json_auth(&uri, &body, &token))
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/trustlines"),
+            r#"{"asset_code":"USDC","asset_issuer":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"}"#,
+            &token,
+        ))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "retry with same idempotency key must 409 (no double-spend)"
-    );
+    assert_eq!(resp.status(), StatusCode::GONE);
 }
 
 /// Regression coverage for the withdrawal route's use of the shared
@@ -453,7 +562,7 @@ async fn api_key_generate_and_get() {
     // Create a wallet owned by this user.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -523,7 +632,7 @@ async fn api_key_requires_ownership() {
     let token_a = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token_a))
+        .oneshot(create_wallet_req(&token_a))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -573,7 +682,7 @@ async fn api_key_can_create_address_on_its_wallet() {
     // Create a wallet + its API key.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -614,7 +723,7 @@ async fn api_key_cannot_touch_another_wallet() {
     // Two wallets owned by the same user; key for wallet A.
     let a = body_json(
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap(),
     )
@@ -624,7 +733,7 @@ async fn api_key_cannot_touch_another_wallet() {
         .to_string();
     let b = body_json(
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap(),
     )
@@ -806,7 +915,7 @@ async fn delete_api_key_rejects_api_key_auth() {
 }
 
 #[tokio::test]
-async fn api_key_cannot_withdraw() {
+async fn api_key_cannot_provision_gas_tank() {
     let Some(state) = test_state().await else {
         return;
     };
@@ -815,7 +924,7 @@ async fn api_key_cannot_withdraw() {
 
     let wallet_id = body_json(
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap(),
     )
@@ -825,12 +934,12 @@ async fn api_key_cannot_withdraw() {
         .to_string();
     let key = api_key_for(&app, &token, &wallet_id).await;
 
-    // Withdrawals are dashboard-only: an API key is rejected with 401.
-    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"k1"}"#;
+    // Provisioning a server-held gas tank is a sensitive, dashboard-only action (require_login):
+    // an API key must be rejected with 401. (Moving user funds now requires the user's own
+    // client-side signature, so there is no custodial withdraw for a key to abuse.)
     let resp = app
-        .oneshot(post_json_auth(
-            &format!("/v1/wallets/{wallet_id}/withdraw"),
-            body,
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
             &key,
         ))
         .await
@@ -838,7 +947,7 @@ async fn api_key_cannot_withdraw() {
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "API keys must not be allowed to withdraw"
+        "API keys must not provision a gas tank"
     );
 }
 
@@ -866,7 +975,7 @@ async fn audit_logs_record_and_list() {
 
     // Create a wallet → records "created master wallet".
     app.clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
 
@@ -934,7 +1043,7 @@ async fn list_sponsored_transactions_returns_empty_for_new_wallet() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -960,7 +1069,7 @@ async fn list_sponsored_transactions_pagination() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1022,7 +1131,7 @@ async fn list_sponsored_transactions_status_filter() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]

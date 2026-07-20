@@ -112,17 +112,42 @@ async fn auth_token(app: &Router) -> String {
         .to_string()
 }
 
+/// Create a non-custodial wallet (client-generated key) and provision its gas tank so the
+/// sponsorship path has a server-held fee account to sign fee-bumps with.
 async fn create_wallet(app: &Router, token: &str) -> (String, String) {
+    let account = DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let w = body_json(resp).await;
-    (
-        w["data"]["id"].as_str().unwrap().to_string(),
-        w["data"]["address"].as_str().unwrap().to_string(),
-    )
+    let id = w["data"]["id"].as_str().unwrap().to_string();
+    let address = w["data"]["address"].as_str().unwrap().to_string();
+
+    // Attach the gas tank (the only server-held key for a client wallet).
+    let resp = app
+        .clone()
+        .oneshot(post_auth(&format!("/v1/wallets/{id}/gas-tank"), token))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "gas tank provisioning must succeed"
+    );
+
+    (id, address)
 }
 
 /// Local mock Horizon that accepts POST /transactions and returns a successful submission.

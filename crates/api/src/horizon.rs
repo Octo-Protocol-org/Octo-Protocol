@@ -136,15 +136,36 @@ pub struct SubmitResult {
     pub hash: String,
     pub successful: bool,
     pub ledger: Option<i64>,
+    /// Horizon result codes when the tx failed, e.g. `("tx_failed", ["op_low_reserve"])`.
+    /// Empty on success or when Horizon didn't return them.
+    pub transaction_code: Option<String>,
+    pub operation_codes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SubmitResponse {
+    #[serde(default)]
     hash: String,
     #[serde(default)]
     successful: bool,
     #[serde(default)]
     ledger: Option<i64>,
+    #[serde(default)]
+    extras: Option<SubmitExtras>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SubmitExtras {
+    #[serde(default)]
+    result_codes: Option<ResultCodes>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResultCodes {
+    #[serde(default)]
+    transaction: Option<String>,
+    #[serde(default)]
+    operations: Vec<String>,
 }
 
 /// A thin Horizon client with retry/backoff and circuit-breaker protection.
@@ -325,6 +346,10 @@ impl Horizon {
                     .await
                     .map_err(|_| FetchError::Transport)?;
 
+                // Horizon returns 400 with a problem document when the tx is rejected (e.g. bad
+                // seq, no reserve). Parse it either way so we can surface the specific result
+                // codes — with client-signed transactions the caller needs to know *why* it
+                // failed in order to correct and re-sign.
                 let status = resp.status();
                 let body: SubmitResponse = match resp.json().await {
                     Ok(b) => b,
@@ -335,10 +360,17 @@ impl Horizon {
                         return Err(FetchError::TxRejected);
                     }
                 };
+                let (transaction_code, operation_codes) = body
+                    .extras
+                    .and_then(|e| e.result_codes)
+                    .map(|rc| (rc.transaction, rc.operations))
+                    .unwrap_or((None, Vec::new()));
                 Ok(SubmitResult {
                     hash: body.hash,
                     successful: body.successful,
                     ledger: body.ledger,
+                    transaction_code,
+                    operation_codes,
                 })
             }
         })

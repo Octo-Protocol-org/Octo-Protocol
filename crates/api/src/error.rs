@@ -25,6 +25,8 @@ pub enum ApiError {
     NotFound,
     /// 409 — conflict (e.g. duplicate idempotency key / already exists).
     Conflict,
+    /// 410 — the endpoint was removed (custodial signing paths, post non-custodial cutover).
+    Gone(String),
     /// 429 — a rate limit or budget would be exceeded.
     TooManyRequests(String),
     /// 500 — an internal error. The detail is logged, never returned to the client.
@@ -39,6 +41,7 @@ impl ApiError {
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             ApiError::Conflict => (StatusCode::CONFLICT, "already exists".into()),
+            ApiError::Gone(m) => (StatusCode::GONE, m.clone()),
             ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.clone()),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,

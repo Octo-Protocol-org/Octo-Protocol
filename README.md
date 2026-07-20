@@ -12,8 +12,9 @@
 </div>
 
 octo lets a fintech manage stablecoin deposits on Stellar from a **single master wallet**:
-generate a dedicated deposit address per customer, detect deposits in real time, and initiate
-withdrawals — all behind a REST API with signed webhooks, and a non-custodial key model.
+generate a dedicated deposit address per customer, detect deposits in real time, and relay
+client-signed withdrawals — all behind a REST API with signed webhooks, and a genuinely
+**non-custodial** key model (keys are generated and held client-side; the server never sees them).
 
 It replicates the "master wallet" backbone of platforms like Blockradar, but built **Stellar-first**.
 
@@ -87,11 +88,13 @@ curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/withdraw \
 
 ## Security architecture
 
-octo is custodial signing software, not a smart-contract system — so the classic web3 exploit
-classes (reentrancy, flash loans, bridges, approval phishing) do not apply. The real surface is
-**key custody and the signing path**, and the whole design is built around one rule: *the seed is
-encrypted at rest and only ever decrypted in memory, inside one crate, for the instant it takes to
-sign — then wiped.*
+octo is non-custodial: user wallet keys are generated and held **client-side** (browser/SDK), so
+the server has nothing to sign with and a full server compromise cannot move user funds. The real
+surface is therefore the **submit path** — validating client-signed transactions before relaying
+them — plus the one remaining server-held key: each wallet's optional **gas tank**, a fee-only
+account whose seed is encrypted at rest and only ever decrypted in memory, inside one crate, for
+the instant it takes to sign a fee-bump — then wiped. Its worst-case exposure is bounded by the
+gas budget, never customer balances.
 
 ### Trust boundaries — where secrets live
 

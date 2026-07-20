@@ -8,23 +8,42 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-/// A master wallet (one per network), holding the sealed HD seed.
+/// A master wallet.
+///
+/// Custody models (see `migrations/0008_client_custody.sql`):
+/// - `custody == "client"`: non-custodial — the USER's private key exists only client-side and
+///   the server can never sign for `stellar_account_g`. If `sealed_*` are set on such a row,
+///   they hold the seed of the separate **gas-tank** fee account (`gas_tank_account_g`), which
+///   only ever carries fee float for sponsorship. `encrypted_backup` is an opaque
+///   client-encrypted blob the server cannot decrypt.
+/// - `custody == "server"`: legacy — the sealed seed is the user account's own seed.
 #[derive(Debug, Clone, FromRow)]
 pub struct Wallet {
     pub id: Uuid,
     pub network: String,
     pub stellar_account_g: String,
-    pub sealed_ciphertext: Vec<u8>,
-    pub sealed_nonce: Vec<u8>,
-    pub sealed_salt: Vec<u8>,
-    /// Scheme version tag for the sealed HD seed. See `octo_crypto::SCHEME_V1`.
-    pub sealed_scheme: i16,
+    pub sealed_ciphertext: Option<Vec<u8>>,
+    pub sealed_nonce: Option<Vec<u8>>,
+    pub sealed_salt: Option<Vec<u8>>,
+    /// Scheme version tag for the sealed seed (see `octo_crypto::SCHEME_V1`). `None` on
+    /// client-custody rows that carry no sealed seed at all.
+    pub sealed_scheme: Option<i16>,
     pub next_muxed_id: i64,
     pub label: Option<String>,
     pub user_id: Option<Uuid>,
     pub description: Option<String>,
+    pub custody: String,
+    pub encrypted_backup: Option<String>,
+    pub gas_tank_account_g: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Wallet {
+    /// True when the private key lives only client-side (server cannot sign).
+    pub fn is_client_custody(&self) -> bool {
+        self.custody == "client"
+    }
 }
 
 /// A per-customer deposit address (off-chain row).
