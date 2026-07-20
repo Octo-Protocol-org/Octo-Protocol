@@ -374,6 +374,37 @@ async fn balances_requires_auth_and_a_real_wallet() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Regression: the sequence number must serialize as a JSON **string**, not a number.
+///
+/// Stellar sequence numbers are ~1.6e16, past `Number.MAX_SAFE_INTEGER` (9.007e15). As a JSON
+/// number, `JSON.parse` rounds to float64 and silently drops the low bits (…466433 → …466432),
+/// so the browser signs with a sequence one too low and Horizon rejects it with `tx_bad_seq`.
+/// This manifested as "the first withdrawal works, the second always fails".
+#[test]
+fn signing_info_serializes_sequence_as_a_string() {
+    // A value past MAX_SAFE_INTEGER that is NOT representable as an f64 — round-tripping it
+    // through a double loses the final digit, which is exactly the production failure.
+    let seq: i64 = 15_942_562_120_466_433;
+    assert!(seq > 9_007_199_254_740_991, "test value must be unsafe in JS");
+    assert_ne!(
+        seq as f64 as i64, seq,
+        "test value must actually lose precision as a double"
+    );
+
+    // Serialize the REAL response struct — this is what would regress if the attribute is removed.
+    let info = octo_api::routes::submit::SigningInfo {
+        account: "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into(),
+        sequence: seq,
+        network_passphrase: "Test SDF Network ; September 2015".into(),
+        base_fee_stroops: 100,
+    };
+    let json = serde_json::to_string(&info).unwrap();
+    assert!(
+        json.contains(r#""sequence":"15942562120466433""#),
+        "sequence must be quoted (a string) on the wire, got: {json}"
+    );
+}
+
 #[tokio::test]
 async fn signing_info_requires_auth_and_a_real_wallet() {
     let Some(state) = test_state().await else {

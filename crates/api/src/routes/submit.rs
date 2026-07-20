@@ -180,6 +180,17 @@ pub async fn signing_info(
 #[derive(Debug, Serialize)]
 pub struct SigningInfo {
     pub account: String,
+    /// The account's current sequence number, as a **string**.
+    ///
+    /// This is not stylistic. Stellar sequence numbers are `(ledger << 32)`-based and are already
+    /// ~1.6e16 on testnet, which is past JavaScript's `Number.MAX_SAFE_INTEGER` (9.007e15). Sent
+    /// as a JSON number, `JSON.parse` silently rounds it — e.g. ...466433 becomes ...466432, one
+    /// too low — so the client signs with a stale sequence and Horizon rejects the transaction
+    /// with `tx_bad_seq`. The first withdrawal after funding happens to land on an even value and
+    /// succeeds, which makes this look like an intermittent bug rather than a rounding one.
+    ///
+    /// Horizon itself returns `sequence` as a string for exactly this reason; we match it.
+    #[serde(with = "crate::json::i64_as_string")]
     pub sequence: i64,
     pub network_passphrase: String,
     pub base_fee_stroops: i64,
