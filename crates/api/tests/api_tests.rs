@@ -349,6 +349,32 @@ async fn get_unknown_wallet_is_404() {
 }
 
 #[tokio::test]
+async fn balances_requires_auth_and_a_real_wallet() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/balances");
+
+    // The Horizon client itself is covered by horizon_client_tests / horizon_resilience_tests;
+    // what those cannot check is this route's authorization, which runs on every CI build.
+    let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Another user must not learn whether this wallet exists.
+    let other = auth_token(&app).await;
+    let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown wallet → 404.
+    let unknown = format!("/v1/wallets/{}/balances", uuid::Uuid::new_v4());
+    let resp = app.oneshot(get_auth(&unknown, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn signing_info_requires_auth_and_a_real_wallet() {
     let Some(state) = test_state().await else {
         return;
