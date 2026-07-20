@@ -1,12 +1,12 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use jsonschema::Validator;
 use octo_api::{build_router, AppState};
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
+use serde_json::Value;
 use std::sync::Once;
 use tower::ServiceExt;
-use jsonschema::Validator;
-use serde_json::Value;
 
 static LOAD_ENV: Once = Once::new();
 
@@ -32,13 +32,17 @@ async fn test_state() -> Option<AppState> {
 }
 
 fn load_openapi_spec() -> Value {
-    let yaml_str = std::fs::read_to_string("../../docs/openapi.yaml").expect("Failed to read openapi.yaml");
+    let yaml_str =
+        std::fs::read_to_string("../../docs/openapi.yaml").expect("Failed to read openapi.yaml");
     serde_yaml::from_str(&yaml_str).expect("Failed to parse YAML")
 }
 
 fn validate_response(spec: &Value, path: &str, method: &str, status: &str, response_body: &Value) {
     let schema = spec
-        .pointer(&format!("/paths/{}/{}/responses/{}/content/application~1json/schema", path, method, status))
+        .pointer(&format!(
+            "/paths/{}/{}/responses/{}/content/application~1json/schema",
+            path, method, status
+        ))
         .expect("Schema not found in OpenAPI spec");
 
     // The response schema is usually a `$ref` into `#/components/schemas/...`. Validating the
@@ -54,7 +58,10 @@ fn validate_response(spec: &Value, path: &str, method: &str, status: &str, respo
     let result = validator.validate(response_body);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);
-        panic!("Response did not match OpenAPI schema for {} {} {}", method, path, status);
+        panic!(
+            "Response did not match OpenAPI schema for {} {} {}",
+            method, path, status
+        );
     }
 }
 
@@ -120,17 +127,16 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let response = app.clone().oneshot(request).await.unwrap();
     // Wallet creation returns 201 Created (Envelope::created), not 200.
     assert_eq!(response.status(), StatusCode::CREATED);
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
 
     // Validate the documented 201 response shape.
     validate_response(&spec, "~1v1~1wallets", "post", "201", &body_json);
 
-    // 2. Error case: the error envelope must match the documented ErrorResponse shape.
-    //
-    // The custodial withdraw endpoint is a tombstone since the non-custodial cutover, so any
-    // request to it is 410 Gone. That is still a real error response, which is what this part of
-    // the drift test is checking.
+    // 2. Error case: hitting the withdraw endpoint should return a real error envelope,
+    // matching the documented ErrorResponse shape (410 Gone).
     let wallet_id = body_json["data"]["id"].as_str().unwrap();
 
     let withdraw_body = serde_json::json!({
@@ -148,8 +154,10 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
 
     let withdraw_res = app.clone().oneshot(withdraw_req).await.unwrap();
     assert_eq!(withdraw_res.status(), StatusCode::GONE);
-    
-    let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024).await.unwrap();
+
+    let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let w_json: Value = serde_json::from_slice(&w_bytes).unwrap();
 
     let mut error_schema = spec
@@ -163,7 +171,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let result = error_validator.validate(&w_json);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);
-        panic!("Error response did not match OpenAPI schema for 422");
+        panic!("Error response did not match the documented ErrorResponse schema (410 Gone)");
     }
 
     // 3. Success case: Get wallet details
@@ -176,8 +184,10 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
 
     let get_wallet_res = app.clone().oneshot(get_wallet_req).await.unwrap();
     assert_eq!(get_wallet_res.status(), StatusCode::OK);
-    
-    let g_bytes = axum::body::to_bytes(get_wallet_res.into_body(), 1024 * 1024).await.unwrap();
+
+    let g_bytes = axum::body::to_bytes(get_wallet_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let g_json: Value = serde_json::from_slice(&g_bytes).unwrap();
 
     validate_response(&spec, "~1v1~1wallets~1{id}", "get", "200", &g_json);

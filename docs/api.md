@@ -1,34 +1,121 @@
 # API reference
 
-> Endpoints are implemented incrementally (see the project plan). This document is kept in sync
-> as routes land; a machine-readable OpenAPI spec will follow.
+The machine-readable contract is **[openapi.yaml](openapi.yaml)**, and it is enforced: the
+`drift_tests` integration test validates live responses against that spec, so the two cannot
+silently diverge. This page is the human-readable tour.
 
-All responses use a consistent envelope:
+All responses use a consistent envelope — **including errors**, where `data` is `null`:
 
 ```json
 { "statusCode": 200, "message": "OK", "data": { } }
 ```
 
-## Planned endpoints
+## Authentication
 
-### Wallets
-- `POST /v1/wallets` — create a master wallet for the configured network. Returns `walletId`, `G...`.
-- `GET  /v1/wallets/{id}` — wallet details + on-chain balance.
+Two credential types, with deliberately different power:
 
-### Addresses
+| Credential | Header | Can do |
+|---|---|---|
+| **Dashboard JWT** | `Authorization: Bearer <token>` | Everything: create wallets, provision a gas tank, read the key backup |
+| **Wallet API key** | `Authorization: Bearer <key>` | Per-wallet operations only. **Cannot** provision a gas tank or read a backup |
+
+Neither can move funds — see below. Tokens carry a unique `jti`; `logout` and `refresh` both
+deny-list the presented token, and every authenticated request checks that deny-list.
+
+- `POST /v1/auth/signup` — create an account, returns a JWT.
+- `POST /v1/auth/login` — returns a JWT.
+- `POST /v1/auth/refresh` — issue a new token **and revoke the presented one**.
+- `POST /v1/auth/logout` — revoke the presented token (a second logout is `401`, not `200`).
+- `GET  /v1/auth/me` — the current user.
+
+## Custody model — read this before the wallet endpoints
+
+octo is **non-custodial**. The wallet's private key is generated and held **client-side**; the
+server stores only the public account and an opaque, client-encrypted backup blob it cannot
+decrypt. Consequently:
+
+- There is **no endpoint that signs a payment for you.** You build and sign locally, then relay.
+- `POST /v1/wallets/:id/withdraw` and `POST /v1/wallets/:id/trustlines` are **`410 Gone`
+  tombstones**. They exist only to give integrators a clear error pointing at `submit-signed`.
+
+## Wallets
+
+- `POST /v1/wallets` — register a wallet from a **client-generated** keypair.
+  Body: `{ "public_key": "G...", "encrypted_backup"?: string, "label"?: string,
+  "description"?: string }`. `public_key` is required; a body without it is `400`.
+  Returns `201` with `{ id, network, address, custody, funded }`.
+  **Never returns a mnemonic** — the client generated it and the server never saw it.
+- `GET  /v1/wallets` — list your wallets (paginated).
+- `GET  /v1/wallets/{id}` — wallet details.
+- `GET  /v1/wallets/{id}/balances` — live on-chain balances.
+- `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
+- `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
+  recovery. **Dashboard JWT only.** Useless without the user's password.
+
+## Moving funds (the non-custodial path)
+
+1. `GET  /v1/wallets/{id}/signing-info` — returns the account `sequence`, the network
+   passphrase, and the base fee, so you can build a transaction without talking to Horizon.
+2. Build and **sign locally**.
+3. `POST /v1/wallets/{id}/submit-signed` — body `{ "transaction_xdr": "<base64>" }`.
+   The server validates (v1 envelope, at least one signature, source account == this wallet,
+   operation-type allowlist) and relays it **unmodified**. On failure it returns Horizon's
+   result codes (`tx_bad_seq`, `op_no_trust`, …) so you can correct and re-sign.
+
+## Addresses
+
 - `POST /v1/wallets/{id}/addresses` — generate a dedicated customer address.
-  Returns `muxed_address` (`M...`) **and** `{ base_address, memo_id }` fallback.
-- `GET  /v1/wallets/{id}/addresses` — list addresses.
+  Returns `muxed_address` (`M...`) **and** the `{ base_address, memo_id }` fallback.
+- `GET  /v1/wallets/{id}/addresses` — list addresses (paginated).
 
-### Withdrawals
-- `POST /v1/wallets/{id}/withdraw` — sign + submit a payment from the master wallet
-  (single or batch). A sign-only variant returns signed XDR without broadcasting.
+## Gas sponsorship
 
-### Transactions
-- `GET  /v1/wallets/{id}/transactions` — deposits + withdrawals.
+Lets you pay your users' Stellar fees. The **gas tank** is a separate, server-held account that
+carries fee float only — the one server-held key in the system, bounded by your gas budget.
 
-### Webhooks
-- `POST /v1/webhooks` — register an endpoint (URL + secret).
-- Deliveries are signed `HMAC-SHA256` over the raw body; the address `metadata` is echoed.
+- `POST /v1/wallets/{id}/gas-tank` — provision the gas tank. **Dashboard JWT only** (an API key
+  gets `401`). Idempotent: a second call returns the existing tank.
+- `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
+  cap, and the daily budget.
+- `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
+  The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
+  untouched. Over budget → `429`; duplicate inner tx → `409`.
+- `GET  /v1/wallets/{id}/sponsored-transactions` — sponsorship history (paginated, filterable
+  by status).
 
-_Authentication (API keys) and pagination are documented when those land._
+## Webhooks
+
+- `POST   /v1/wallets/{id}/webhooks` — register an endpoint (URL + generated secret).
+- `GET    /v1/wallets/{id}/webhooks` — list active endpoints.
+- `DELETE /v1/wallets/{id}/webhooks/{endpoint_id}` — deactivate (soft delete, so the delivery
+  history survives as an audit trail).
+- `GET    /v1/wallets/{id}/webhooks/{endpoint_id}/deliveries` — delivery history (`?limit=`,
+  default 50, max 200).
+
+Deliveries are signed `HMAC-SHA256` over the raw body. Endpoint URLs are SSRF-screened:
+loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike.
+
+## API keys
+
+All three require a **dashboard JWT** and wallet ownership — an API key can never manage keys,
+so it cannot escalate or revoke itself.
+
+- `POST   /v1/wallets/{id}/api-key` — generate/regenerate (the plaintext key is shown **once**;
+  only a SHA-256 hash is stored).
+- `GET    /v1/wallets/{id}/api-key` — metadata (prefix, created_at) — never the key itself.
+- `DELETE /v1/wallets/{id}/api-key` — revoke.
+
+## Audit logs
+
+- `GET /v1/audit-logs` — your account's activity, filterable by `category` and a free-text
+  `search`.
+
+## Conventions
+
+- **Pagination:** list endpoints take `?limit=` (default 50, max 200) and `?before=<uuid>` for
+  keyset pagination. They return `{ "data": [...], "next_cursor": <uuid|null> }` — note this
+  sits *inside* the response envelope, so the full shape is
+  `{ statusCode, message, data: { data: [...], next_cursor } }`.
+- **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
+- **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
+  custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.

@@ -68,23 +68,41 @@ just run            # cargo run -p octo-server  → API on $BIND_ADDR (default :
 
 Then, against a running server (testnet):
 
+All routes below require a dashboard login token (`Authorization: Bearer <JWT>` from
+`POST /v1/auth/signup`); `$TOKEN` stands in for it.
+
 ```bash
-# Create a master wallet (friendbot-funds it on testnet)
-curl -s -X POST localhost:8080/v1/wallets | jq
+# Create a master wallet. Non-custodial: YOU generate the keypair (browser/SDK) and register
+# only the public account — the server never receives the private key or mnemonic.
+# `encrypted_backup` is optional and opaque to the server (client-encrypted under your password).
+curl -s -X POST localhost:8080/v1/wallets \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"public_key":"G...YOURS","label":"acme"}' | jq
 
 # Generate a customer deposit address (returns the M... and the G...+memo fallback)
-curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/addresses | jq
+curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/addresses \
+  -H "authorization: Bearer $TOKEN" | jq
 
 # Live on-chain balances
-curl -s localhost:8080/v1/wallets/<WALLET_ID>/balances | jq
+curl -s localhost:8080/v1/wallets/<WALLET_ID>/balances \
+  -H "authorization: Bearer $TOKEN" | jq
 
-# Register a webhook, then withdraw (Idempotency-Key prevents double-spend)
+# Register a webhook
 curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/webhooks \
-  -H 'content-type: application/json' -d '{"url":"https://your.app/hooks"}' | jq
-curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/withdraw \
-  -H 'content-type: application/json' -H 'Idempotency-Key: abc-123' \
-  -d '{"destination":"G...DEST","amount_stroops":10000000}' | jq
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"url":"https://your.app/hooks"}' | jq
+
+# Move funds: fetch what you need to build the transaction, sign it LOCALLY, then relay it.
+# (POST /withdraw is gone — 410 — because the server holds no key to sign with.)
+curl -s localhost:8080/v1/wallets/<WALLET_ID>/signing-info \
+  -H "authorization: Bearer $TOKEN" | jq   # sequence, network passphrase, base fee
+curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/submit-signed \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"transaction_xdr":"<BASE64_SIGNED_XDR>"}' | jq
 ```
+
+See [docs/non-custodial-flow.md](docs/non-custodial-flow.md) for the full
+build → sign → relay sequence.
 
 ## Security architecture
 
@@ -98,14 +116,16 @@ gas budget, never customer balances.
 
 ### Trust boundaries — where secrets live
 
-Everything that can touch plaintext key material is confined to the **secret zone**
-(`wallet-core` + `crypto`). The HTTP layer, database, and network never see a decrypted seed or a
-private key.
+The **user's** private key never enters this diagram at all — it is generated and used entirely
+client-side. Server-side, the only plaintext key material is a wallet's optional **gas tank**
+seed, confined to the **secret zone** (`wallet-core` + `crypto`). The HTTP layer, database, and
+network never see a decrypted seed or a private key.
 
 ```mermaid
 flowchart LR
-    subgraph client[Client / Fintech backend]
+    subgraph client[Client / Fintech backend - HOLDS THE USER KEY]
         C[API caller]
+        CK[User keypair<br/>generated + signed here<br/>never sent to octo]
     end
 
     subgraph api[API zone - no plaintext secrets]
@@ -113,13 +133,13 @@ flowchart LR
         I[octo-ingest]
     end
 
-    subgraph secret[Secret zone - the ONLY plaintext-key code]
-        WC[wallet-core<br/>SEP-0005 derive, sign, zeroize]
+    subgraph secret[Secret zone - the ONLY plaintext-key code<br/>gas-tank seed only]
+        WC[wallet-core<br/>SEP-0005 derive, fee-bump sign, zeroize]
         CR[crypto<br/>AES-256-GCM seal/open]
     end
 
     subgraph data[Data zone - ciphertext only]
-        DB[(Postgres<br/>sealed seed: ciphertext+nonce+salt)]
+        DB[(Postgres<br/>public key + opaque client backup<br/>gas-tank sealed seed)]
         KMS[[KMS / env<br/>master key]]
     end
 
@@ -127,12 +147,13 @@ flowchart LR
         H[Horizon / Friendbot]
     end
 
-    C -->|HTTPS REST| A
-    A -->|"provision / sign request"| WC
+    CK -->|signs tx locally| C
+    C -->|HTTPS REST: public key, signed XDR| A
+    A -->|"gas-tank provision / fee-bump sign"| WC
     WC <-->|seal / open| CR
     CR -->|master key| KMS
-    A -->|store ciphertext| DB
-    WC -->|read sealed seed| DB
+    A -->|store public key + opaque backup| DB
+    WC -->|read gas-tank sealed seed| DB
     A -->|submit signed tx / read balances| H
     H -->|payment events| I
     I -->|deposit rows| DB
@@ -141,43 +162,47 @@ flowchart LR
     class secret,WC,CR secretzone;
 ```
 
-### The signing path (per transaction)
+### The submit path (per transaction)
 
-A private key exists only inside this sequence and is zeroized before the function returns. octo
-only ever builds **its own Payment operations** — it never signs caller-supplied raw XDR, so it
-can't be used as a "sign anything" oracle.
+The user's key is used **on the client**; octo only validates and relays what arrives. There is
+no server-side signing step for user funds to attack, and no "sign anything" oracle, because the
+server has no user key to sign with.
 
 ```mermaid
 sequenceDiagram
+    participant CL as Client (browser / SDK)
     participant API as octo-api
-    participant DB as Postgres
-    participant CR as crypto
-    participant WC as wallet-core
+    participant V as submit_validation
     participant H as Horizon
 
-    API->>DB: fetch sealed seed (ciphertext, nonce, salt)
-    API->>WC: sign_payment(dest, stroops, network)
-    WC->>CR: open(master_key, sealed, AAD=network)
-    Note over CR: AES-256-GCM verifies tag<br/>(tamper / wrong-network → fail)
-    CR-->>WC: seed bytes (in memory, Zeroizing)
-    WC->>WC: SEP-0005 derive m/44'/148'/0' (ed25519)
-    WC->>WC: build Payment op · validate amount > 0
-    WC->>WC: sign transaction
-    WC->>WC: 🧹 zeroize seed + private key
-    WC-->>API: signed XDR envelope
-    API->>H: submit transaction
+    CL->>API: GET /signing-info (sequence, passphrase, base fee)
+    CL->>CL: build tx · 🔑 sign locally · zeroize key
+    CL->>API: POST /submit-signed { transaction_xdr }
+    API->>V: validate envelope
+    Note over V: v1 envelope · ≥1 signature present<br/>source == this wallet · op-type allowlist
+    V-->>API: ok
+    API->>H: submit signed XDR (never re-signed / never altered)
+    H-->>API: result codes (tx_bad_seq, op_no_trust, …)
+    API-->>CL: status + hash + result codes to correct and re-sign
 ```
+
+Fee-bump sponsorship is the one place octo still signs — with the wallet's **gas-tank** key, over
+the *outer* fee-bump envelope only. The user's inner transaction is passed through untouched.
 
 ### Defense summary
 
 | Attack class | Defense in octo |
 |---|---|
-| Seed stolen from DB / backup | Stored **AES-256-GCM** (random nonce+salt); master key from **KMS/env**, never in the DB |
+| **Full server compromise** | The user's key is **never on the server** — DB, backups and RAM all lack it, so an attacker with total server control still cannot move user funds |
+| Stolen key backup | `encrypted_backup` is ciphertext the **client** produced under the user's password; octo stores it opaquely and cannot decrypt it |
+| Gas-tank seed stolen from DB / backup | Stored **AES-256-GCM** (random nonce+salt); master key from **KMS/env**, never in the DB. Exposure is bounded by the **gas budget**, never customer balances |
 | Seed/key leaked via logs or panic | Secrets confined to `wallet-core`/`crypto`, wrapped in `Zeroizing`, no `Debug`; `unwrap`/`panic` **denied** by clippy there |
-| Signing-oracle abuse | Only octo's own **Payment** ops are built; no raw-XDR signing; op-type allowlist |
+| Signing-oracle abuse | No user key server-side, so there is nothing to coerce into signing. Relayed transactions are **validated, never re-signed or altered** (v1 envelope, signature present, source == wallet, op-type allowlist) |
+| Fee-bump abuse (sponsorship) | The gas tank signs only the **outer** fee-bump; the inner tx is untouched. Per-tx fee cap + daily budget, reserved atomically under a per-wallet lock |
 | Deposit double-credit (reorg/replay) | Credited only on `successful==true`, **idempotent** on the immutable `(tx_hash, op_index)` unique index |
-| Double-withdraw | **Idempotency key** + state machine; row-locked balance checks |
-| Wrong-network signature | Network bound as **AES-GCM AAD** — a testnet-sealed seed can't be opened as mainnet |
+| Wrong-network signature | Network bound as **AES-GCM AAD** — a testnet-sealed gas-tank seed can't be opened as mainnet |
+| Session/token replay | Tokens carry a unique `jti`; logout and refresh both **deny-list** the presented token, checked on every authenticated request |
+| SSRF via webhook URL | `is_safe_url` rejects loopback/private/link-local targets, IPv4 **and** bracketed IPv6 |
 | SQL injection | Parameterized `sqlx` only |
 | Supply chain | `cargo-deny` + `cargo-audit` + `gitleaks` + pinned `Cargo.lock` in CI |
 
@@ -187,10 +212,16 @@ open public issues for security reports.
 
 ## Roadmap
 
-- **Gas sponsorship** *(coming soon)* — let app developers sponsor their users'
-  Stellar transactions from their master wallet (fee-bump / sponsored reserves), so users can
-  transact without holding XLM for fees.
-- MPC/HSM custody upgrade, fiat on/off-ramp, and additional chains.
+- **Gas sponsorship** — *shipped.* App developers can sponsor their users' Stellar transactions
+  via fee-bump from a per-wallet **gas tank**, so users transact without holding XLM for fees.
+  Per-transaction fee caps and a daily budget are enforced atomically.
+  See `POST /v1/wallets/:id/gas-tank` and `POST /v1/wallets/:id/sponsor`.
+- Fiat on/off-ramp and additional chains.
+
+> The "MPC/HSM custody upgrade" that used to sit here is no longer on the roadmap: it was a plan
+> to better protect a server-held user key, and the non-custodial cutover removed that key
+> entirely. MPC/HSM remains relevant only to the gas-tank fee key, whose exposure is already
+> bounded by the gas budget.
 
 ## Status
 
