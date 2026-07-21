@@ -183,3 +183,33 @@ export function generateApiKey(token: string, id: string) {
     token,
   });
 }
+
+// Placeholder types and functions for webhook functionality (to be implemented)
+export type WebhookEndpoint = {
+  id: string;
+  url: string;
+  active?: boolean;
+  created_at: string;
+};
+
+export type WebhookDelivery = {
+  id: string;
+  endpoint_id: string;
+  event_type: string;
+  status: string;
+  response_code: number | null;
+  attempts: number;
+  created_at: string;
+};
+
+/** List webhook endpoints for a wallet (placeholder - to be implemented). */
+export function listWebhooks(token: string, id: string, cursor?: string): Promise<WebhookEndpoint[]> {
+  // Placeholder implementation - returns empty array
+  return Promise.resolve([]);
+}
+
+/** List webhook deliveries for a wallet (placeholder - to be implemented). */
+export function listWebhookDeliveries(token: string, id: string, endpointId?: string): Promise<WebhookDelivery[]> {
+  // Placeholder implementation - returns empty array
+  return Promise.resolve([]);
+}

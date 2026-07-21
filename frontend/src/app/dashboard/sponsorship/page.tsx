@@ -23,14 +23,14 @@ export default function SponsorshipPage() {
   useEffect(() => {
     if (!token) return;
     listWallets(token)
-      .then(async (wallets) => {
+      .then(async (response) => {
         // Only the sponsorship config is fetched per wallet — not full wallet details.
         const configs = await Promise.all(
-          wallets.map((w) =>
+          response.data.map((w) =>
             getSponsorshipConfig(w.id, token).catch(() => null),
           ),
         );
-        return wallets.map((wallet, i) => ({ wallet, config: configs[i] }));
+        return response.data.map((wallet, i) => ({ wallet, config: configs[i] }));
       })
       .then(setRows)
       .catch(() => setRows([]));
