@@ -183,7 +183,11 @@ pub async fn list_transactions(
     if has_more {
         data.truncate(limit as usize);
     }
-    let next_cursor = if has_more { data.last().map(|r| r.id) } else { None };
+    let next_cursor = if has_more {
+        data.last().map(|r| r.id)
+    } else {
+        None
+    };
 
     Ok(Envelope::ok(TransactionListResponse { data, next_cursor }))
 }
@@ -235,7 +239,11 @@ pub async fn list_wallets(
     if has_more {
         wallets.truncate(limit as usize);
     }
-    let next_cursor = if has_more { wallets.last().map(|w| w.id) } else { None };
+    let next_cursor = if has_more {
+        wallets.last().map(|w| w.id)
+    } else {
+        None
+    };
 
     Ok(Envelope::ok(WalletListResponse {
         data: wallets.into_iter().map(to_view).collect(),

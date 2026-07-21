@@ -615,7 +615,10 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // Next call should be allowed through as a probe.
-        let result = execute(&cb, &policy, CallKind::ReadOnly, || async { Ok::<_, &str>(42) }).await;
+        let result = execute(&cb, &policy, CallKind::ReadOnly, || async {
+            Ok::<_, &str>(42)
+        })
+        .await;
         assert_eq!(result.unwrap(), 42);
         assert!(cb.is_closed());
     }

@@ -18,7 +18,9 @@ use tower::ServiceExt;
 static LOAD_ENV: Once = Once::new();
 
 fn database_url() -> Option<String> {
-    LOAD_ENV.call_once(|| { let _ = dotenvy::dotenv(); });
+    LOAD_ENV.call_once(|| {
+        let _ = dotenvy::dotenv();
+    });
     std::env::var("DATABASE_URL").ok()
 }
 
@@ -39,7 +41,9 @@ async fn test_state() -> Option<AppState> {
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     serde_json::from_slice(&b).unwrap()
 }
 

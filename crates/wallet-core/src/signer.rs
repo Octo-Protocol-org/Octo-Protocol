@@ -644,17 +644,15 @@ mod tests {
         let env =
             stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
         match env {
-            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
-                match &e.tx.operations[0].body {
-                    stellar_base::xdr::OperationBody::Payment(pay) => {
-                        assert!(
-                            matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum4(_)),
-                            "4-char code must produce CreditAlphanum4 asset"
-                        );
-                    }
-                    _ => panic!("expected Payment operation"),
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => match &e.tx.operations[0].body {
+                stellar_base::xdr::OperationBody::Payment(pay) => {
+                    assert!(
+                        matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum4(_)),
+                        "4-char code must produce CreditAlphanum4 asset"
+                    );
                 }
-            }
+                _ => panic!("expected Payment operation"),
+            },
             _ => panic!("expected Tx envelope"),
         }
     }
@@ -674,17 +672,15 @@ mod tests {
         let env =
             stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
         match env {
-            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
-                match &e.tx.operations[0].body {
-                    stellar_base::xdr::OperationBody::Payment(pay) => {
-                        assert!(
-                            matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum12(_)),
-                            "9-char code must produce CreditAlphanum12 asset"
-                        );
-                    }
-                    _ => panic!("expected Payment operation"),
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => match &e.tx.operations[0].body {
+                stellar_base::xdr::OperationBody::Payment(pay) => {
+                    assert!(
+                        matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum12(_)),
+                        "9-char code must produce CreditAlphanum12 asset"
+                    );
                 }
-            }
+                _ => panic!("expected Payment operation"),
+            },
             _ => panic!("expected Tx envelope"),
         }
     }
@@ -1024,7 +1020,10 @@ mod tests {
                         &sealed,
                         StellarNetwork::Testnet,
                         0,
-                        &FeeBumpRequest { inner_xdr: &truncated, max_base_fee_stroops: 200 },
+                        &FeeBumpRequest {
+                            inner_xdr: &truncated,
+                            max_base_fee_stroops: 200
+                        },
                     ),
                     Err(WalletError::InvalidXdr)
                 ),
@@ -1055,7 +1054,10 @@ mod tests {
                         &sealed,
                         StellarNetwork::Testnet,
                         0,
-                        &FeeBumpRequest { inner_xdr: &flipped_b64, max_base_fee_stroops: 200 },
+                        &FeeBumpRequest {
+                            inner_xdr: &flipped_b64,
+                            max_base_fee_stroops: 200
+                        },
                     ),
                     Err(WalletError::InvalidXdr)
                 ),

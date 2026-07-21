@@ -97,8 +97,8 @@ fn forge_token(sub: &str, exp: i64) -> String {
     let header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"; // {"alg":"HS256","typ":"JWT"}
     let payload = b64(format!(r#"{{"sub":"{sub}","exp":{exp}}}"#).as_bytes());
     let signing_input = format!("{header}.{payload}");
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(b"test-jwt-secret-at-least-16-bytes")
-        .unwrap();
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(b"test-jwt-secret-at-least-16-bytes").unwrap();
     mac.update(signing_input.as_bytes());
     let sig = b64(&mac.finalize().into_bytes());
     format!("{signing_input}.{sig}")
@@ -158,10 +158,7 @@ async fn refresh_rejects_an_expired_token() {
     let (_token, user_id) = signup(&app, &unique_email()).await;
 
     // Correctly signed, but expired a minute ago.
-    let expired = forge_token(
-        &user_id,
-        chrono::Utc::now().timestamp() - 60,
-    );
+    let expired = forge_token(&user_id, chrono::Utc::now().timestamp() - 60);
     let resp = app.oneshot(post_refresh(Some(&expired))).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -400,7 +397,11 @@ async fn logout_invalidates_the_current_token_for_subsequent_requests() {
         )
         .await
         .unwrap();
-    assert_eq!(pre.status(), StatusCode::OK, "token should be valid before logout");
+    assert_eq!(
+        pre.status(),
+        StatusCode::OK,
+        "token should be valid before logout"
+    );
 
     // Logout — expect 200.
     let logout_resp = app
@@ -415,7 +416,11 @@ async fn logout_invalidates_the_current_token_for_subsequent_requests() {
         )
         .await
         .unwrap();
-    assert_eq!(logout_resp.status(), StatusCode::OK, "logout should succeed");
+    assert_eq!(
+        logout_resp.status(),
+        StatusCode::OK,
+        "logout should succeed"
+    );
 
     // The same token must now be rejected.
     let post = app
@@ -460,14 +465,18 @@ async fn denylisted_token_is_rejected_even_though_its_signature_and_expiry_are_s
         )
         .await
         .unwrap();
-    assert_eq!(before.status(), StatusCode::OK, "token must be valid before deny-listing");
+    assert_eq!(
+        before.status(),
+        StatusCode::OK,
+        "token must be valid before deny-listing"
+    );
 
     // Decode the token to get user_id and exp, then insert into deny-list directly.
-    let claims = octo_api::auth::verify_token(state.jwt_secret(), &token)
-        .expect("token must be decodable");
+    let claims =
+        octo_api::auth::verify_token(state.jwt_secret(), &token).expect("token must be decodable");
     let user_id: uuid::Uuid = claims.sub.parse().unwrap();
-    let expires_at = chrono::DateTime::from_timestamp(claims.exp, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let expires_at =
+        chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
     let token_hash = octo_api::auth::hash_token(&token);
     state
         .store()

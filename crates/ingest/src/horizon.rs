@@ -167,8 +167,7 @@ impl HorizonPayments {
                 if !resp.status().is_success() {
                     return Err(IngestFetchError::Permanent);
                 }
-                let page: PaymentsPage =
-                    resp.json().await.map_err(|_| IngestFetchError::Decode)?;
+                let page: PaymentsPage = resp.json().await.map_err(|_| IngestFetchError::Decode)?;
                 Ok(page._embedded.records)
             }
         })

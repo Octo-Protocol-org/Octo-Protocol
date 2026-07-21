@@ -170,7 +170,10 @@ pub async fn list_deliveries(
     }
 
     // Retrieve deliveries (limit to last 50).
-    let deliveries = state.store().list_webhook_deliveries(endpoint_id, 50).await?;
+    let deliveries = state
+        .store()
+        .list_webhook_deliveries(endpoint_id, 50)
+        .await?;
 
     let views: Vec<WebhookDeliveryView> = deliveries
         .into_iter()
@@ -189,4 +192,3 @@ pub async fn list_deliveries(
 
     Ok(Envelope::ok(views))
 }
-

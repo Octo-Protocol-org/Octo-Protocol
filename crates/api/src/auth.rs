@@ -121,7 +121,10 @@ pub async fn signup(
     let token = issue_token(state.jwt_secret(), user.id)?;
     let (code, json) = Envelope::created(AuthResponse {
         token,
-        user: UserView { id: user.id, email: user.email },
+        user: UserView {
+            id: user.id,
+            email: user.email,
+        },
     });
     Ok((code, json))
 }
@@ -158,7 +161,10 @@ pub async fn login(
     let token = issue_token(state.jwt_secret(), user.id)?;
     Ok(Envelope::ok(AuthResponse {
         token,
-        user: UserView { id: user.id, email: user.email },
+        user: UserView {
+            id: user.id,
+            email: user.email,
+        },
     }))
 }
 
@@ -215,7 +221,10 @@ pub async fn me(
         .await
         .map_err(|_| ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Envelope::ok(UserView { id: user.id, email: user.email }))
+    Ok(Envelope::ok(UserView {
+        id: user.id,
+        email: user.email,
+    }))
 }
 
 /// `POST /v1/auth/logout` — invalidate the current session token server-side.
@@ -245,8 +254,8 @@ pub async fn logout(
 
     // Deny-list the token so it cannot be replayed.
     let token_hash = hash_token(token);
-    let expires_at = chrono::DateTime::from_timestamp(claims.exp, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let expires_at =
+        chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
     state
         .store()
         .denylist_token(&token_hash, user_id, expires_at)
@@ -304,11 +313,16 @@ fn b64(input: &[u8]) -> String {
 }
 
 fn b64_decode(input: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input).ok()
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(input)
+        .ok()
 }
 
 fn issue_token(secret: &[u8], user_id: Uuid) -> Result<String, ApiError> {
-    let claims = Claims { sub: user_id.to_string(), exp: now_secs() + TOKEN_TTL_SECS };
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp: now_secs() + TOKEN_TTL_SECS,
+    };
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
     let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
     let sig = sign_hs256(secret, signing_input.as_bytes());
@@ -347,7 +361,9 @@ fn sign_hs256(secret: &[u8], input: &[u8]) -> String {
 }
 
 fn verify_hs256(secret: &[u8], input: &[u8], signature_b64: &str) -> bool {
-    let Some(sig) = b64_decode(signature_b64) else { return false; };
+    let Some(sig) = b64_decode(signature_b64) else {
+        return false;
+    };
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(input);
     mac.verify_slice(&sig).is_ok()

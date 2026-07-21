@@ -148,7 +148,7 @@ async fn test_oversized_body_returns_envelope() {
         return;
     };
     let app = build_router(state);
-    
+
     // إرسال طلب كبير جداً (أكبر من الحد المسموح به عادة)
     let resp = app
         .oneshot(
@@ -164,11 +164,12 @@ async fn test_oversized_body_returns_envelope() {
 
     // التحقق من أننا نرجع 413
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    
+
     // التحقق من أن الجسم (body) يطابق الـ Envelope
     let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-    let envelope: Envelope = serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
-    
+    let envelope: Envelope =
+        serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
+
     assert_eq!(envelope.status_code, 413);
     assert!(!envelope.message.is_empty());
 }
@@ -438,13 +439,12 @@ async fn withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row() {
         );
 
         // Prove rejection happened before create_withdrawal: no row with this idempotency key.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM withdrawals WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(state.store().pool())
-        .await
-        .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM withdrawals WHERE idempotency_key = $1")
+                .bind(&key)
+                .fetch_one(state.store().pool())
+                .await
+                .unwrap();
         assert_eq!(
             count, 0,
             "case '{label}': invalid asset code must not create a withdrawal row"
@@ -1123,12 +1123,17 @@ async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
     let j = body_json(resp).await;
     let page1 = j["data"]["data"].as_array().unwrap();
     assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
-    let cursor = j["data"]["next_cursor"].as_str().expect("next_cursor must be present on first page");
+    let cursor = j["data"]["next_cursor"]
+        .as_str()
+        .expect("next_cursor must be present on first page");
 
     // Fetch second page using the cursor — expect more items.
     let resp = app
         .clone()
-        .oneshot(get_auth(&format!("/v1/wallets?limit=2&before={cursor}"), &token))
+        .oneshot(get_auth(
+            &format!("/v1/wallets?limit=2&before={cursor}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1157,10 +1162,7 @@ async fn list_addresses_pagination_returns_a_next_cursor_and_respects_limit() {
     // Create 5 addresses.
     for _ in 0..5 {
         let uri = format!("/v1/wallets/{wallet_id}/addresses");
-        app.clone()
-            .oneshot(post_auth(&uri, &token))
-            .await
-            .unwrap();
+        app.clone().oneshot(post_auth(&uri, &token)).await.unwrap();
     }
 
     // Fetch first page with limit=2.
@@ -1223,8 +1225,12 @@ async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit()
                 asset_code: "native".into(),
                 asset_issuer: None,
                 amount_stroops: (i + 1) as i64 * 100,
-                source_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
-                destination_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
+                source_account: Some(
+                    "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into(),
+                ),
+                destination_account: Some(
+                    "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into(),
+                ),
                 stellar_tx_hash: format!("txhash-pag-{i}"),
                 operation_index: i as i32,
                 horizon_op_id: format!("op-pag-{i}"),

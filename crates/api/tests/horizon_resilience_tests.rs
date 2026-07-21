@@ -46,9 +46,7 @@ impl MockState {
     }
 }
 
-async fn account_handler(
-    State(s): State<MockState>,
-) -> axum::response::Response<axum::body::Body> {
+async fn account_handler(State(s): State<MockState>) -> axum::response::Response<axum::body::Body> {
     s.call_count.fetch_add(1, Ordering::SeqCst);
     if s.fail_remaining.load(Ordering::SeqCst) > 0 {
         s.fail_remaining.fetch_sub(1, Ordering::SeqCst);
@@ -65,9 +63,7 @@ async fn account_handler(
         .unwrap()
 }
 
-async fn submit_handler(
-    State(s): State<MockState>,
-) -> axum::response::Response<axum::body::Body> {
+async fn submit_handler(State(s): State<MockState>) -> axum::response::Response<axum::body::Body> {
     s.call_count.fetch_add(1, Ordering::SeqCst);
     if s.fail_remaining.load(Ordering::SeqCst) > 0 {
         s.fail_remaining.fetch_sub(1, Ordering::SeqCst);
@@ -136,7 +132,10 @@ async fn account_sequence_retries_on_5xx_then_succeeds() {
     let (url, state) = start_mock(MockState::new(1, 503)).await;
     let client = test_client(&url, 3, 20, 60_000);
 
-    let seq = client.account_sequence(GADDR).await.expect("should recover");
+    let seq = client
+        .account_sequence(GADDR)
+        .await
+        .expect("should recover");
     assert_eq!(seq, 9_876_543);
     assert_eq!(state.call_count.load(Ordering::SeqCst), 2);
 }
@@ -152,7 +151,10 @@ async fn submit_transaction_is_never_retried_even_on_5xx() {
     let client = test_client(&url, 5, 100, 60_000);
 
     let result = client.submit_transaction("fake_xdr").await;
-    assert!(result.is_err(), "submit must fail when mock always returns 503");
+    assert!(
+        result.is_err(),
+        "submit must fail when mock always returns 503"
+    );
     assert_eq!(
         state.call_count.load(Ordering::SeqCst),
         1,
@@ -208,5 +210,8 @@ async fn circuit_closes_after_cooldown() {
 
     // Mock now returns 200. Probe must succeed and close the circuit.
     let result = client.balances(GADDR).await;
-    assert!(result.is_ok(), "circuit should close after cool-down + successful probe");
+    assert!(
+        result.is_ok(),
+        "circuit should close after cool-down + successful probe"
+    );
 }

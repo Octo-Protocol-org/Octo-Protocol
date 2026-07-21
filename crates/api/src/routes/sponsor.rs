@@ -105,7 +105,13 @@ pub async fn sponsor(
         inner_xdr: &inner_xdr,
         max_base_fee_stroops: max_fee,
     };
-    let signed = match sign_fee_bump(state.master_key_for_scheme(wallet.sealed_scheme), &sealed, state.network(), 0, &fb) {
+    let signed = match sign_fee_bump(
+        state.master_key_for_scheme(wallet.sealed_scheme),
+        &sealed,
+        state.network(),
+        0,
+        &fb,
+    ) {
         Ok(s) => s,
         Err(_) => {
             let _ = state
