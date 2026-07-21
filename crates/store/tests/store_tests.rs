@@ -304,6 +304,40 @@ async fn sum_fees_today_counts_only_confirmed() {
 }
 
 #[tokio::test]
+async fn sum_fees_today_can_use_wallet_status_created_at_index() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    let mut tx = store.pool().begin().await.expect("begin transaction");
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *tx)
+        .await
+        .expect("disable sequential scans for index eligibility check");
+    let plan: Vec<String> = sqlx::query_scalar(
+        r#"EXPLAIN (COSTS OFF)
+           SELECT COALESCE(SUM(fee_stroops), 0)::bigint
+           FROM sponsored_transactions
+           WHERE wallet_id = $1
+             AND status = 'confirmed'
+             AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')"#,
+    )
+    .bind(wallet_id)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain sum_sponsored_fees_today");
+    let plan = plan.join("\n");
+
+    assert!(
+        plan.contains("idx_sponsored_wallet_status_"),
+        "expected the wallet/status/created_at index, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan"),
+        "sum query must not require a full table scan:\n{plan}"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_inner_tx_hash_is_conflict() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;

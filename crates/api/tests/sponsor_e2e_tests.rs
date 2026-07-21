@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use octo_api::{build_router, AppState};
-use octo_store::Store;
+use octo_store::{NewSponsoredTx, Store};
 use octo_wallet_core::StellarNetwork;
 use std::sync::{Arc, Mutex, Once};
 use stellar_base::crypto::DalekKeyPair;
@@ -389,6 +389,7 @@ async fn e2e_sponsor_update_config_persists() {
     assert_eq!(put_json["data"]["enabled"], true);
     assert_eq!(put_json["data"]["per_tx_fee_cap_stroops"], 500_000);
     assert_eq!(put_json["data"]["daily_budget_stroops"], 10_000_000);
+    assert_eq!(put_json["data"]["fees_spent_today_stroops"], 0);
 
     let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -402,6 +403,50 @@ async fn e2e_sponsor_update_config_persists() {
         get_json["data"]["daily_budget_stroops"],
         put_json["data"]["daily_budget_stroops"]
     );
+}
+
+#[tokio::test]
+async fn e2e_sponsorship_get_counts_only_confirmed_fees_spent_today() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let (wallet_id, _) = create_wallet(&app, &token).await;
+    enable_sponsorship_via_api(&app, &token, &wallet_id).await;
+    let wallet_id = Uuid::parse_str(&wallet_id).expect("wallet UUID");
+
+    state
+        .store()
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("pending-{}", Uuid::new_v4().simple()),
+            fee_stroops: 300,
+        })
+        .await
+        .expect("insert pending sponsored transaction");
+
+    let confirmed = state
+        .store()
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("confirmed-{}", Uuid::new_v4().simple()),
+            fee_stroops: 700,
+        })
+        .await
+        .expect("insert confirmed sponsored transaction");
+    state
+        .store()
+        .update_sponsored_tx_status(confirmed.id, "confirmed", None, None)
+        .await
+        .expect("confirm sponsored transaction");
+
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["fees_spent_today_stroops"], 700);
 }
 
 #[tokio::test]
