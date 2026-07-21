@@ -16,6 +16,9 @@
 pub mod amount;
 pub mod horizon;
 
+#[cfg(test)]
+mod backfill_tests;
+
 use horizon::{HorizonPayments, PaymentRecord};
 use octo_store::{NewDeposit, Store};
 use octo_wallet_core::decode_muxed;
@@ -226,7 +229,7 @@ impl Ingestor {
             source_account: rec.from.clone(),
             destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
             stellar_tx_hash: tx_hash,
-            operation_index: 0,
+            operation_index: operation_index_from_toid(&rec.id).unwrap_or(0),
             horizon_op_id: rec.id.clone(),
             ledger,
             memo_id,
@@ -305,6 +308,24 @@ impl Ingestor {
         }
         tx.memo.as_deref()?.parse::<i64>().ok()
     }
+}
+
+/// Extract the operation index from a Horizon TOID (Transaction Operation ID).
+/// 
+/// A TOID has the format: `{ledger}-{tx_index}-{op_index}`, where:
+/// - `ledger` is the ledger sequence number
+/// - `tx_index` is the transaction's index within that ledger
+/// - `op_index` is the operation's index within that transaction
+/// 
+/// Returns `None` if the TOID format is invalid or parsing fails.
+pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
+    // Split on hyphens and take the third component (operation index)
+    let parts: Vec<&str> = toid.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    
+    parts[2].parse::<i32>().ok()
 }
 
 /// Errors from the ingest worker.
@@ -550,5 +571,41 @@ mod tests {
             None,
             "memo string one above i64::MAX must be silently unattributed (current documented behavior)"
         );
+    }
+
+    #[test]
+    fn operation_index_from_toid_parses_correctly() {
+        // Standard TOID format: ledger-tx_index-op_index
+        assert_eq!(operation_index_from_toid("12345-1-0"), Some(0));
+        assert_eq!(operation_index_from_toid("12345-1-1"), Some(1));
+        assert_eq!(operation_index_from_toid("12345-10-5"), Some(5));
+        assert_eq!(operation_index_from_toid("999999999-0-99"), Some(99));
+    }
+
+    #[test]
+    fn operation_index_from_toid_handles_invalid_format() {
+        // Missing parts
+        assert_eq!(operation_index_from_toid("12345-1"), None);
+        assert_eq!(operation_index_from_toid("12345"), None);
+        assert_eq!(operation_index_from_toid(""), None);
+        
+        // Too many parts
+        assert_eq!(operation_index_from_toid("12345-1-0-extra"), None);
+        
+        // Non-numeric operation index
+        assert_eq!(operation_index_from_toid("12345-1-abc"), None);
+        assert_eq!(operation_index_from_toid("12345-1-"), None);
+    }
+
+    #[test]
+    fn operation_index_from_toid_handles_edge_cases() {
+        // Negative numbers (invalid for operation index but should parse)
+        assert_eq!(operation_index_from_toid("12345-1--1"), Some(-1));
+        
+        // Large numbers within i32 range
+        assert_eq!(operation_index_from_toid("12345-1-2147483647"), Some(i32::MAX));
+        
+        // Numbers outside i32 range should fail
+        assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
     }
 }
