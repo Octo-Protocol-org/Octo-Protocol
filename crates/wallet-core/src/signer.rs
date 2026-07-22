@@ -211,6 +211,13 @@ pub fn sign_fee_bump(
         TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRSerialize,
     };
 
+    // Reject fees below the Stellar network minimum before touching key material.
+    // A sub-minimum fee would be rejected by Horizon at submit time, wasting a budget
+    // reservation (try_reserve_sponsored_transaction) and a full sign cycle.
+    if req.max_base_fee_stroops < MIN_BASE_FEE.to_i64() {
+        return Err(WalletError::InvalidAmount);
+    }
+
     // Parse and validate the inner XDR — must be a v1 TransactionEnvelope.
     let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
@@ -787,5 +794,41 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
+    }
+
+    // Issue #82: MIN_BASE_FEE check fires before any key material is touched.
+    #[test]
+    fn sign_fee_bump_rejects_fee_below_network_minimum() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let inner_xdr = make_inner_xdr(0, 1);
+        // Try fees below the network minimum (100 stroops).
+        for bad_fee in [0i64, 1, 50, 99] {
+            let req = FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: bad_fee,
+            };
+            assert!(
+                matches!(
+                    sign_fee_bump(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+                    Err(WalletError::InvalidAmount)
+                ),
+                "fee={bad_fee} should be rejected as < MIN_BASE_FEE"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_fee_bump_accepts_fee_at_exactly_the_network_minimum() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let inner_xdr = make_inner_xdr(0, 1);
+        let req = FeeBumpRequest {
+            inner_xdr: &inner_xdr,
+            max_base_fee_stroops: MIN_BASE_FEE.to_i64(), // Exactly 100 stroops.
+        };
+        let result = sign_fee_bump(&mk, &sealed, StellarNetwork::Testnet, 0, &req);
+        assert!(
+            result.is_ok(),
+            "fee at exactly MIN_BASE_FEE (100 stroops) must be accepted"
+        );
     }
 }
