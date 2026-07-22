@@ -1,10 +1,37 @@
 //! Minimal Horizon + friendbot client used by the API for funding and balance reads.
 //!
-//! Only the few endpoints octo needs are implemented. Network errors map to `ApiError::Internal`
-//! (logged by the caller); a missing account maps to `ApiError::NotFound`.
+//! # Resilience
+//!
+//! Read-only calls (`balances`, `account_sequence`) are wrapped with:
+//! - **Retry-with-exponential-backoff** via [`octo_resilience::RetryPolicy`] — transient
+//!   connection errors, timeouts, and 5xx responses are retried up to `max_attempts` times.
+//! - **Circuit breaker** via [`octo_resilience::CircuitBreaker`] — after `failure_threshold`
+//!   consecutive failures the circuit opens and calls return immediately with an internal error,
+//!   preventing every concurrent request from queuing up its own timeout against an already-
+//!   struggling Horizon instance.
+//!
+//! `submit_transaction` is deliberately excluded from automatic retry. See
+//! [`octo_resilience`]'s module documentation for the full rationale; the short version is:
+//! a network timeout on submission does NOT mean the transaction was rejected — it may have
+//! already landed on-chain. Retrying would risk a double-submission. The caller must instead
+//! query the ledger by hash to determine what actually happened.
+//!
+//! `friendbot_fund` runs with a separate small retry pass (friendbot is idempotent on testnet —
+//! re-funding an already-funded account is a no-op).
 
 use crate::error::ApiError;
+use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Timeout for balance/sequence reads and friendbot funding — these are simple GETs against a
+/// Horizon-like endpoint and should be fast; a hung connection here must not block a request
+/// handler indefinitely.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Signed-transaction submission may legitimately take longer than a simple read (Horizon can hold
+/// the connection while the tx is validated/applied), so it gets a longer per-request override
+/// instead of raising the client's default for every call.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A single balance line from a Horizon account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +52,82 @@ struct AccountResponse {
     /// Account sequence number (Horizon returns it as a string).
     #[serde(default)]
     sequence: String,
+    #[serde(default)]
+    subentry_count: i64,
+    #[serde(default)]
+    num_sponsoring: i64,
+    #[serde(default)]
+    num_sponsored: i64,
+}
+
+/// Everything the withdrawal pre-flight checks need about the source account, fetched in a
+/// single Horizon call (balances + sequence + reserve inputs).
+#[derive(Debug, Clone)]
+pub struct AccountInfo {
+    pub balances: Vec<Balance>,
+    pub sequence: i64,
+    /// Number of subentries (trustlines, offers, data entries, signers) — drives the minimum
+    /// reserve requirement alongside the 2 base entries every account carries.
+    pub subentry_count: i64,
+    pub num_sponsoring: i64,
+    pub num_sponsored: i64,
+}
+
+/// The Stellar protocol's base reserve, in stroops. This is a network-wide ledger parameter that
+/// has been stable at 0.5 XLM since the 2019 fee/reserve protocol upgrade; we hardcode it rather
+/// than fetch `/ledgers` on every withdrawal (an extra Horizon round trip) since a live change
+/// would be a rare, widely-announced network event.
+pub const BASE_RESERVE_STROOPS: i64 = 5_000_000;
+
+impl AccountInfo {
+    /// Minimum native XLM balance this account must maintain, per the standard reserve formula:
+    /// `base_reserve * (2 + subentry_count + num_sponsoring - num_sponsored)`.
+    pub fn min_reserve_stroops(&self) -> i64 {
+        let entries = 2 + self.subentry_count + self.num_sponsoring - self.num_sponsored;
+        BASE_RESERVE_STROOPS * entries.max(0)
+    }
+
+    pub fn native_balance_stroops(&self) -> i64 {
+        self.balances
+            .iter()
+            .find(|b| b.asset_type == "native")
+            .and_then(|b| parse_amount_stroops(&b.balance))
+            .unwrap_or(0)
+    }
+
+    /// Balance of a specific credit asset, or `None` if there is no trustline for it.
+    pub fn asset_balance_stroops(&self, code: &str, issuer: &str) -> Option<i64> {
+        self.balances
+            .iter()
+            .find(|b| b.asset_code.as_deref() == Some(code) && b.asset_issuer.as_deref() == Some(issuer))
+            .and_then(|b| parse_amount_stroops(&b.balance))
+    }
+}
+
+/// Whether `balances` (as returned for some account) includes a trustline for the given credit
+/// asset. Pulled out of the withdrawal route so the matching rule is unit-testable without a
+/// live Horizon call.
+pub fn has_trustline(balances: &[Balance], code: &str, issuer: &str) -> bool {
+    balances
+        .iter()
+        .any(|b| b.asset_code.as_deref() == Some(code) && b.asset_issuer.as_deref() == Some(issuer))
+}
+
+/// Parse a Horizon decimal amount string (e.g. `"100.0000000"`) into integer stroops without
+/// going through floating point (avoids rounding error near balance/reserve boundaries).
+fn parse_amount_stroops(s: &str) -> Option<i64> {
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    let whole: i64 = whole.parse().ok()?;
+    let mut frac = frac.to_string();
+    while frac.len() < 7 {
+        frac.push('0');
+    }
+    frac.truncate(7);
+    let frac: i64 = frac.parse().ok()?;
+    Some(whole * 10_000_000 + frac)
 }
 
 /// The result of submitting a transaction to Horizon.
@@ -44,47 +147,98 @@ struct SubmitResponse {
     ledger: Option<i64>,
 }
 
-/// A thin Horizon client (one shared reqwest client).
+/// A thin Horizon client with retry/backoff and circuit-breaker protection.
+///
+/// The circuit breaker and retry policy are shared across all calls through this client instance
+/// so failures on any call type count toward opening the circuit.
+///
+/// # Cloning
+///
+/// [`Horizon`] is `Clone`; clones share the **same** circuit-breaker state (via `Arc` inside
+/// [`CircuitBreaker`]) so all clones participate in the same failure window.
 #[derive(Clone)]
 pub struct Horizon {
     http: reqwest::Client,
     base_url: String,
+    circuit: CircuitBreaker,
+    retry: RetryPolicy,
 }
 
 impl Horizon {
+    /// Create a new client with default resilience settings.
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_resilience(
+            base_url,
+            RetryPolicy::default(),
+            CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
+        )
+    }
+
+    /// Create a client with explicit resilience configuration.
+    /// Used by `bin/server` (to wire env-var config) and by tests (to inject tight thresholds).
+    pub fn with_resilience(
+        base_url: impl Into<String>,
+        retry: RetryPolicy,
+        circuit: CircuitBreaker,
+    ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(DEFAULT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.into(),
+            circuit,
+            retry,
         }
     }
 
-    /// Fetch an account's balances. Returns `NotFound` if the account does not exist on-chain yet.
+    /// Fetch an account's balances. Retried on transient failures (transport errors, 5xx).
+    /// Returns `NotFound` if the account does not exist on-chain yet.
     pub async fn balances(&self, account_g: &str) -> Result<Vec<Balance>, ApiError> {
         let url = format!(
             "{}/accounts/{}",
             self.base_url.trim_end_matches('/'),
             account_g
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
+        let http = self.http.clone();
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let url = url.clone();
+            let http = http.clone();
+            async move {
+                let resp = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| FetchError::Transport)?;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ApiError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(ApiError::Internal);
-        }
-        let account: AccountResponse = resp.json().await.map_err(|_| ApiError::Internal)?;
-        Ok(account.balances)
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(FetchError::NotFound);
+                }
+                if resp.status().is_server_error() {
+                    return Err(FetchError::Transport); // retriable
+                }
+                if !resp.status().is_success() {
+                    return Err(FetchError::Permanent);
+                }
+                let account: AccountResponse =
+                    resp.json().await.map_err(|_| FetchError::Permanent)?;
+                Ok(account.balances)
+            }
+        })
+        .await;
+
+        map_result(result)
     }
 
-    /// Fetch an account's current sequence number. `NotFound` if the account doesn't exist.
+    /// Fetch an account's current sequence number. Retried on transient failures.
+    /// Returns `NotFound` if the account doesn't exist.
     pub async fn account_sequence(&self, account_g: &str) -> Result<i64, ApiError> {
+        self.account_info(account_g).await.map(|a| a.sequence)
+    }
+
+    /// Fetch balances, sequence, and reserve inputs for an account in a single Horizon call.
+    /// `NotFound` if the account does not exist on-chain yet.
+    pub async fn account_info(&self, account_g: &str) -> Result<AccountInfo, ApiError> {
         let url = format!(
             "{}/accounts/{}",
             self.base_url.trim_end_matches('/'),
@@ -103,13 +257,25 @@ impl Horizon {
             return Err(ApiError::Internal);
         }
         let account: AccountResponse = resp.json().await.map_err(|_| ApiError::Internal)?;
-        account
+        let sequence = account
             .sequence
             .parse::<i64>()
-            .map_err(|_| ApiError::Internal)
+            .map_err(|_| ApiError::Internal)?;
+        Ok(AccountInfo {
+            balances: account.balances,
+            sequence,
+            subentry_count: account.subentry_count,
+            num_sponsoring: account.num_sponsoring,
+            num_sponsored: account.num_sponsored,
+        })
     }
 
     /// Submit a signed transaction (base64 XDR envelope) to Horizon.
+    ///
+    /// **Not retried** — see the module-level documentation and [`octo_resilience`] for the full
+    /// rationale. TL;DR: a transport timeout does not mean the tx was rejected; it may have
+    /// already landed on-chain, so a retry risks double-submission. The circuit breaker still
+    /// applies: if Horizon is clearly down we fail fast rather than queuing up timeouts.
     ///
     /// Returns the result even when the transaction failed on-chain (`successful == false`) so the
     /// caller can record the failure; only transport/HTTP errors return `Err`.
@@ -119,42 +285,116 @@ impl Horizon {
             .http
             .post(&url)
             .form(&[("tx", envelope_xdr)])
+            .timeout(SUBMIT_TIMEOUT)
             .send()
             .await
             .map_err(|_| ApiError::Internal)?;
 
-        // Horizon returns 400 with a problem document when the tx is rejected (e.g. bad seq, no
-        // balance). Treat a parseable hash as "submitted but failed"; otherwise it's an error.
-        let status = resp.status();
-        let body: SubmitResponse = match resp.json().await {
-            Ok(b) => b,
-            Err(_) => {
-                if status.is_success() {
-                    return Err(ApiError::Internal);
-                }
-                // Rejected with no parseable hash → surface as a bad-request to the caller.
-                return Err(ApiError::BadRequest(
-                    "transaction rejected by network".into(),
-                ));
+        let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
+            let url = url.clone();
+            let http = http.clone();
+            let xdr = xdr.clone();
+            async move {
+                let resp = http
+                    .post(&url)
+                    .form(&[("tx", &xdr)])
+                    .send()
+                    .await
+                    .map_err(|_| FetchError::Transport)?;
+
+                let status = resp.status();
+                let body: SubmitResponse = match resp.json().await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        if status.is_success() {
+                            return Err(FetchError::Transport);
+                        }
+                        return Err(FetchError::TxRejected);
+                    }
+                };
+                Ok(SubmitResult {
+                    hash: body.hash,
+                    successful: body.successful,
+                    ledger: body.ledger,
+                })
             }
-        };
-        Ok(SubmitResult {
-            hash: body.hash,
-            successful: body.successful,
-            ledger: body.ledger,
         })
+        .await;
+
+        match result {
+            Ok(r) => Ok(r),
+            Err(ResilienceError::Circuit) => Err(ApiError::Internal),
+            Err(ResilienceError::Exhausted(FetchError::TxRejected)) => {
+                Err(ApiError::BadRequest("transaction rejected by network".into()))
+            }
+            Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
+        }
     }
 }
 
-/// Fund a testnet account via friendbot. Best-effort: returns `Ok(())` on success, and a logged
-/// error otherwise (the caller decides whether funding is required).
+// ---------------------------------------------------------------------------
+// Internal fetch-error type
+// ---------------------------------------------------------------------------
+
+/// Errors from inside retry closures. `Transport` = transient (retriable on read-only calls);
+/// others are permanent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FetchError {
+    /// Network error, timeout, or 5xx — transient.
+    Transport,
+    /// Horizon returned 404 — account not found. Permanent.
+    NotFound,
+    /// Any other non-success status. Permanent.
+    Permanent,
+    /// `POST /transactions` returned no parseable hash — tx rejected. Permanent.
+    TxRejected,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => write!(f, "transport error"),
+            Self::NotFound => write!(f, "account not found"),
+            Self::Permanent => write!(f, "permanent error"),
+            Self::TxRejected => write!(f, "transaction rejected"),
+        }
+    }
+}
+
+/// Map a resilience `Result` (read-only calls) to an `ApiError`.
+fn map_result<T>(r: Result<T, ResilienceError<FetchError>>) -> Result<T, ApiError> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(ResilienceError::Circuit) => Err(ApiError::Internal),
+        Err(ResilienceError::Exhausted(FetchError::NotFound)) => Err(ApiError::NotFound),
+        Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Friendbot
+// ---------------------------------------------------------------------------
+
+/// Fund a testnet account via friendbot. Best-effort; a single retry is safe because friendbot
+/// is idempotent (re-funding an already-funded account is a no-op on testnet).
 pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), ApiError> {
+    friendbot_fund_with_timeout(friendbot_url, account_g, DEFAULT_TIMEOUT).await
+}
+
+async fn friendbot_fund_with_timeout(
+    friendbot_url: &str,
+    account_g: &str,
+    timeout: Duration,
+) -> Result<(), ApiError> {
     let url = format!(
         "{}/?addr={}",
         friendbot_url.trim_end_matches('/'),
         account_g
     );
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default()
         .get(&url)
         .send()
         .await
@@ -163,5 +403,53 @@ pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), 
         Ok(())
     } else {
         Err(ApiError::Internal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Binds an ephemeral listener that accepts a connection and then holds it open forever
+    /// without reading or writing, so callers get no response and only the client's own timeout
+    /// ends the request. Returns the base URL to hit.
+    async fn hanging_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn horizon_client_times_out_and_maps_to_internal_error() {
+        let base_url = hanging_server().await;
+        let horizon = Horizon {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap(),
+            base_url,
+        };
+
+        let result = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;
+        assert!(matches!(result, Err(ApiError::Internal)));
+    }
+
+    #[tokio::test]
+    async fn friendbot_fund_times_out_and_returns_an_error() {
+        let base_url = hanging_server().await;
+
+        let result = friendbot_fund_with_timeout(
+            &base_url,
+            "GABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::Internal)));
     }
 }

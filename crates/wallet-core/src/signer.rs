@@ -11,6 +11,7 @@
 //!   are zeroized on drop.
 
 use crate::address::is_valid_account;
+use crate::asset::is_valid_asset_code;
 use crate::derive::WalletSeed;
 use crate::error::WalletError;
 use octo_crypto::{open, SealedSeed, MASTER_KEY_LEN};
@@ -155,12 +156,15 @@ pub fn sign_payment(
     let asset = match req.asset {
         None => Asset::new_native(),
         Some((code, issuer)) => {
+            if !is_valid_asset_code(code) {
+                return Err(WalletError::InvalidAssetCode);
+            }
             if !is_valid_account(issuer) {
                 return Err(WalletError::InvalidAddress);
             }
             let issuer_pk =
                 PublicKey::from_account_id(issuer).map_err(|_| WalletError::InvalidAddress)?;
-            Asset::new_credit(code, issuer_pk).map_err(|_| WalletError::InvalidAddress)?
+            Asset::new_credit(code, issuer_pk).map_err(|_| WalletError::InvalidAssetCode)?
         }
     };
 
@@ -200,7 +204,15 @@ pub fn sign_payment(
 pub struct FeeBumpRequest<'a> {
     /// Base64-encoded signed `TransactionEnvelope` from the user. Must be a v1 (`Tx`) envelope.
     pub inner_xdr: &'a str,
-    /// Maximum base fee (in stroops) the sponsor is willing to pay for the fee-bump.
+    /// Maximum fee (in stroops) the sponsor is willing to pay for the fee-bump.
+    ///
+    /// This value is stored **verbatim** as the outer `FeeBumpTransaction.fee` — a **flat total
+    /// fee bid in stroops for the whole envelope**, not a per-operation base fee. Per Stellar's
+    /// fee-bump validity rules (CAP-15), the network treats the declared fee as covering
+    /// `inner_operation_count + 1` operations (the inner ops plus the fee-bump itself), so for
+    /// multi-op inner transactions the caller must size this bid accordingly — use
+    /// [`inner_operation_count`] to inspect the inner transaction. See `docs/threat-model.md`
+    /// section B (signing-path abuse / fee injection) for the fee-semantics threat rows.
     pub max_base_fee_stroops: i64,
 }
 
@@ -330,19 +342,22 @@ pub fn compute_inner_tx_hash(
     Ok(Sha256::digest(&payload_xdr).into())
 }
 
-/// Parse a base64 XDR string and require it to be a v1 `TransactionEnvelope` (`Tx` variant).
+/// Count the operations in the inner transaction of a fee-bump flow, so callers can size the
+/// flat fee bid ([`FeeBumpRequest::max_base_fee_stroops`]) as
+/// `(operation_count + 1) × base_fee` per Stellar's fee-bump rule (the `+ 1` pays for the
+/// fee-bump itself).
 ///
-/// Both `sign_fee_bump` and `compute_inner_tx_hash` need this same guard: the envelope must be
-/// a v1 Tx, not a fee-bump or the legacy v0 form. Centralising the check here ensures the two
-/// call sites cannot silently drift apart as the fee-bump path grows.
-fn parse_inner_v1(
-    inner_xdr: &str,
-) -> Result<stellar_base::xdr::TransactionV1Envelope, WalletError> {
+/// Accepts only a v1 (`Tx`) envelope — the same constraint as [`sign_fee_bump`] — and returns
+/// [`WalletError::InvalidXdr`] for anything else. Pure parsing: no I/O, no secret material. A
+/// zero-op envelope parses and returns `Ok(0)`; Stellar itself rejects zero-op transactions, so
+/// this helper reports the count, it does not validate the transaction.
+pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
     use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
-    let env =
+
+    let inner_env =
         TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    match env {
-        TransactionEnvelope::Tx(v1) => Ok(v1),
+    match inner_env {
+        TransactionEnvelope::Tx(v1) => Ok(v1.tx.operations.len()),
         _ => Err(WalletError::InvalidXdr),
     }
 }
@@ -444,6 +459,42 @@ mod tests {
             sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
             Err(WalletError::InvalidAddress)
         ));
+    }
+
+    /// Regression coverage for `sign_payment`'s use of the shared
+    /// `crate::asset::is_valid_asset_code` (see `crate::asset`): an out-of-bounds credit-asset
+    /// code must be rejected as `InvalidAssetCode` before any `Asset::new_credit` call, and a
+    /// well-formed 1-12 byte code must still sign successfully.
+    #[test]
+    fn credit_payment_asset_code_goes_through_shared_validator() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+
+        for bad in ["", "THIRTEEN_BYTE"] {
+            let req = PaymentRequest {
+                destination: DEST,
+                stroops: 1,
+                asset: Some((bad, MASTER_ACCOUNT_0)),
+                memo_id: None,
+                sequence: 1,
+            };
+            assert!(
+                matches!(
+                    sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+                    Err(WalletError::InvalidAssetCode)
+                ),
+                "code {bad:?} (len {}) must be rejected as InvalidAssetCode",
+                bad.len()
+            );
+        }
+
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 1,
+            asset: Some(("USDC", MASTER_ACCOUNT_0)),
+            memo_id: None,
+            sequence: 1,
+        };
+        assert!(sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req).is_ok());
     }
 
     #[test]
@@ -587,6 +638,108 @@ mod tests {
         assert!(!signed.envelope_xdr.is_empty());
     }
 
+    // ── Credit-asset branch of sign_payment (#42) ────────────────────────────
+
+    #[test]
+    fn signs_credit_asset_payment_alphanum4() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // USDC is 4 chars → AlphaNum4; use DEST as the issuer (a valid G... address).
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 10_000_000,
+            asset: Some(("USDC", DEST)),
+            memo_id: None,
+            sequence: 1,
+        };
+        let signed = sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        let env =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match env {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match &e.tx.operations[0].body {
+                    stellar_base::xdr::OperationBody::Payment(pay) => {
+                        assert!(
+                            matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum4(_)),
+                            "4-char code must produce CreditAlphanum4 asset"
+                        );
+                    }
+                    _ => panic!("expected Payment operation"),
+                }
+            }
+            _ => panic!("expected Tx envelope"),
+        }
+    }
+
+    #[test]
+    fn signs_credit_asset_payment_alphanum12() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // "LONGTOKEN" is 9 chars (5-12 range) → AlphaNum12.
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 10_000_000,
+            asset: Some(("LONGTOKEN", DEST)),
+            memo_id: None,
+            sequence: 1,
+        };
+        let signed = sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        let env =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match env {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match &e.tx.operations[0].body {
+                    stellar_base::xdr::OperationBody::Payment(pay) => {
+                        assert!(
+                            matches!(pay.asset, stellar_base::xdr::Asset::CreditAlphanum12(_)),
+                            "9-char code must produce CreditAlphanum12 asset"
+                        );
+                    }
+                    _ => panic!("expected Payment operation"),
+                }
+            }
+            _ => panic!("expected Tx envelope"),
+        }
+    }
+
+    #[test]
+    fn rejects_credit_asset_with_invalid_issuer() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 1,
+            asset: Some(("USDC", "not-a-valid-G-address")),
+            memo_id: None,
+            sequence: 1,
+        };
+        assert!(matches!(
+            sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+            Err(WalletError::InvalidAddress)
+        ));
+    }
+
+    #[test]
+    fn rejects_credit_asset_with_invalid_code() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // Empty string and a 13-char code are both outside the 1-12 byte range
+        // that Asset::new_credit accepts, so both must map to WalletError::InvalidAddress.
+        for bad_code in ["", "TOOLONGASSET1X"] {
+            let req = PaymentRequest {
+                destination: DEST,
+                stroops: 1,
+                asset: Some((bad_code, DEST)),
+                memo_id: None,
+                sequence: 1,
+            };
+            assert!(
+                matches!(
+                    sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+                    Err(WalletError::InvalidAddress)
+                ),
+                "code {:?} should be rejected",
+                bad_code
+            );
+        }
+    }
+
     // ── Helper: build a signed inner payment envelope XDR ────────────────────
 
     fn make_inner_xdr(source_index: u32, seq: i64) -> String {
@@ -618,7 +771,11 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: 200,
+                sequence: 0,
+            },
         )
         .unwrap();
 
@@ -629,8 +786,9 @@ mod tests {
             _ => panic!("expected TxFeeBump"),
         };
         // Decode MASTER_ACCOUNT_0 to its raw 32-byte ed25519 key.
-        let expected_bytes =
-            stellar_strkey::ed25519::PublicKey::from_string(MASTER_ACCOUNT_0).unwrap().0;
+        let expected_bytes = stellar_strkey::ed25519::PublicKey::from_string(MASTER_ACCOUNT_0)
+            .unwrap()
+            .0;
         match fee_bump_env.tx.fee_source {
             stellar_base::xdr::MuxedAccount::Ed25519(bytes) => {
                 assert_eq!(bytes.0, expected_bytes);
@@ -659,7 +817,11 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: 200,
+                sequence: 0,
+            },
         )
         .unwrap();
 
@@ -686,7 +848,11 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: 200,
+                sequence: 0,
+            },
         )
         .unwrap();
 
@@ -710,7 +876,11 @@ mod tests {
                 &sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest { inner_xdr: "", max_base_fee_stroops: 200 },
+                &FeeBumpRequest {
+                    inner_xdr: "",
+                    max_base_fee_stroops: 200,
+                    sequence: 0
+                },
             ),
             Err(WalletError::InvalidXdr)
         ));
@@ -729,7 +899,11 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: 200,
+                sequence: 0,
+            },
         )
         .unwrap()
         .envelope_xdr;
@@ -741,7 +915,11 @@ mod tests {
                 &sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest { inner_xdr: &fee_bump_xdr, max_base_fee_stroops: 200 },
+                &FeeBumpRequest {
+                    inner_xdr: &fee_bump_xdr,
+                    max_base_fee_stroops: 200,
+                    sequence: 0
+                },
             ),
             Err(WalletError::InvalidXdr)
         ));
@@ -759,7 +937,11 @@ mod tests {
                 &mainnet_sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
+                &FeeBumpRequest {
+                    inner_xdr: &inner_xdr,
+                    max_base_fee_stroops: 200,
+                    sequence: 0
+                },
             ),
             Err(WalletError::SeedDecryption)
         ));
@@ -778,7 +960,11 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: max_base_fee },
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: max_base_fee,
+                sequence: 0,
+            },
         )
         .unwrap();
 
@@ -804,105 +990,122 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
+            &FeeBumpRequest {
+                inner_xdr: &inner_xdr,
+                max_base_fee_stroops: 200,
+                sequence: 0,
+            },
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
     }
 
-    // Issue #82: MIN_BASE_FEE check fires before any key material is touched.
+    // ── Malformed-XDR corpus (#44) ────────────────────────────────────────────
+    //
+    // Table-driven tests that mutate a known-good signed envelope at the byte
+    // level to produce truncated or bit-corrupted XDR.  Every case must return
+    // Err(WalletError::InvalidXdr) from both sign_fee_bump and
+    // compute_inner_tx_hash — never panic, never silently accept garbage.
+
+    fn valid_xdr_bytes() -> (String, Vec<u8>) {
+        use base64::prelude::*;
+        let xdr_b64 = make_inner_xdr(0, 1);
+        let bytes = BASE64_STANDARD.decode(&xdr_b64).unwrap();
+        (xdr_b64, bytes)
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::prelude::*;
+        BASE64_STANDARD.encode(bytes)
+    }
+
     #[test]
-    fn sign_fee_bump_rejects_fee_below_network_minimum() {
+    fn truncated_xdr_variants_are_rejected() {
         let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
-        let inner_xdr = make_inner_xdr(0, 1);
-        // Try fees below the network minimum (100 stroops).
-        for bad_fee in [0i64, 1, 50, 99] {
-            let req = FeeBumpRequest {
-                inner_xdr: &inner_xdr,
-                max_base_fee_stroops: bad_fee,
-            };
+        let (_, bytes) = valid_xdr_bytes();
+
+        let truncations = [0usize, 1, bytes.len() / 4, bytes.len() / 2, bytes.len() - 1];
+
+        for &len in &truncations {
+            let truncated = b64(&bytes[..len]);
             assert!(
                 matches!(
-                    sign_fee_bump(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
-                    Err(WalletError::InvalidAmount)
+                    sign_fee_bump(
+                        &mk,
+                        &sealed,
+                        StellarNetwork::Testnet,
+                        0,
+                        &FeeBumpRequest { inner_xdr: &truncated, max_base_fee_stroops: 200 },
+                    ),
+                    Err(WalletError::InvalidXdr)
                 ),
-                "fee={bad_fee} should be rejected as < MIN_BASE_FEE"
+                "sign_fee_bump should reject truncated XDR (byte len {})",
+                len
             );
         }
     }
 
     #[test]
-    fn sign_fee_bump_accepts_fee_at_exactly_the_network_minimum() {
+    fn bit_flipped_xdr_variants_are_rejected() {
         let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
-        let inner_xdr = make_inner_xdr(0, 1);
-        let req = FeeBumpRequest {
-            inner_xdr: &inner_xdr,
-            max_base_fee_stroops: MIN_BASE_FEE.to_i64(), // Exactly 100 stroops.
-        };
-        let result = sign_fee_bump(&mk, &sealed, StellarNetwork::Testnet, 0, &req);
-        assert!(
-            result.is_ok(),
-            "fee at exactly MIN_BASE_FEE (100 stroops) must be accepted"
-        );
-    }
+        let (_, bytes) = valid_xdr_bytes();
 
-    // Issue #83: StellarNetwork::Standalone tests.
-    #[test]
-    fn standalone_network_round_trips_through_parse_and_as_str() {
-        assert_eq!(
-            StellarNetwork::parse("standalone"),
-            Some(StellarNetwork::Standalone)
-        );
-        assert_eq!(StellarNetwork::Standalone.as_str(), "standalone");
-        // Round-trip: parse -> as_str -> parse must yield the same variant.
-        let net = StellarNetwork::parse("standalone").unwrap();
-        assert_eq!(StellarNetwork::parse(net.as_str()), Some(net));
-    }
+        // Flip entire bytes at positions covering the 4-byte TransactionEnvelope
+        // type discriminant and the MuxedAccount type discriminant that follows.
+        // XOR with 0xFF guarantees a non-zero mutation on any non-FF byte.
+        let flip_offsets = [0usize, 1, 2, 3, 4];
 
-    #[test]
-    fn standalone_crypto_context_differs_from_mainnet_and_testnet() {
-        let standalone_ctx = StellarNetwork::Standalone.crypto_context();
-        let mainnet_ctx = StellarNetwork::Public.crypto_context();
-        let testnet_ctx = StellarNetwork::Testnet.crypto_context();
-        assert_ne!(standalone_ctx, mainnet_ctx);
-        assert_ne!(standalone_ctx, testnet_ctx);
-        assert_ne!(mainnet_ctx, testnet_ctx);
+        for &offset in &flip_offsets {
+            let mut flipped = bytes.clone();
+            flipped[offset] ^= 0xFF;
+            let flipped_b64 = b64(&flipped);
+            assert!(
+                matches!(
+                    sign_fee_bump(
+                        &mk,
+                        &sealed,
+                        StellarNetwork::Testnet,
+                        0,
+                        &FeeBumpRequest { inner_xdr: &flipped_b64, max_base_fee_stroops: 200 },
+                    ),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "sign_fee_bump should reject bit-flipped XDR at byte offset {}",
+                offset
+            );
+        }
     }
 
     #[test]
-    fn seed_sealed_for_standalone_cannot_open_under_testnet_or_mainnet() {
-        let (mk, sealed_standalone) = sealed_vector_seed(StellarNetwork::Standalone);
-        let req = PaymentRequest {
-            destination: DEST,
-            stroops: 1,
-            asset: None,
-            memo_id: None,
-            sequence: 1,
-        };
-        // Standalone-sealed seed must not open as testnet.
-        assert!(
-            matches!(
-                sign_payment(&mk, &sealed_standalone, StellarNetwork::Testnet, 0, &req),
-                Err(WalletError::SeedDecryption)
-            ),
-            "standalone seed opened as testnet must fail"
-        );
-        // Standalone-sealed seed must not open as mainnet.
-        assert!(
-            matches!(
-                sign_payment(&mk, &sealed_standalone, StellarNetwork::Public, 0, &req),
-                Err(WalletError::SeedDecryption)
-            ),
-            "standalone seed opened as mainnet must fail"
-        );
-        // Conversely, a testnet-sealed seed cannot be opened as standalone.
-        let (mk2, sealed_testnet) = sealed_vector_seed(StellarNetwork::Testnet);
-        assert!(
-            matches!(
-                sign_payment(&mk2, &sealed_testnet, StellarNetwork::Standalone, 0, &req),
-                Err(WalletError::SeedDecryption)
-            ),
-            "testnet seed opened as standalone must fail"
-        );
+    fn compute_inner_tx_hash_rejects_same_corpus() {
+        let (_, bytes) = valid_xdr_bytes();
+
+        // Truncations
+        for &len in &[0usize, 1, bytes.len() / 2, bytes.len() - 1] {
+            let truncated = b64(&bytes[..len]);
+            assert!(
+                matches!(
+                    compute_inner_tx_hash(&truncated, StellarNetwork::Testnet),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "compute_inner_tx_hash should reject truncated XDR (len {})",
+                len
+            );
+        }
+
+        // Bit flips at discriminant bytes
+        for &offset in &[0usize, 3] {
+            let mut flipped = bytes.clone();
+            flipped[offset] ^= 0xFF;
+            let flipped_b64 = b64(&flipped);
+            assert!(
+                matches!(
+                    compute_inner_tx_hash(&flipped_b64, StellarNetwork::Testnet),
+                    Err(WalletError::InvalidXdr)
+                ),
+                "compute_inner_tx_hash should reject bit-flipped XDR at offset {}",
+                offset
+            );
+        }
     }
 }

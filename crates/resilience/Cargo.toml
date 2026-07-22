@@ -1,0 +1,16 @@
+[package]
+name = "octo-resilience"
+description = "Shared retry/backoff and circuit-breaker primitives for Horizon HTTP calls."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

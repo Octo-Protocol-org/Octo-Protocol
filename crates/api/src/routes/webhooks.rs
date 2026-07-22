@@ -5,9 +5,10 @@ use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use octo_store::WebhookDelivery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -68,6 +69,43 @@ pub async fn create_webhook(
     Ok((status, json))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeliveriesQuery {
+    /// Maximum rows to return (default 50, max 200).
+    pub limit: Option<i64>,
+}
+
+/// `GET /v1/wallets/:id/webhooks/:endpoint_id/deliveries` — an endpoint's delivery history,
+/// newest first.
+pub async fn list_deliveries(
+    State(state): State<AppState>,
+    Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Query(q): Query<DeliveriesQuery>,
+) -> ApiResult<Json<Envelope<Vec<WebhookDelivery>>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+
+    let limit = q.limit.unwrap_or(50);
+    if limit > 200 {
+        return Err(ApiError::BadRequest("limit must not exceed 200".into()));
+    }
+    if limit < 1 {
+        return Err(ApiError::BadRequest("limit must be at least 1".into()));
+    }
+
+    // Don't leak whether the endpoint exists under a different wallet.
+    let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
+    if endpoint.wallet_id != wallet_id {
+        return Err(ApiError::NotFound);
+    }
+
+    let rows = state
+        .store()
+        .list_webhook_deliveries(endpoint_id, limit)
+        .await?;
+    Ok(Envelope::ok(rows))
+}
+
 /// Generate a random hex secret for HMAC signing.
 fn generate_secret() -> String {
     // A v4 UUID (122 bits of randomness) rendered without dashes is a fine webhook secret.
@@ -75,3 +113,80 @@ fn generate_secret() -> String {
     let b = Uuid::new_v4().simple().to_string();
     format!("{a}{b}")
 }
+
+#[derive(Debug, Serialize)]
+pub struct WebhookDeliveryView {
+    pub id: Uuid,
+    pub endpoint_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempts: i32,
+    pub response_code: Option<i32>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `GET /v1/wallets/:id/webhooks`
+pub async fn list_webhooks(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<Vec<WebhookView>>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+
+    // Confirm the wallet exists (404 otherwise).
+    let _ = state.store().get_wallet(wallet_id).await?;
+
+    let eps = state.store().active_webhook_endpoints(wallet_id).await?;
+    let views: Vec<WebhookView> = eps
+        .into_iter()
+        .map(|ep| WebhookView {
+            id: ep.id,
+            url: ep.url,
+            secret: ep.secret,
+            active: ep.active,
+        })
+        .collect();
+
+    Ok(Envelope::ok(views))
+}
+
+/// `GET /v1/wallets/:id/webhooks/:endpoint_id/deliveries`
+pub async fn list_deliveries(
+    State(state): State<AppState>,
+    Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<Vec<WebhookDeliveryView>>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+
+    // Confirm the wallet exists (404 otherwise).
+    let _ = state.store().get_wallet(wallet_id).await?;
+
+    // Confirm the endpoint exists and belongs to the wallet.
+    let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
+    if endpoint.wallet_id != wallet_id {
+        return Err(ApiError::NotFound);
+    }
+
+    // Retrieve deliveries (limit to last 50).
+    let deliveries = state.store().list_webhook_deliveries(endpoint_id, 50).await?;
+
+    let views: Vec<WebhookDeliveryView> = deliveries
+        .into_iter()
+        .map(|d| WebhookDeliveryView {
+            id: d.id,
+            endpoint_id: d.endpoint_id,
+            event_type: d.event_type,
+            payload: d.payload,
+            status: d.status,
+            attempts: d.attempts,
+            response_code: d.response_code,
+            created_at: d.created_at,
+            updated_at: d.updated_at,
+        })
+        .collect();
+
+    Ok(Envelope::ok(views))
+}
+

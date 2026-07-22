@@ -17,12 +17,13 @@ mod models;
 
 pub use error::StoreError;
 pub use models::{
-    Address, ApiKey, AuditLog, GasSponsorshipConfig, NewDeposit, NewSponsoredTx,
+    Address, ApiKey, AuditLog, DenylistedToken, GasSponsorshipConfig, NewDeposit, NewSponsoredTx,
     SponsoredTransaction, Transaction, User, Wallet, WebhookEndpoint, Withdrawal,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -40,6 +41,8 @@ pub struct NewWallet<'a> {
     pub sealed_ciphertext: &'a [u8],
     pub sealed_nonce: &'a [u8],
     pub sealed_salt: &'a [u8],
+    /// Scheme version tag for the sealed seed. Use `octo_crypto::SCHEME_V1`.
+    pub sealed_scheme: i16,
     pub label: Option<&'a str>,
     pub user_id: Option<Uuid>,
     pub description: Option<&'a str>,
@@ -217,6 +220,15 @@ impl Store {
         Ok(row.map(|r| r.0))
     }
 
+    /// Delete (revoke) the API key for a wallet. Returns `Ok(())` even if no key existed.
+    pub async fn delete_api_key(&self, wallet_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM api_keys WHERE wallet_id = $1")
+            .bind(wallet_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // --- wallets ----------------------------------------------------------
 
     /// Create a master wallet. Fails with [`StoreError::Conflict`] if the account already exists.
@@ -224,9 +236,9 @@ impl Store {
         sqlx::query_as::<_, Wallet>(
             r#"
             INSERT INTO wallets
-                (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt, label,
-                 user_id, description)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
+                 sealed_scheme, label, user_id, description)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -235,6 +247,7 @@ impl Store {
         .bind(new.sealed_ciphertext)
         .bind(new.sealed_nonce)
         .bind(new.sealed_salt)
+        .bind(new.sealed_scheme)
         .bind(new.label)
         .bind(new.user_id)
         .bind(new.description)
@@ -243,12 +256,84 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
-    /// List a user's wallets (most recent first).
-    pub async fn list_wallets_for_user(&self, user_id: Uuid) -> Result<Vec<Wallet>, StoreError> {
+    /// List a user's wallets (most recent first), with optional cursor-based pagination.
+    ///
+    /// Fetching `limit + 1` rows lets the caller detect whether a next page exists without a
+    /// separate COUNT query — the same pattern used by `list_sponsored_transactions`.
+    pub async fn list_wallets_for_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
-            "SELECT * FROM wallets WHERE user_id = $1 ORDER BY created_at DESC",
+            r#"
+            SELECT * FROM wallets
+            WHERE user_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM wallets WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
         )
         .bind(user_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated version of [`list_wallets_for_user`]: returns at most `limit` rows, newest first.
+    /// Pass the last page's final wallet id as `before_id` to fetch the next page.
+    pub async fn list_wallets_for_user_page(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE user_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM wallets WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated version of [`list_wallets_for_user`]: returns at most `limit` rows created
+    /// before the row with `before_id` (keyset pagination, most-recent-first).
+    pub async fn list_wallets_for_user_page(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE user_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM wallets WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -269,6 +354,78 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)
+    }
+
+    /// Atomically swap the sealed seed material for a single wallet after a reseal/key-rotation.
+    ///
+    /// The caller (typically `bin/migrate-keys`) opens the old seed with the old master key,
+    /// re-seals it with the new master key via `octo_crypto::reseal`, and then calls this method
+    /// to persist the result. The `expected_scheme` guard ensures idempotency: if the row was
+    /// already migrated (e.g. by a concurrent runner) the update is silently skipped rather than
+    /// overwriting a newer record.
+    ///
+    /// Returns `true` if the row was updated, `false` if it was already on the target scheme.
+    pub async fn reseal_wallet(
+        &self,
+        wallet_id: Uuid,
+        new_ciphertext: &[u8],
+        new_nonce: &[u8],
+        new_salt: &[u8],
+        new_scheme: i16,
+        expected_old_scheme: i16,
+    ) -> Result<bool, StoreError> {
+        // Only update the row if it still carries the old scheme — this is the idempotency guard.
+        // A concurrent runner that already migrated this wallet will have set sealed_scheme to
+        // `new_scheme`, so the WHERE clause won't match and no double-reseal can occur.
+        let result = sqlx::query(
+            r#"
+            UPDATE wallets
+            SET sealed_ciphertext = $2,
+                sealed_nonce       = $3,
+                sealed_salt        = $4,
+                sealed_scheme      = $5,
+                updated_at         = now()
+            WHERE id = $1
+              AND sealed_scheme = $6
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(new_ciphertext)
+        .bind(new_nonce)
+        .bind(new_salt)
+        .bind(new_scheme)
+        .bind(expected_old_scheme)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Fetch a page of wallets whose `sealed_scheme` does not equal `target_scheme`, for the
+    /// migration backfill job. Returns at most `batch_size` rows ordered by `id` (stable for
+    /// resumable cursored iteration). Pass the last returned wallet's `id` as `after_id` on
+    /// subsequent calls to page through the full table without re-scanning already-migrated rows.
+    pub async fn list_wallets_needing_reseal(
+        &self,
+        target_scheme: i16,
+        batch_size: i64,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE sealed_scheme <> $1
+              AND ($2::uuid IS NULL OR id > $2)
+            ORDER BY id
+            LIMIT $3
+            "#,
+        )
+        .bind(target_scheme)
+        .bind(after_id)
+        .bind(batch_size)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     // --- addresses --------------------------------------------------------
@@ -322,12 +479,54 @@ impl Store {
         Ok(address)
     }
 
-    /// List addresses for a wallet (most recent first).
-    pub async fn list_addresses(&self, wallet_id: Uuid) -> Result<Vec<Address>, StoreError> {
+    /// List addresses for a wallet (most recent first), with optional cursor-based pagination.
+    pub async fn list_addresses(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Address>, StoreError> {
         let rows = sqlx::query_as::<_, Address>(
-            "SELECT * FROM addresses WHERE wallet_id = $1 ORDER BY created_at DESC",
+            r#"
+            SELECT * FROM addresses
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM addresses WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
         )
         .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated version of [`list_addresses`]: returns at most `limit` rows, newest first.
+    /// Pass the last page's final address id as `before_id` to fetch the next page.
+    pub async fn list_addresses_page(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Address>, StoreError> {
+        let rows = sqlx::query_as::<_, Address>(
+            r#"
+            SELECT * FROM addresses
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM addresses WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -400,18 +599,78 @@ impl Store {
         }
     }
 
-    /// List transactions for a wallet (most recent first).
-    pub async fn list_transactions(&self, wallet_id: Uuid) -> Result<Vec<Transaction>, StoreError> {
+    /// List transactions for a wallet (most recent first), with optional cursor-based pagination.
+    pub async fn list_transactions(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Transaction>, StoreError> {
         let rows = sqlx::query_as::<_, Transaction>(
-            "SELECT * FROM transactions WHERE wallet_id = $1 ORDER BY created_at DESC",
+            r#"
+            SELECT * FROM transactions
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM transactions WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
         )
         .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Paginated version of [`list_transactions`]: returns at most `limit` rows, newest first.
+    /// Pass the last page's final transaction id as `before_id` to fetch the next page.
+    pub async fn list_transactions_page(
+        &self,
+        wallet_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<Transaction>, StoreError> {
+        let rows = sqlx::query_as::<_, Transaction>(
+            r#"
+            SELECT * FROM transactions
+            WHERE wallet_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                    SELECT created_at, id FROM transactions WHERE id = $2
+                  ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(before_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
     }
 
     // --- withdrawals ------------------------------------------------------
+
+    /// Cheap existence check on `(wallet_id, idempotency_key)`, used to short-circuit a retried
+    /// request with a 409 **before** running any pre-flight Horizon checks — a key that has
+    /// already been consumed doesn't need its request re-validated against the chain.
+    pub async fn withdrawal_exists(
+        &self,
+        wallet_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool, StoreError> {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM withdrawals WHERE wallet_id = $1 AND idempotency_key = $2",
+        )
+        .bind(wallet_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
 
     /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
     /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
@@ -675,6 +934,50 @@ impl Store {
         Ok(total.unwrap_or(0))
     }
 
+    // --- token deny-list -------------------------------------------------
+
+    /// Add a token to the deny-list so it cannot be replayed after logout.
+    ///
+    /// `token_hash` must be the **SHA-256 hex** of the raw JWT (never the token itself).
+    /// `expires_at` should mirror the token's own `exp` claim so that rows can be pruned once
+    /// they are past their natural expiry and cannot match any valid token anyway.
+    ///
+    /// Inserting the same hash twice is harmless (ON CONFLICT DO NOTHING).
+    pub async fn denylist_token(
+        &self,
+        token_hash: &str,
+        user_id: Uuid,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO token_denylist (token_hash, user_id, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (token_hash) DO NOTHING
+            "#,
+        )
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns `true` if the token hash is present in the deny-list **and** has not yet expired.
+    ///
+    /// Expired rows are logically irrelevant (the token itself would fail `verify_token`'s expiry
+    /// check), but this query skips them so a slow pruning job doesn't affect correctness.
+    pub async fn is_token_denylisted(&self, token_hash: &str) -> Result<bool, StoreError> {
+        let found: Option<bool> = sqlx::query_scalar(
+            "SELECT true FROM token_denylist WHERE token_hash = $1 AND expires_at > now() LIMIT 1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
     // --- ingest cursor ----------------------------------------------------
 
     /// Read the saved Horizon paging token for a wallet, if any.
@@ -743,6 +1046,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Deactivate a webhook endpoint by setting its active status to false.
+    pub async fn deactivate_webhook_endpoint(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE webhook_endpoints SET active = false WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.
     pub async fn log_webhook_delivery(
         &self,
@@ -770,5 +1082,53 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    // --- token deny-list --------------------------------------------------
+
+    /// Revoke a JWT by inserting it into the deny-list.
+    ///
+    /// `expires_at` should match the token's `exp` claim (converted from Unix seconds). Duplicate
+    /// revocations (same token) are silently ignored via `ON CONFLICT DO NOTHING`.
+    pub async fn revoke_token(
+        &self,
+        token: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO token_denylist (token, expires_at)
+            VALUES ($1, $2)
+            ON CONFLICT (token) DO NOTHING
+            "#,
+        )
+        .bind(token)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return `true` if the token has been revoked (is in the deny-list).
+    pub async fn is_token_revoked(&self, token: &str) -> Result<bool, StoreError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM token_denylist WHERE token = $1)",
+        )
+        .bind(token)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Delete expired deny-list entries (those whose `expires_at` is in the past).
+    ///
+    /// Intended to be called periodically (e.g. once per hour in a background task) to prevent
+    /// unbounded table growth. Safe to skip — expired tokens are rejected by `verify_token()`
+    /// regardless of the deny-list.
+    pub async fn purge_expired_tokens(&self) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM token_denylist WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }

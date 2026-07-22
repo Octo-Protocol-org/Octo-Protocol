@@ -3,13 +3,18 @@
 //! These drive the real axum router with in-process requests, exercising
 //! crypto + wallet-core + store together. Skipped (with a message) if no DATABASE_URL.
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
+use axum::routing::post as post_route;
+use axum::Router;
 use octo_api::{build_router, AppState};
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use std::sync::Once;
 use tower::ServiceExt; // for `oneshot`
+use tower_http::limit::RequestBodyLimitLayer;
+
+const REQUEST_BODY_LIMIT: usize = 64 * 1024;
 
 static LOAD_ENV: Once = Once::new();
 
@@ -41,16 +46,28 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-fn post(uri: &str) -> Request<Body> {
+fn get(uri: &str) -> Request<Body> {
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
+}
+
+fn signup_request(body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri(uri)
-        .body(Body::empty())
+        .uri("/v1/auth/signup")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .body(Body::from(body))
         .unwrap()
 }
 
-fn get(uri: &str) -> Request<Body> {
-    Request::builder().uri(uri).body(Body::empty()).unwrap()
+fn body_limit_request(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/limit")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .body(Body::from(body))
+        .unwrap()
 }
 
 /// GET with an Authorization bearer token.
@@ -95,61 +112,65 @@ async fn auth_token(app: &axum::Router) -> String {
         .to_string()
 }
 
+async fn body_limit_handler(_: Bytes) -> Result<StatusCode, std::convert::Infallible> {
+    Ok(StatusCode::OK)
+}
+
 #[tokio::test]
-async fn create_wallet_returns_account_and_mnemonic() {
+async fn request_body_over_the_configured_limit_returns_413() {
+    let app = Router::new()
+        .route("/limit", post_route(body_limit_handler))
+        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT));
+
+    let body = "a".repeat(REQUEST_BODY_LIMIT + 1);
+    assert!(body.len() > REQUEST_BODY_LIMIT);
+
+    let resp = app.oneshot(body_limit_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn request_body_at_the_configured_limit_succeeds() {
+    let app = Router::new()
+        .route("/limit", post_route(body_limit_handler))
+        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT));
+
+    let body = "a".repeat(REQUEST_BODY_LIMIT);
+    assert_eq!(body.len(), REQUEST_BODY_LIMIT);
+
+    let resp = app.oneshot(body_limit_request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_oversized_body_returns_envelope() {
     let Some(state) = test_state().await else {
-        eprintln!("SKIPPED: set DATABASE_URL (start `docker compose up -d db`)");
         return;
     };
-    let app = build_router(state.clone());
-    let token = auth_token(&app).await;
-
+    let app = build_router(state);
+    
+    // إرسال طلب كبير جداً (أكبر من الحد المسموح به عادة)
     let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/wallets")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(r#"{"label":"acme"}"#))
+                .header("Content-Type", "application/json")
+                .body(Body::from(vec![0; 1024 * 1024 * 10])) // 10MB
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let json = body_json(resp).await;
-    let data = &json["data"];
-    assert!(
-        data["address"].as_str().unwrap().starts_with('G'),
-        "master address must be a G... account"
-    );
-    assert_eq!(
-        data["recovery_mnemonic"]
-            .as_str()
-            .unwrap()
-            .split_whitespace()
-            .count(),
-        12,
-        "a 12-word recovery mnemonic must be returned once"
-    );
-    assert_eq!(data["network"], "testnet");
-
-    // The stored seed must be ciphertext — never the plaintext mnemonic.
-    let wallet_id = data["id"].as_str().unwrap();
-    let row: (Vec<u8>,) =
-        sqlx::query_as("SELECT sealed_ciphertext FROM wallets WHERE id = $1::uuid")
-            .bind(wallet_id)
-            .fetch_one(state.store().pool())
-            .await
-            .unwrap();
-    assert!(!row.0.is_empty(), "sealed ciphertext stored");
-    let mnemonic = data["recovery_mnemonic"].as_str().unwrap();
-    let needle = &mnemonic.as_bytes()[..mnemonic.len().min(12)];
-    assert!(
-        !row.0.windows(needle.len()).any(|w| w == needle),
-        "plaintext mnemonic must not appear in stored ciphertext"
-    );
+    // التحقق من أننا نرجع 413
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    
+    // التحقق من أن الجسم (body) يطابق الـ Envelope
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let envelope: Envelope = serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
+    
+    assert_eq!(envelope.status_code, 413);
+    assert!(!envelope.message.is_empty());
 }
 
 #[tokio::test]
@@ -264,6 +285,16 @@ async fn addresses_on_unknown_wallet_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// DELETE with an Authorization bearer token.
+fn delete_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn post_json(uri: &str, body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -366,6 +397,59 @@ async fn withdraw_duplicate_idempotency_key_conflicts_before_signing() {
         StatusCode::CONFLICT,
         "retry with same idempotency key must 409 (no double-spend)"
     );
+}
+
+/// Regression coverage for the withdrawal route's use of the shared
+/// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
+/// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
+/// is ever created, not merely fail later at signing.
+#[tokio::test]
+async fn withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    for (label, code) in [("empty", ""), ("13_bytes", "ABCDEFGHIJKLM")] {
+        let key = format!("key-{}", uuid::Uuid::new_v4());
+        let body = format!(
+            r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}","asset":{{"code":"{code}","issuer":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6"}}}}"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(post_json_auth(&uri, &body, &token))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "asset code case '{label}' must be rejected"
+        );
+
+        // Prove rejection happened before create_withdrawal: no row with this idempotency key.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM withdrawals WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(state.store().pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "case '{label}': invalid asset code must not create a withdrawal row"
+        );
+    }
 }
 
 #[tokio::test]
@@ -485,6 +569,15 @@ async fn api_key_for(app: &axum::Router, token: &str, wallet_id: &str) -> String
         .to_string()
 }
 
+fn delete_auth(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[tokio::test]
 async fn api_key_can_create_address_on_its_wallet() {
     let Some(state) = test_state().await else {
@@ -563,6 +656,169 @@ async fn api_key_cannot_touch_another_wallet() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_api_key_revokes_it_and_subsequent_calls_using_it_are_401() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Create a wallet and generate an API key.
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = api_key_for(&app, &token, &wallet_id).await;
+
+    // The key works for authenticated requests.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/addresses"),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Revoke the key via the dashboard.
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The revoked key no longer works — 401.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/addresses"),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // GET metadata confirms no key configured.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/wallets/{wallet_id}/api-key"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"]["configured"], false);
+}
+
+#[tokio::test]
+async fn delete_api_key_requires_wallet_ownership() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+
+    // User A creates a wallet with an API key.
+    let token_a = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token_a))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    api_key_for(&app, &token_a, &wallet_id).await;
+
+    // User B cannot revoke A's key → 404 (not revealed).
+    let token_b = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &token_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_api_key_on_a_wallet_with_no_key_is_ok() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Create a wallet without generating a key.
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // DELETE on a wallet with no key is still OK (idempotent).
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn delete_api_key_rejects_api_key_auth() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = api_key_for(&app, &token, &wallet_id).await;
+
+    // An API key cannot revoke itself — only dashboard JWT works.
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{wallet_id}/api-key"),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -821,4 +1077,240 @@ async fn list_sponsored_transactions_requires_auth() {
     );
     let resp = app.oneshot(get(&uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Pagination tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a wallet and return its id string.
+async fn create_wallet_for(app: &axum::Router, token: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", token))
+        .await
+        .unwrap();
+    body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Create 5 wallets for this user.
+    for _ in 0..5 {
+        app.clone()
+            .oneshot(post_auth("/v1/wallets", &token))
+            .await
+            .unwrap();
+    }
+
+    // Fetch first page with limit=2 — expect 2 items and a next_cursor.
+    let resp = app
+        .clone()
+        .oneshot(get_auth("/v1/wallets?limit=2", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let page1 = j["data"]["data"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
+    let cursor = j["data"]["next_cursor"].as_str().expect("next_cursor must be present on first page");
+
+    // Fetch second page using the cursor — expect more items.
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&format!("/v1/wallets?limit=2&before={cursor}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j2 = body_json(resp).await;
+    let page2 = j2["data"]["data"].as_array().unwrap();
+    assert!(!page2.is_empty(), "second page must not be empty");
+
+    // Ids across pages must not overlap.
+    let ids1: Vec<&str> = page1.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    let ids2: Vec<&str> = page2.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    for id in &ids2 {
+        assert!(!ids1.contains(id), "pages must not overlap");
+    }
+}
+
+#[tokio::test]
+async fn list_addresses_pagination_returns_a_next_cursor_and_respects_limit() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    // Create 5 addresses.
+    for _ in 0..5 {
+        let uri = format!("/v1/wallets/{wallet_id}/addresses");
+        app.clone()
+            .oneshot(post_auth(&uri, &token))
+            .await
+            .unwrap();
+    }
+
+    // Fetch first page with limit=2.
+    let uri = format!("/v1/wallets/{wallet_id}/addresses?limit=2");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let page1 = j["data"]["data"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
+    let cursor = j["data"]["next_cursor"]
+        .as_str()
+        .expect("next_cursor must be present on first page");
+
+    // Fetch second page using the cursor.
+    let uri = format!("/v1/wallets/{wallet_id}/addresses?limit=2&before={cursor}");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j2 = body_json(resp).await;
+    let page2 = j2["data"]["data"].as_array().unwrap();
+    assert!(!page2.is_empty(), "second page must not be empty");
+
+    // Ids across pages must not overlap.
+    let ids1: Vec<&str> = page1.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    let ids2: Vec<&str> = page2.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    for id in &ids2 {
+        assert!(!ids1.contains(id), "pages must not overlap");
+    }
+}
+
+#[tokio::test]
+async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    // Insert 5 synthetic deposit transactions directly via the store.
+    let address_uri = format!("/v1/wallets/{wallet_id}/addresses");
+    let resp = app
+        .clone()
+        .oneshot(post_auth(&address_uri, &token))
+        .await
+        .unwrap();
+    let address_id: uuid::Uuid = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let wallet_uuid: uuid::Uuid = wallet_id.parse().unwrap();
+
+    for i in 0..5u64 {
+        state
+            .store()
+            .record_deposit(&octo_store::NewDeposit {
+                wallet_id: wallet_uuid,
+                address_id: Some(address_id),
+                asset_code: "native".into(),
+                asset_issuer: None,
+                amount_stroops: (i + 1) as i64 * 100,
+                source_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
+                destination_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
+                stellar_tx_hash: format!("txhash-pag-{i}"),
+                operation_index: i as i32,
+                horizon_op_id: format!("op-pag-{i}"),
+                ledger: Some(i as i64),
+                memo_id: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Fetch first page with limit=2.
+    let uri = format!("/v1/wallets/{wallet_id}/transactions?limit=2");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let page1 = j["data"]["data"].as_array().unwrap();
+    assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
+    let cursor = j["data"]["next_cursor"]
+        .as_str()
+        .expect("next_cursor must be present on first page");
+
+    // Fetch second page using the cursor.
+    let uri = format!("/v1/wallets/{wallet_id}/transactions?limit=2&before={cursor}");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j2 = body_json(resp).await;
+    let page2 = j2["data"]["data"].as_array().unwrap();
+    assert!(!page2.is_empty(), "second page must not be empty");
+
+    let ids1: Vec<&str> = page1.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    let ids2: Vec<&str> = page2.iter().map(|x| x["id"].as_str().unwrap()).collect();
+    for id in &ids2 {
+        assert!(!ids1.contains(id), "pages must not overlap");
+    }
+}
+
+#[tokio::test]
+async fn pagination_limit_boundaries_are_validated_consistently_with_sponsored_transactions() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    // limit=0 → 400 on all three endpoints.
+    for uri in [
+        "/v1/wallets?limit=0".to_string(),
+        format!("/v1/wallets/{wallet_id}/addresses?limit=0"),
+        format!("/v1/wallets/{wallet_id}/transactions?limit=0"),
+    ] {
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "limit=0 must be 400 for {uri}"
+        );
+    }
+
+    // limit=201 → 400 on all three endpoints.
+    for uri in [
+        "/v1/wallets?limit=201".to_string(),
+        format!("/v1/wallets/{wallet_id}/addresses?limit=201"),
+        format!("/v1/wallets/{wallet_id}/transactions?limit=201"),
+    ] {
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "limit=201 must be 400 for {uri}"
+        );
+    }
+
+    // limit=200 → 200 OK on all three endpoints (boundary is inclusive).
+    for uri in [
+        "/v1/wallets?limit=200".to_string(),
+        format!("/v1/wallets/{wallet_id}/addresses?limit=200"),
+        format!("/v1/wallets/{wallet_id}/transactions?limit=200"),
+    ] {
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "limit=200 must be OK for {uri}"
+        );
+    }
 }

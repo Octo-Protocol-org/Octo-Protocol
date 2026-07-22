@@ -71,6 +71,7 @@ impl WalletSeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use stellar_strkey::ed25519::PublicKey;
 
     // Official SEP-0005 Test 1 vector (no passphrase).
@@ -121,5 +122,54 @@ mod tests {
             WalletSeed::from_phrase("not a real mnemonic phrase at all"),
             Err(WalletError::InvalidMnemonic)
         ));
+    }
+
+    proptest! {
+        #[test]
+        fn derivation_is_deterministic_for_any_index(
+            entropy in any::<[u8; 16]>(),
+            index in any::<u32>()
+        ) {
+            let mnemonic =
+                bip39::Mnemonic::from_entropy(&entropy, bip39::Language::English).unwrap();
+            let seed_bytes = bip39::Seed::new(&mnemonic, "").as_bytes().to_vec();
+            let seed_a = WalletSeed::from_bytes(seed_bytes.clone());
+            let seed_b = WalletSeed::from_bytes(seed_bytes);
+            let secret_a = seed_a.derive_ed25519_secret(index);
+            let secret_b = seed_b.derive_ed25519_secret(index);
+            prop_assert_eq!(*secret_a, *secret_b);
+        }
+
+        #[test]
+        fn distinct_indices_yield_distinct_secrets(
+            entropy in any::<[u8; 16]>(),
+            index_a in any::<u32>(),
+            index_b in any::<u32>()
+        ) {
+            prop_assume!(index_a != index_b);
+            let mnemonic =
+                bip39::Mnemonic::from_entropy(&entropy, bip39::Language::English).unwrap();
+            let seed =
+                WalletSeed::from_bytes(bip39::Seed::new(&mnemonic, "").as_bytes().to_vec());
+            let secret_a = seed.derive_ed25519_secret(index_a);
+            let secret_b = seed.derive_ed25519_secret(index_b);
+            prop_assert_ne!(*secret_a, *secret_b);
+        }
+    }
+
+    #[test]
+    fn boundary_indices_derive_without_panic() {
+        let seed = WalletSeed::from_phrase(VECTOR_MNEMONIC).unwrap();
+        // Exercises the hardened-offset OR-mask at the extreme ends of u32:
+        // 0, 1 (lowest valid indices), HARDENED-1 (highest non-hardened u32 value),
+        // and u32::MAX (wraps the OR-mask into the already-set upper bit).
+        for &index in &[0u32, 1, super::HARDENED - 1, u32::MAX] {
+            let secret = seed.derive_ed25519_secret(index);
+            let signing = ed25519_dalek::SigningKey::from_bytes(&secret);
+            let pk = PublicKey(signing.verifying_key().to_bytes());
+            let encoded = format!("{pk}");
+            let decoded = PublicKey::from_string(&encoded).unwrap();
+            assert_eq!(decoded.0, signing.verifying_key().to_bytes());
+        }
     }
 }

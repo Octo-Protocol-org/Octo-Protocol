@@ -4,7 +4,19 @@
 //! saved paging-token cursor. Cursor polling — rather than the SSE stream — keeps the worker
 //! simple, restart-safe, and trivially horizontally scalable (one worker per account); the cursor
 //! is the durable resume point.
+//!
+//! # Resilience
+//!
+//! `payments_after` is a **read-only** call and is therefore wrapped with retry-with-backoff and
+//! a circuit breaker from [`octo_resilience`]. Transient Horizon failures (connection errors,
+//! timeouts, 5xx) are retried up to `max_attempts` times with exponential backoff. After
+//! `failure_threshold` consecutive failures the circuit opens, short-circuiting further calls
+//! until the cool-down elapses.
+//!
+//! There is no equivalent of `submit_transaction` in this crate, so the submit-asymmetry rule
+//! does not apply here.
 
+use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
 use serde::Deserialize;
 
 /// Errors talking to Horizon.
@@ -14,6 +26,8 @@ pub enum HorizonError {
     Request,
     #[error("horizon returned an unexpected response")]
     Decode,
+    #[error("horizon circuit breaker open")]
+    CircuitOpen,
 }
 
 /// One payment record from Horizon (the fields octo needs).
@@ -74,24 +88,47 @@ struct PaymentsPage {
     _embedded: Embedded,
 }
 
-/// A thin Horizon payments client.
+/// A thin Horizon payments client with retry-with-backoff and circuit-breaker protection.
+///
+/// Clones share the same circuit-breaker state (via `Arc` inside [`CircuitBreaker`]).
 #[derive(Clone)]
 pub struct HorizonPayments {
     http: reqwest::Client,
     base_url: String,
+    circuit: CircuitBreaker,
+    retry: RetryPolicy,
 }
 
 impl HorizonPayments {
+    /// Create a new client with default resilience settings.
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_resilience(
+            base_url,
+            RetryPolicy::default(),
+            CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
+        )
+    }
+
+    /// Create a client with explicit resilience configuration.
+    /// Used by `bin/server` (to wire env-var config) and tests (to inject tight thresholds).
+    pub fn with_resilience(
+        base_url: impl Into<String>,
+        retry: RetryPolicy,
+        circuit: CircuitBreaker,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
+            circuit,
+            retry,
         }
     }
 
     /// Fetch up to `limit` payments for `account_g`, oldest-first, starting after `cursor`.
     ///
-    /// Oldest-first (`order=asc`) so we process and advance the cursor monotonically.
+    /// Oldest-first (`order=asc`) so we process and advance the cursor monotonically. Transient
+    /// failures are retried with exponential backoff; the circuit breaker opens after repeated
+    /// failures so the ingest loop doesn't pile up independent timeouts.
     pub async fn payments_after(
         &self,
         account_g: &str,
@@ -109,22 +146,60 @@ impl HorizonPayments {
             url.push_str(c);
         }
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| HorizonError::Request)?;
+        let http = self.http.clone();
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let url = url.clone();
+            let http = http.clone();
+            async move {
+                let resp = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| IngestFetchError::Transport)?;
 
-        // A 404 means the account does not exist on-chain yet (e.g. a wallet created but not yet
-        // funded). That is not an error for ingestion — there simply are no payments to process.
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Vec::new());
+                // 404 means the account does not exist on-chain yet — not a retriable error.
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(Vec::new());
+                }
+                if resp.status().is_server_error() {
+                    return Err(IngestFetchError::Transport); // retriable
+                }
+                if !resp.status().is_success() {
+                    return Err(IngestFetchError::Permanent);
+                }
+                let page: PaymentsPage =
+                    resp.json().await.map_err(|_| IngestFetchError::Decode)?;
+                Ok(page._embedded.records)
+            }
+        })
+        .await;
+
+        match result {
+            Ok(records) => Ok(records),
+            Err(ResilienceError::Circuit) => Err(HorizonError::CircuitOpen),
+            Err(ResilienceError::Exhausted(IngestFetchError::Decode)) => Err(HorizonError::Decode),
+            Err(ResilienceError::Exhausted(_)) => Err(HorizonError::Request),
         }
-        if !resp.status().is_success() {
-            return Err(HorizonError::Request);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal error type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum IngestFetchError {
+    Transport,
+    Decode,
+    Permanent,
+}
+
+impl std::fmt::Display for IngestFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => write!(f, "transport error"),
+            Self::Decode => write!(f, "decode error"),
+            Self::Permanent => write!(f, "permanent error"),
         }
-        let page: PaymentsPage = resp.json().await.map_err(|_| HorizonError::Decode)?;
-        Ok(page._embedded.records)
     }
 }

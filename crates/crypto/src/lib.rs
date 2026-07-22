@@ -10,6 +10,12 @@
 //!    `context` (e.g. `"octo:mainnet"`) is bound into key derivation.
 //! 2. **AAD context binding.** The same `context` is also passed as AES-GCM associated data, so a
 //!    ciphertext sealed for one context cannot be opened under another even if salts collided.
+//! 3. **Scheme version tag.** Each [`SealedSeed`] carries an explicit `scheme` byte so that
+//!    future cipher or KDF upgrades can be identified without a flag-day migration. The current
+//!    scheme is [`SCHEME_V1`] (`1`). Rows in the database default to `1` via the migration
+//!    (`0008_scheme_version.sql`). The legacy `scheme = 0` tag maps to the same algorithm as `1`
+//!    and exists only as an internal baseline for migration tooling — it is never produced by
+//!    `seal` and [`open`] rejects it with [`CryptoError::UnknownScheme`].
 //!
 //! Plaintext and derived keys are wrapped in [`Zeroizing`] and wiped on drop. Errors are coarse
 //! and leak no cryptographic detail (see [`CryptoError`]).
@@ -38,11 +44,25 @@ pub const NONCE_LEN: usize = 12;
 /// Length of the per-record HKDF salt, in bytes.
 pub const SALT_LEN: usize = 32;
 
+/// The current sealing scheme: AES-256-GCM with per-record HKDF-SHA256 subkey derivation and
+/// context-bound AAD. All new seals are produced with this scheme tag.
+pub const SCHEME_V1: u8 = 1;
+
 /// A sealed secret: the AES-256-GCM ciphertext (including the authentication tag) plus the
-/// public, non-secret `nonce` and `salt` needed to open it.
+/// public, non-secret `nonce` and `salt` needed to open it, and an explicit `scheme` version tag
+/// that identifies the cipher and KDF used to produce the ciphertext.
 ///
 /// None of these fields are secret, so deriving `Debug` is safe — but note that `open` *also*
 /// requires the original `context` and master key, neither of which is stored here.
+///
+/// ## Scheme values
+/// | `scheme` | Algorithm |
+/// |---|---|
+/// | `1` (current) | AES-256-GCM, HKDF-SHA256 per-record subkey, context-bound AAD |
+///
+/// Scheme `0` is a sentinel for "not yet set" in older DB rows; it is never produced by [`seal`]
+/// and is rejected by [`open`] with [`CryptoError::UnknownScheme`]. Rows that carry `scheme = 0`
+/// must be migrated with [`reseal`] before they can be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedSeed {
     /// AES-256-GCM ciphertext with the 16-byte GCM tag appended.
@@ -51,6 +71,8 @@ pub struct SealedSeed {
     pub nonce: [u8; NONCE_LEN],
     /// Random salt used to derive this record's subkey via HKDF.
     pub salt: [u8; SALT_LEN],
+    /// Scheme version tag. Currently always [`SCHEME_V1`] for records produced by [`seal`].
+    pub scheme: u8,
 }
 
 impl SealedSeed {
@@ -62,6 +84,16 @@ impl SealedSeed {
         nonce: &[u8],
         salt: &[u8],
     ) -> Result<SealedSeed, CryptoError> {
+        Self::from_parts_with_scheme(ciphertext, nonce, salt, SCHEME_V1)
+    }
+
+    /// Like [`from_parts`] but also accepts the explicit scheme tag stored in the database.
+    pub fn from_parts_with_scheme(
+        ciphertext: Vec<u8>,
+        nonce: &[u8],
+        salt: &[u8],
+        scheme: u8,
+    ) -> Result<SealedSeed, CryptoError> {
         let nonce: [u8; NONCE_LEN] = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength)?;
@@ -72,6 +104,7 @@ impl SealedSeed {
             ciphertext,
             nonce,
             salt,
+            scheme,
         })
     }
 }
@@ -98,7 +131,8 @@ fn derive_subkey(
 ///
 /// `context` is a non-secret domain separator that must be supplied identically to [`open`]
 /// (e.g. `b"octo:mainnet"`). A fresh random nonce and salt are generated per call, so sealing the
-/// same plaintext twice yields different output.
+/// same plaintext twice yields different output. The returned [`SealedSeed`] always has
+/// `scheme = `[`SCHEME_V1`].
 pub fn seal(
     master_key: &[u8; MASTER_KEY_LEN],
     plaintext: &[u8],
@@ -127,6 +161,7 @@ pub fn seal(
         ciphertext,
         nonce: nonce_bytes,
         salt,
+        scheme: SCHEME_V1,
     })
 }
 
@@ -134,13 +169,20 @@ pub fn seal(
 ///
 /// Returns the plaintext wrapped in [`Zeroizing`] so it is wiped when dropped. Fails with
 /// [`CryptoError::DecryptionFailed`] for *any* authentication failure (wrong key, tampered
-/// ciphertext/nonce/tag, or a `context` that differs from the one used to seal) — the variant is
-/// deliberately indistinguishable across those cases.
+/// ciphertext/nonce/tag, or a `context` that differs from the one used to seal), and with
+/// [`CryptoError::UnknownScheme`] when the `scheme` tag is not a value this code knows how to
+/// handle — the variant is deliberately indistinguishable across those cases for security.
 pub fn open(
     master_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
     context: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    // Validate the scheme tag before attempting any cryptographic operation.
+    match sealed.scheme {
+        SCHEME_V1 => {} // the only supported scheme
+        _ => return Err(CryptoError::UnknownScheme(sealed.scheme)),
+    }
+
     if sealed.nonce.len() != NONCE_LEN {
         return Err(CryptoError::InvalidNonceLength);
     }
@@ -160,6 +202,22 @@ pub fn open(
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
     Ok(Zeroizing::new(plaintext))
+}
+
+/// Rotate the master key protecting an already-sealed secret.
+///
+/// Opens `sealed` under `old_key`/`context`, then seals the recovered plaintext under `new_key`
+/// and the same `context`. The intermediate plaintext is wrapped in [`Zeroizing`] (as returned by
+/// [`open`]) and wiped on drop. The returned [`SealedSeed`] gets a fresh random nonce and salt, as
+/// [`seal`] always generates — it never reuses the original record's.
+pub fn reseal(
+    old_key: &[u8; MASTER_KEY_LEN],
+    new_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    context: &[u8],
+) -> Result<SealedSeed, CryptoError> {
+    let plaintext = open(old_key, sealed, context)?;
+    seal(new_key, plaintext.as_ref(), context)
 }
 
 /// Convenience: parse a 32-byte master key from a byte slice (e.g. decoded from a KMS/env value).
@@ -186,6 +244,13 @@ mod tests {
         let sealed = seal(&mk, secret, CTX).unwrap();
         let opened = open(&mk, &sealed, CTX).unwrap();
         assert_eq!(opened.as_slice(), secret);
+    }
+
+    #[test]
+    fn seal_always_produces_scheme_v1() {
+        let mk = key();
+        let sealed = seal(&mk, b"seed", CTX).unwrap();
+        assert_eq!(sealed.scheme, SCHEME_V1, "seal must always produce scheme v1");
     }
 
     #[test]
@@ -278,6 +343,51 @@ mod tests {
     }
 
     #[test]
+    fn reseal_produces_a_record_openable_only_under_the_new_key() {
+        let old_mk = key();
+        let new_mk = key();
+        let secret = b"a 24-word BIP39 mnemonic seed lives here";
+        let sealed = seal(&old_mk, secret, CTX).unwrap();
+
+        let resealed = reseal(&old_mk, &new_mk, &sealed, CTX).unwrap();
+
+        assert_eq!(open(&new_mk, &resealed, CTX).unwrap().as_slice(), secret);
+        assert!(matches!(
+            open(&old_mk, &resealed, CTX),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn reseal_result_has_fresh_nonce_and_salt_distinct_from_the_original() {
+        let old_mk = key();
+        let new_mk = key();
+        let sealed = seal(&old_mk, b"seed", CTX).unwrap();
+
+        let resealed = reseal(&old_mk, &new_mk, &sealed, CTX).unwrap();
+
+        assert_ne!(resealed.nonce, sealed.nonce);
+        assert_ne!(resealed.salt, sealed.salt);
+    }
+
+    #[test]
+    fn reseal_fails_cleanly_if_old_key_or_context_is_wrong() {
+        let old_mk = key();
+        let new_mk = key();
+        let wrong_mk = key();
+        let sealed = seal(&old_mk, b"seed", CTX).unwrap();
+
+        assert!(matches!(
+            reseal(&wrong_mk, &new_mk, &sealed, CTX),
+            Err(CryptoError::DecryptionFailed)
+        ));
+        assert!(matches!(
+            reseal(&old_mk, &new_mk, &sealed, b"octo:mainnet"),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
     fn master_key_from_slice_validates_length() {
         assert!(master_key_from_slice(&[0u8; 32]).is_ok());
         assert!(matches!(
@@ -288,5 +398,113 @@ mod tests {
             master_key_from_slice(&[0u8; 33]),
             Err(CryptoError::InvalidKeyLength)
         ));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Size-boundary tests
+    //
+    // HKDF-SHA256 can expand up to 255 * 32 = 8 160 bytes of output.  This crate
+    // always requests exactly 32 bytes, so the expansion limit is never approached
+    // regardless of plaintext size.  The GCM ciphertext-length invariant is:
+    //
+    //     ciphertext.len() == plaintext.len() + 16   (16-byte authentication tag)
+    //
+    // The tests below assert that invariant and verify seal/open round-trips for
+    // each size class: 0, 1, 64 (HD seed), 1 024, and 1 048 576 bytes (1 MiB).
+    // ---------------------------------------------------------------------------
+
+    /// Table-driven seal→open roundtrip across the full range of supported sizes.
+    #[test]
+    fn seal_open_roundtrips_across_size_range() {
+        let mk = key();
+        for &size in &[0usize, 1, 64, 1_024, 1_048_576] {
+            let plaintext: Vec<u8> = (0..size).map(|i| (i & 0xff) as u8).collect();
+            let sealed = seal(&mk, &plaintext, CTX)
+                .unwrap_or_else(|e| panic!("seal failed for size {size}: {e:?}"));
+            let opened = open(&mk, &sealed, CTX)
+                .unwrap_or_else(|e| panic!("open failed for size {size}: {e:?}"));
+            assert_eq!(
+                opened.as_slice(),
+                plaintext.as_slice(),
+                "roundtrip mismatch for size {size}"
+            );
+        }
+    }
+
+    /// Splicing fields from two independently-sealed records always fails authentication.
+    ///
+    /// We seal two different plaintexts under the same master key but with *different* contexts,
+    /// producing records A and B. Every cross-combination of
+    ///
+    ///   {A.ciphertext, B.ciphertext} × {A.nonce, B.nonce} × {A.salt, B.salt}
+    ///
+    /// is then tried under both contexts. The only combinations that could possibly succeed are
+    /// the two identity combinations (A opened under ctx_a, B opened under ctx_b); those are
+    /// excluded from the loop. All remaining 2×2×2×2 − 2 = 14 combinations must return
+    /// `Err(CryptoError::DecryptionFailed)`.
+    #[test]
+    fn spliced_sealed_seed_fields_never_decrypt() {
+        let mk = key();
+        let ctx_a: &[u8] = b"octo:mainnet";
+        let ctx_b: &[u8] = b"octo:testnet";
+
+        let a = seal(&mk, b"plaintext-alpha", ctx_a).unwrap();
+        let b = seal(&mk, b"plaintext-beta", ctx_b).unwrap();
+
+        let ciphertexts = [(&a.ciphertext, "A.ct"), (&b.ciphertext, "B.ct")];
+        let nonces = [(&a.nonce[..], "A.nonce"), (&b.nonce[..], "B.nonce")];
+        let salts = [(&a.salt[..], "A.salt"), (&b.salt[..], "B.salt")];
+        let contexts = [(ctx_a, "ctx_a"), (ctx_b, "ctx_b")];
+
+        for (ct, ct_label) in &ciphertexts {
+            for (nonce, nonce_label) in &nonces {
+                for (salt, salt_label) in &salts {
+                    for (ctx, ctx_label) in &contexts {
+                        // Skip the two identity combinations that are supposed to succeed.
+                        let is_identity_a = std::ptr::eq(*ct, &a.ciphertext)
+                            && std::ptr::eq(*nonce, &a.nonce[..])
+                            && std::ptr::eq(*salt, &a.salt[..])
+                            && std::ptr::eq(*ctx, ctx_a);
+                        let is_identity_b = std::ptr::eq(*ct, &b.ciphertext)
+                            && std::ptr::eq(*nonce, &b.nonce[..])
+                            && std::ptr::eq(*salt, &b.salt[..])
+                            && std::ptr::eq(*ctx, ctx_b);
+                        if is_identity_a || is_identity_b {
+                            continue;
+                        }
+
+                        let spliced =
+                            SealedSeed::from_parts((*ct).clone(), nonce, salt).unwrap();
+                        let result = open(&mk, &spliced, ctx);
+                        assert!(
+                            matches!(result, Err(CryptoError::DecryptionFailed)),
+                            "expected DecryptionFailed for splice \
+                             ({ct_label}, {nonce_label}, {salt_label}, {ctx_label}), \
+                             got {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The GCM ciphertext is always exactly plaintext.len() + 16 (the authentication tag).
+    #[test]
+    fn ciphertext_length_is_plaintext_plus_tag_across_size_range() {
+        const GCM_TAG_LEN: usize = 16;
+        let mk = key();
+        for &size in &[0usize, 1, 64, 1_024, 1_048_576] {
+            let plaintext: Vec<u8> = vec![0xab; size];
+            let sealed = seal(&mk, &plaintext, CTX)
+                .unwrap_or_else(|e| panic!("seal failed for size {size}: {e:?}"));
+            assert_eq!(
+                sealed.ciphertext.len(),
+                size + GCM_TAG_LEN,
+                "ciphertext length wrong for plaintext size {size}: \
+                 expected {}, got {}",
+                size + GCM_TAG_LEN,
+                sealed.ciphertext.len()
+            );
+        }
     }
 }

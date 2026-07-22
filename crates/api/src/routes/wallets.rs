@@ -1,17 +1,27 @@
-//! Wallet endpoints: create a master wallet, fetch one.
+//! Wallet endpoints: create a master wallet, fetch one, list with pagination.
 
 use crate::auth::{authenticate, authorize_wallet};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_store::NewWallet;
 use octo_wallet_core::provision_wallet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Shared pagination query parameters used by list_wallets, list_transactions,
+/// and list_addresses. Mirrors `SponsoredTxnQuery`'s limit/before convention.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListParams {
+    /// Maximum rows to return (default 50, max 200).
+    pub limit: Option<i64>,
+    /// Cursor: return rows created before this id (exclusive).
+    pub before: Option<Uuid>,
+}
 
 /// Optional body for wallet creation.
 #[derive(Debug, Default, Deserialize)]
@@ -47,13 +57,42 @@ pub struct WalletView {
     pub description: Option<String>,
 }
 
+/// Paginated list response for wallets.
+#[derive(Debug, Serialize)]
+pub struct WalletListResponse {
+    pub data: Vec<WalletView>,
+    /// UUID of the last row in this page, or null if there are no more rows.
+    pub next_cursor: Option<Uuid>,
+}
+
+/// Paginated list response for transactions.
+#[derive(Debug, Serialize)]
+pub struct TransactionListResponse {
+    pub data: Vec<octo_store::Transaction>,
+    /// UUID of the last row in this page, or null if there are no more rows.
+    pub next_cursor: Option<Uuid>,
+}
+
+/// Validate a `limit` query param using the same bounds as `SponsoredTxnQuery`:
+/// default 50, min 1, max 200.
+pub fn validated_limit(limit: Option<i64>) -> Result<i64, ApiError> {
+    let l = limit.unwrap_or(50);
+    if l > 200 {
+        return Err(ApiError::BadRequest("limit must not exceed 200".into()));
+    }
+    if l < 1 {
+        return Err(ApiError::BadRequest("limit must be at least 1".into()));
+    }
+    Ok(l)
+}
+
 /// `POST /v1/wallets` — create a master wallet for the authenticated user.
 pub async fn create_wallet(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<CreateWalletResponse>>)> {
-    let user_id = authenticate(&headers, &state)?;
+    let user_id = authenticate(&headers, &state).await?;
     let req: CreateWalletRequest = parse_optional(&body)?;
     let label = req.label;
     let description = req.description;
@@ -69,6 +108,7 @@ pub async fn create_wallet(
             sealed_ciphertext: &provisioned.sealed.ciphertext,
             sealed_nonce: &provisioned.sealed.nonce,
             sealed_salt: &provisioned.sealed.salt,
+            sealed_scheme: i16::from(provisioned.sealed.scheme),
             label: label.as_deref(),
             user_id: Some(user_id),
             description: description.as_deref(),
@@ -118,21 +158,34 @@ pub async fn get_balances(
     Ok(Envelope::ok(balances))
 }
 
-/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet.
+/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet,
+/// with optional `?limit=` and `?before=` cursor pagination.
 pub async fn list_transactions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> ApiResult<Json<Envelope<Vec<octo_store::Transaction>>>> {
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<Envelope<TransactionListResponse>>> {
     authorize_wallet(&headers, &state, id).await?;
-    // Confirm the wallet exists (404 otherwise).
     let _ = state.store().get_wallet(id).await?;
-    let txns = state
+
+    let limit = validated_limit(q.limit)?;
+
+    // Fetch limit+1 to detect whether a next page exists.
+    let rows = state
         .store()
-        .list_transactions(id)
+        .list_transactions(id, limit + 1, q.before)
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(Envelope::ok(txns))
+
+    let has_more = rows.len() > limit as usize;
+    let mut data = rows;
+    if has_more {
+        data.truncate(limit as usize);
+    }
+    let next_cursor = if has_more { data.last().map(|r| r.id) } else { None };
+
+    Ok(Envelope::ok(TransactionListResponse { data, next_cursor }))
 }
 
 fn to_view(w: octo_store::Wallet) -> WalletView {
@@ -159,16 +212,33 @@ pub async fn get_wallet(
     Ok(Envelope::ok(to_view(w)))
 }
 
-/// `GET /v1/wallets` — list the authenticated user's wallets.
+/// `GET /v1/wallets` — list the authenticated user's wallets, with optional
+/// `?limit=` and `?before=` cursor pagination.
 pub async fn list_wallets(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> ApiResult<Json<Envelope<Vec<WalletView>>>> {
-    let user_id = authenticate(&headers, &state)?;
-    let wallets = state
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<Envelope<WalletListResponse>>> {
+    let user_id = authenticate(&headers, &state).await?;
+
+    let limit = validated_limit(q.limit)?;
+
+    // Fetch limit+1 to detect whether a next page exists.
+    let rows = state
         .store()
-        .list_wallets_for_user(user_id)
+        .list_wallets_for_user(user_id, limit + 1, q.before)
         .await
         .map_err(|_| ApiError::Internal)?;
-    Ok(Envelope::ok(wallets.into_iter().map(to_view).collect()))
+
+    let has_more = rows.len() > limit as usize;
+    let mut wallets = rows;
+    if has_more {
+        wallets.truncate(limit as usize);
+    }
+    let next_cursor = if has_more { wallets.last().map(|w| w.id) } else { None };
+
+    Ok(Envelope::ok(WalletListResponse {
+        data: wallets.into_iter().map(to_view).collect(),
+        next_cursor,
+    }))
 }

@@ -94,17 +94,18 @@ pub async fn sponsor(
         .await?; // BudgetExceeded -> 429, Conflict -> 409
 
     // 5. Sign the fee-bump (decrypt -> derive -> sign -> zeroize, inside wallet-core).
-    let sealed = SealedSeed::from_parts(
+    let sealed = SealedSeed::from_parts_with_scheme(
         wallet.sealed_ciphertext.clone(),
         &wallet.sealed_nonce,
         &wallet.sealed_salt,
+        wallet.sealed_scheme as u8,
     )
     .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {
         inner_xdr: &inner_xdr,
         max_base_fee_stroops: max_fee,
     };
-    let signed = match sign_fee_bump(state.master_key(), &sealed, state.network(), 0, &fb) {
+    let signed = match sign_fee_bump(state.master_key_for_scheme(wallet.sealed_scheme), &sealed, state.network(), 0, &fb) {
         Ok(s) => s,
         Err(_) => {
             let _ = state
@@ -131,7 +132,7 @@ pub async fn sponsor(
         .await;
 
     // 7. Audit log (best-effort) — only when driven by a dashboard login (API keys have no user).
-    if let Ok(user_id) = crate::auth::require_login(&headers, &state) {
+    if let Ok(user_id) = crate::auth::require_login(&headers, &state).await {
         if wallet.user_id == Some(user_id) {
             crate::audit::record(
                 &state,
@@ -200,7 +201,7 @@ pub async fn list_sponsored_transactions(
     Query(q): Query<SponsoredTxnQuery>,
 ) -> ApiResult<Json<Envelope<SponsoredTxnListResponse>>> {
     // JWT login session required (no API keys).
-    let user_id = crate::auth::require_login(&headers, &state)?;
+    let user_id = crate::auth::require_login(&headers, &state).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.user_id != Some(user_id) {
         return Err(ApiError::NotFound);

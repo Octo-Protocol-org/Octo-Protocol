@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/useAuth";
 import { listWallets, type WalletView } from "@/lib/wallets";
 import {
   getSponsorshipConfig,
+  formatXlm,
   type SponsorshipConfig,
 } from "@/lib/sponsorship";
 import { DashboardShell } from "@/components/dashboard/DashboardShell";
@@ -13,6 +14,8 @@ import { DashboardShell } from "@/components/dashboard/DashboardShell";
 export default function DashboardHome() {
   const { user, token, loading, logout } = useAuth();
   const [wallets, setWallets] = useState<WalletView[] | null>(null);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [sponsorshipByWalletId, setSponsorshipByWalletId] = useState<
     Map<string, SponsorshipConfig | null>
   >(new Map());
@@ -21,32 +24,54 @@ export default function DashboardHome() {
     if (!token) return;
     let aborted = false;
     listWallets(token)
-      .then(async (ws) => {
+      .then(async (page) => {
         if (aborted) return;
-        setWallets(ws);
-        // Fetch sponsorship configs in parallel so the wallet list never has to wait on them.
-        // A single failed sponsorship fetch must not blank out the whole row.
+        setWallets(page.data);
+        setCursor(page.next_cursor);
+        // Fetch sponsorship configs in parallel.
         const results = await Promise.allSettled(
-          ws.map((w) => getSponsorshipConfig(token, w.id)),
+          page.data.map((w) => getSponsorshipConfig(token, w.id)),
         );
         if (aborted) return;
         const map = new Map<string, SponsorshipConfig | null>();
-        ws.forEach((w, i) => {
+        page.data.forEach((w, i) => {
           const r = results[i];
           map.set(w.id, r.status === "fulfilled" ? r.value : null);
         });
         setSponsorshipByWalletId(map);
       })
       .catch(() => {
-        // Gate on the same `aborted` flag the .then already uses so we don't call
-        // setState on an unmounted component when listWallets rejects late.
         if (aborted) return;
         setWallets([]);
       });
-    return () => {
-      aborted = true;
-    };
+    return () => { aborted = true; };
   }, [token]);
+
+  async function loadMore() {
+    if (!cursor || loadingMore || !token) return;
+    setLoadingMore(true);
+    try {
+      const page = await listWallets(token, cursor);
+      setWallets((prev) => [...(prev ?? []), ...page.data]);
+      setCursor(page.next_cursor);
+      // Fetch sponsorship configs for the new batch.
+      const results = await Promise.allSettled(
+        page.data.map((w) => getSponsorshipConfig(token, w.id)),
+      );
+      setSponsorshipByWalletId((prev) => {
+        const map = new Map(prev);
+        page.data.forEach((w, i) => {
+          const r = results[i];
+          map.set(w.id, r.status === "fulfilled" ? r.value : null);
+        });
+        return map;
+      });
+    } catch {
+      // leave existing list in place on failure
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   if (loading || !user) {
     return (
@@ -103,15 +128,28 @@ export default function DashboardHome() {
           ) : wallets.length === 0 ? (
             <EmptyState />
           ) : (
-            <div className="grid gap-4 md:grid-cols-2">
-              {wallets.map((w) => (
-                <WalletCard
-                  key={w.id}
-                  wallet={w}
-                  sponsorship={sponsorshipByWalletId.get(w.id) ?? undefined}
-                />
-              ))}
-            </div>
+            <>
+              <div className="grid gap-4 md:grid-cols-2">
+                {wallets.map((w) => (
+                  <WalletCard
+                    key={w.id}
+                    wallet={w}
+                    sponsorship={sponsorshipByWalletId.get(w.id) ?? undefined}
+                  />
+                ))}
+              </div>
+              {cursor && (
+                <div className="mt-6 text-center">
+                  <button
+                    onClick={loadMore}
+                    disabled={loadingMore}
+                    className="rounded-lg border border-white/10 bg-white/[0.03] px-5 py-2.5 text-sm text-foreground transition-colors hover:border-burgundy/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {loadingMore ? "Loading…" : "Load more wallets"}
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -136,10 +174,6 @@ function EmptyState() {
   );
 }
 
-function formatXlm(stroops: number): string {
-  return (stroops / 10_000_000).toFixed(2);
-}
-
 function WalletCard({
   wallet,
   sponsorship,
@@ -150,6 +184,11 @@ function WalletCard({
   const short = `${wallet.address.slice(0, 6)}…${wallet.address.slice(-6)}`;
   const sponsorEnabled = sponsorship?.enabled === true;
   const dailyBudget = sponsorship?.daily_budget_stroops;
+  const spentToday = sponsorship?.spent_today_stroops ?? 0;
+  const hasBudget = typeof dailyBudget === "number" && dailyBudget > 0;
+  const pct = hasBudget
+    ? Math.min(100, Math.max(0, (spentToday / dailyBudget) * 100))
+    : 0;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-burgundy-soft/30 p-5">
@@ -206,15 +245,20 @@ function WalletCard({
               {sponsorEnabled ? "Enabled" : "Off"}
             </span>
           </div>
-          {/* Daily-budget cap is rendered only when the API returns a numeric budget.
-              The progress bar for daily-spend consumption is intentionally omitted for now
-              because the current API response does not include a "fees_spent_today_stroops"
-              field. When that lands, swap this label for a fill-bar the same way the wallet
-              card already handles other grid cells. */}
-          {typeof dailyBudget === "number" && dailyBudget > 0 && (
-            <p className="mt-0.5 text-[10px] text-muted">
-              {formatXlm(dailyBudget)} XLM/day cap
-            </p>
+          {hasBudget ? (
+            <div className="mt-1.5 space-y-1">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-burgundy-bright transition-all"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-muted">
+                {formatXlm(spentToday)} / {formatXlm(dailyBudget)} XLM today
+              </p>
+            </div>
+          ) : (
+            <p className="mt-0.5 text-[10px] text-muted">no daily cap</p>
           )}
         </div>
       </div>

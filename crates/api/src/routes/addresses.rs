@@ -1,15 +1,16 @@
-//! Address endpoints: generate a customer deposit address, list them.
+//! Address endpoints: generate a customer deposit address, list them with pagination.
 //!
 //! Each address is returned in **both** forms — the muxed `M...` (default) and the
 //! `G...` + numeric `memo_id` fallback for senders that don't support muxed (see
 //! `docs/deposit-model.md`).
 
 use crate::auth::authorize_wallet;
-use crate::error::{ApiResult, Envelope};
+use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
+use crate::routes::wallets::ListParams;
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_wallet_core::encode_muxed;
@@ -38,6 +39,14 @@ pub struct AddressView {
     pub base_address: String,
     pub memo_id: i64,
     pub metadata: serde_json::Value,
+}
+
+/// Paginated list response for addresses.
+#[derive(Debug, Serialize)]
+pub struct AddressListResponse {
+    pub data: Vec<AddressView>,
+    /// UUID of the last row in this page, or null if there are no more rows.
+    pub next_cursor: Option<Uuid>,
 }
 
 /// `POST /v1/wallets/{id}/addresses`
@@ -96,28 +105,46 @@ pub async fn create_address(
     Ok((status, json))
 }
 
-/// `GET /v1/wallets/{id}/addresses`
+/// `GET /v1/wallets/{id}/addresses` — list deposit addresses for a wallet, with optional
+/// `?limit=` and `?before=` cursor pagination.
 pub async fn list_addresses(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
-) -> ApiResult<Json<Envelope<Vec<AddressView>>>> {
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<Envelope<AddressListResponse>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
-    // Confirm the wallet exists (404 otherwise) and get its base account for the fallback form.
     let wallet = state.store().get_wallet(wallet_id).await?;
-    let rows = state.store().list_addresses(wallet_id).await?;
 
-    let views = rows
+    let limit = crate::routes::wallets::validated_limit(q.limit)?;
+
+    // Fetch limit+1 to detect whether a next page exists.
+    let rows = state
+        .store()
+        .list_addresses(wallet_id, limit + 1, q.before)
+        .await?;
+
+    let has_more = rows.len() > limit as usize;
+    let mut items = rows;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = if has_more { items.last().map(|a| a.id) } else { None };
+
+    let views = items
         .into_iter()
         .map(|a| AddressView {
             id: a.id,
             customer_ref: a.customer_ref,
             muxed_address: a.muxed_address,
-            base_address: wallet.stellar_account_g.clone(),
+            base_address: base.clone(),
             memo_id: a.muxed_id,
             metadata: a.metadata,
         })
         .collect();
 
-    Ok(Envelope::ok(views))
+    Ok(Envelope::ok(AddressListResponse {
+        data: views,
+        next_cursor,
+    }))
 }

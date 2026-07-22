@@ -24,6 +24,11 @@ pub enum WalletError {
     #[error("invalid Stellar address")]
     InvalidAddress,
 
+    /// A credit-asset code was not 1 to 12 bytes, so it can never match a real Stellar asset
+    /// (see [`crate::asset::is_valid_asset_code`]).
+    #[error("invalid asset code")]
+    InvalidAssetCode,
+
     /// A requested amount was out of range (must be a positive number of stroops).
     #[error("invalid amount")]
     InvalidAmount,

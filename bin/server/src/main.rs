@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use octo_api::{build_router, AppState};
 use octo_ingest::Supervisor;
+use octo_resilience::ResilienceConfig;
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
@@ -33,22 +34,41 @@ async fn main() -> Result<()> {
     store.migrate().await.context("run migrations")?;
     tracing::info!("database connected and migrated");
 
-    // Shared state.
-    let state = AppState::new(
+    // Resilience config (shared between API Horizon client and ingest HorizonPayments client).
+    let resilience = cfg.resilience.clone();
+    tracing::info!(
+        max_attempts = resilience.max_attempts,
+        base_delay_ms = resilience.base_delay_ms,
+        max_delay_ms = resilience.max_delay_ms,
+        cb_failure_threshold = resilience.cb_failure_threshold,
+        cb_reset_timeout_secs = resilience.cb_reset_timeout_secs,
+        "horizon resilience config"
+    );
+
+    // Shared state (includes the API's Horizon client wired with resilience).
+    let state = AppState::new_with_resilience(
         store.clone(),
         cfg.master_key,
         cfg.network,
         cfg.horizon_url.clone(),
         cfg.friendbot_url.clone(),
+        resilience.retry_policy(),
+        resilience.circuit_breaker(),
     )
     .with_jwt_secret(cfg.jwt_secret.clone());
 
-    // Ingest supervisor (background task).
-    let supervisor = Supervisor::new(
+    // Ingest supervisor (background task) — uses its own HorizonPayments client with the same
+    // resilience config (separate circuit-breaker instance so ingest and API failures are counted
+    // independently).
+    let ingest_retry = cfg.resilience.retry_policy();
+    let ingest_circuit = cfg.resilience.circuit_breaker();
+    let supervisor = Supervisor::new_with_resilience(
         store.clone(),
         cfg.horizon_url.clone(),
         WebhookSender::new(store.clone()),
         cfg.network.as_str(),
+        ingest_retry,
+        ingest_circuit,
     );
     tokio::spawn(async move {
         supervisor
@@ -87,10 +107,25 @@ struct Config {
     horizon_url: String,
     friendbot_url: Option<String>,
     master_key: [u8; 32],
+    /// Optional next master key for zero-downtime rotation. Present only during the rotation
+    /// window while `octo-migrate-keys` is backfilling. When set, the server uses this key as
+    /// the primary signing key (for already-migrated rows) and falls back to `master_key` for
+    /// rows not yet re-sealed. See `docs/key-rotation.md` for the full runbook.
+    master_key_next: Option<[u8; 32]>,
     jwt_secret: Vec<u8>,
     bind_addr: String,
     ingest_interval_secs: u64,
     ingest_page_limit: u32,
+    /// Resilience settings for all Horizon clients (API + ingest).
+    ///
+    /// | Variable | Default | Description |
+    /// |---|---|---|
+    /// | `HORIZON_MAX_ATTEMPTS` | 3 | Retry attempts for read-only calls |
+    /// | `HORIZON_BASE_DELAY_MS` | 200 | Base backoff delay (ms) |
+    /// | `HORIZON_MAX_DELAY_MS` | 5000 | Max backoff delay (ms) |
+    /// | `HORIZON_CB_FAILURE_THRESHOLD` | 5 | Consecutive failures before circuit opens |
+    /// | `HORIZON_CB_RESET_TIMEOUT_SECS` | 30 | Seconds before circuit allows a probe |
+    resilience: ResilienceConfig,
 }
 
 impl Config {
@@ -110,6 +145,22 @@ impl Config {
         let master_key = AppState::decode_master_key(&master_key_b64)
             .map_err(|_| anyhow::anyhow!("MASTER_KEY must be base64-encoded 32 bytes"))?;
 
+        // During a key-rotation window, MASTER_KEY_NEXT can be set alongside MASTER_KEY.
+        // The server reads it here and passes it to AppState so that signing paths can try the
+        // new key first, then fall back to the old key for rows not yet migrated by
+        // `octo-migrate-keys`. Once the migration tool reports 0 remaining rows, MASTER_KEY
+        // should be updated to the new value and MASTER_KEY_NEXT removed.
+        //
+        // Security note: both keys must be treated with the same care as MASTER_KEY. They should
+        // come from the same KMS/secrets manager; neither should ever be written to disk or logs.
+        let master_key_next = std::env::var("MASTER_KEY_NEXT")
+            .ok()
+            .map(|b64| {
+                AppState::decode_master_key(&b64)
+                    .map_err(|_| anyhow::anyhow!("MASTER_KEY_NEXT must be base64-encoded 32 bytes"))
+            })
+            .transpose()?;
+
         let jwt_secret = std::env::var("JWT_SECRET")
             .context("JWT_SECRET is required (used to sign dashboard auth tokens)")?
             .into_bytes();
@@ -128,16 +179,20 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(50);
 
+        let resilience = ResilienceConfig::from_env();
+
         Ok(Config {
             database_url,
             network,
             horizon_url,
             friendbot_url,
             master_key,
+            master_key_next,
             jwt_secret,
             bind_addr,
             ingest_interval_secs,
             ingest_page_limit,
+            resilience,
         })
     }
 }

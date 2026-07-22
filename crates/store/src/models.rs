@@ -17,6 +17,8 @@ pub struct Wallet {
     pub sealed_ciphertext: Vec<u8>,
     pub sealed_nonce: Vec<u8>,
     pub sealed_salt: Vec<u8>,
+    /// Scheme version tag for the sealed HD seed. See `octo_crypto::SCHEME_V1`.
+    pub sealed_scheme: i16,
     pub next_muxed_id: i64,
     pub label: Option<String>,
     pub user_id: Option<Uuid>,
@@ -101,6 +103,20 @@ pub struct WebhookEndpoint {
     pub created_at: DateTime<Utc>,
 }
 
+/// A single webhook delivery attempt (append-only log).
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct WebhookDelivery {
+    pub id: Uuid,
+    pub endpoint_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempts: i32,
+    pub response_code: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// An audit-log entry (append-only record of account activity).
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct AuditLog {
@@ -135,6 +151,20 @@ pub struct SponsoredTransaction {
     pub status: String,
     /// Horizon error detail on failure; ops-only, never returned to callers.
     pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A row in the token deny-list (JWT revocation record).
+///
+/// Only the SHA-256 hash of the token is stored — never the raw token itself.
+#[derive(Debug, Clone, FromRow)]
+pub struct DenylistedToken {
+    /// SHA-256 hex of the raw JWT.
+    pub token_hash: String,
+    /// Mirrors the token's `exp` claim; used for safe pruning.
+    pub expires_at: DateTime<Utc>,
+    /// The user who revoked the token.
+    pub user_id: Uuid,
     pub created_at: DateTime<Utc>,
 }
 

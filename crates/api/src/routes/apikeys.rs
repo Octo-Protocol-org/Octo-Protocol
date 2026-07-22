@@ -39,7 +39,7 @@ async fn owned_wallet(
     headers: &HeaderMap,
     wallet_id: Uuid,
 ) -> Result<octo_store::Wallet, ApiError> {
-    let user_id = authenticate(headers, state)?;
+    let user_id = authenticate(headers, state).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.user_id != Some(user_id) {
         // Don't reveal existence of someone else's wallet.
@@ -98,6 +98,37 @@ pub async fn generate_key(
         prefix,
     });
     Ok((code, json))
+}
+
+/// `DELETE /v1/wallets/:id/api-key` — revoke the wallet's API key without regenerating.
+///
+/// Dashboard JWT only (not an API key). A no-op if no key exists.
+pub async fn delete_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<&'static str>>> {
+    let wallet = owned_wallet(&state, &headers, id).await?;
+
+    state
+        .store()
+        .delete_api_key(id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    if let Some(uid) = wallet.user_id {
+        crate::audit::record(
+            &state,
+            uid,
+            "revoked API key",
+            crate::audit::category::CREDENTIALS,
+            wallet.label.as_deref(),
+            &headers,
+        )
+        .await;
+    }
+
+    Ok(Envelope::ok("api key revoked"))
 }
 
 /// `GET /v1/wallets/:id/api-key` — key metadata (prefix + whether configured). Never the secret.

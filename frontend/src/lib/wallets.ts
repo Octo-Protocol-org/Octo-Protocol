@@ -48,6 +48,13 @@ export type Transaction = {
   created_at: string;
 };
 
+/** Generic paginated response returned by list endpoints. */
+export type Page<T> = {
+  data: T[];
+  /** Pass back as `before` to fetch the next page; null when there are no more. */
+  next_cursor: string | null;
+};
+
 /** Create a master wallet. The server picks the network; name/description optional. */
 export function createWallet(
   token: string,
@@ -64,9 +71,13 @@ export function createWallet(
   });
 }
 
-/** List the authenticated user's wallets. */
-export function listWallets(token: string) {
-  return apiFetch<WalletView[]>("/v1/wallets", { token });
+/** List the authenticated user's wallets (first page, newest first). */
+export function listWallets(token: string, cursor?: string) {
+  const params = new URLSearchParams({ limit: "50" });
+  if (cursor) params.set("before", cursor);
+  return apiFetch<Page<WalletView>>(`/v1/wallets?${params.toString()}`, {
+    token,
+  });
 }
 
 export function getWallet(token: string, id: string) {
@@ -77,8 +88,14 @@ export function getBalances(token: string, id: string) {
   return apiFetch<Balance[]>(`/v1/wallets/${id}/balances`, { token });
 }
 
-export function listAddresses(token: string, id: string) {
-  return apiFetch<Address[]>(`/v1/wallets/${id}/addresses`, { token });
+/** List addresses for a wallet (paginated, newest first). */
+export function listAddresses(token: string, id: string, cursor?: string) {
+  const params = new URLSearchParams({ limit: "50" });
+  if (cursor) params.set("before", cursor);
+  return apiFetch<Page<Address>>(
+    `/v1/wallets/${id}/addresses?${params.toString()}`,
+    { token },
+  );
 }
 
 export function createAddress(
@@ -93,8 +110,14 @@ export function createAddress(
   });
 }
 
-export function listTransactions(token: string, id: string) {
-  return apiFetch<Transaction[]>(`/v1/wallets/${id}/transactions`, { token });
+/** List transactions for a wallet (paginated, newest first). */
+export function listTransactions(token: string, id: string, cursor?: string) {
+  const params = new URLSearchParams({ limit: "50" });
+  if (cursor) params.set("before", cursor);
+  return apiFetch<Page<Transaction>>(
+    `/v1/wallets/${id}/transactions?${params.toString()}`,
+    { token },
+  );
 }
 
 /** Format integer stroops as a decimal XLM-style string (7 dp). */
@@ -160,4 +183,3 @@ export function generateApiKey(token: string, id: string) {
     token,
   });
 }
-

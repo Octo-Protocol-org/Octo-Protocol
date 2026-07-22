@@ -23,12 +23,15 @@ pub struct Event {
     pub data: serde_json::Value,
 }
 
+pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Sends signed webhooks for a wallet's active endpoints, with retry + delivery logging.
 #[derive(Clone)]
 pub struct WebhookSender {
     store: Store,
     http: reqwest::Client,
     max_attempts: u32,
+    delivery_timeout: Duration,
 }
 
 impl WebhookSender {
@@ -40,7 +43,14 @@ impl WebhookSender {
                 .build()
                 .unwrap_or_default(),
             max_attempts: 3,
+            delivery_timeout: DEFAULT_DELIVERY_TIMEOUT,
         }
+    }
+
+    /// Set a custom total delivery timeout ceiling per endpoint attempt (default is 20s).
+    pub fn with_delivery_timeout(mut self, timeout: Duration) -> Self {
+        self.delivery_timeout = timeout;
+        self
     }
 
     /// Deliver `event` to every active endpoint of `wallet_id`. Best-effort per endpoint: a failing
@@ -91,57 +101,91 @@ impl WebhookSender {
     ) -> bool {
         let signature = sign::sign(ep.secret.as_bytes(), body_bytes);
         let mut last_code: Option<i32> = None;
+        let mut attempts_made = 0;
 
-        for attempt in 1..=self.max_attempts {
-            let resp = self
-                .http
-                .post(&ep.url)
-                .header("content-type", "application/json")
-                .header(sign::SIGNATURE_HEADER, &signature)
-                .body(body_bytes.to_vec())
-                .send()
-                .await;
+        let res = tokio::time::timeout(self.delivery_timeout, async {
+            for attempt in 1..=self.max_attempts {
+                attempts_made = attempt;
+                let resp = self
+                    .http
+                    .post(&ep.url)
+                    .header("content-type", "application/json")
+                    .header(sign::SIGNATURE_HEADER, &signature)
+                    .body(body_bytes.to_vec())
+                    .send()
+                    .await;
 
-            match resp {
-                Ok(r) => {
-                    let code = r.status().as_u16() as i32;
-                    last_code = Some(code);
-                    if r.status().is_success() {
-                        let _ = self
-                            .store
-                            .log_webhook_delivery(
-                                ep.id,
-                                event_type,
-                                body,
-                                "delivered",
-                                attempt as i32,
-                                Some(code),
-                            )
-                            .await;
-                        return true;
+                match resp {
+                    Ok(r) => {
+                        let code = r.status().as_u16() as i32;
+                        last_code = Some(code);
+                        if r.status().is_success() {
+                            return Ok(attempt);
+                        }
                     }
+                    Err(_) => last_code = None,
                 }
-                Err(_) => last_code = None,
-            }
 
-            if attempt < self.max_attempts {
-                // Exponential backoff: 1s, 2s, ...
-                tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+                if attempt < self.max_attempts {
+                    // Exponential backoff: 1s, 2s, ...
+                    tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+                }
+            }
+            Err(())
+        })
+        .await;
+
+        match res {
+            Ok(Ok(successful_attempt)) => {
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "delivered",
+                        successful_attempt as i32,
+                        last_code,
+                    )
+                    .await;
+                true
+            }
+            Ok(Err(())) => {
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "failed",
+                        self.max_attempts as i32,
+                        last_code,
+                    )
+                    .await;
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    endpoint_id = %ep.id,
+                    url = %ep.url,
+                    timeout_secs = self.delivery_timeout.as_secs(),
+                    "webhook delivery attempt exceeded overall deadline"
+                );
+                let attempts = if attempts_made > 0 { attempts_made as i32 } else { 1 };
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "failed",
+                        attempts,
+                        last_code,
+                    )
+                    .await;
+                false
             }
         }
-
-        let _ = self
-            .store
-            .log_webhook_delivery(
-                ep.id,
-                event_type,
-                body,
-                "failed",
-                self.max_attempts as i32,
-                last_code,
-            )
-            .await;
-        false
     }
 }
 
@@ -163,10 +207,11 @@ pub fn is_safe_url(url: &str) -> bool {
         Some((_, rest)) => rest,
         None => return false,
     };
-    let host = after_scheme
+    let raw_host = after_scheme
         .split(['/', ':', '?', '#'])
         .next()
         .unwrap_or("");
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
 
     if host.is_empty() {
         return false;
@@ -199,7 +244,31 @@ pub fn is_safe_url(url: &str) -> bool {
             }
         }
     }
-    true
+    // IPv4 100.64.0.0/10 (carrier-grade NAT)
+if host.starts_with("100.") {
+    if let Some(rest) = host.strip_prefix("100.") {
+        if let Some(second) = rest.split('.').next() {
+            if let Ok(n) = second.parse::<u8>() {
+                if (64..=127).contains(&n) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+// IPv6 checks (loopback, link-local, unique-local)
+if host.contains(":") {
+    if host == "::1" || host == "::" {
+        return false;
+    }
+    if host.starts_with("fe80:") {
+        return false;
+    }
+    if host.starts_with("fc") || host.starts_with("fd") {
+        return false;
+    }
+}
+true
 }
 
 #[cfg(test)]
@@ -230,4 +299,14 @@ mod tests {
         assert!(is_safe_url("http://172.15.0.1/x"));
         assert!(is_safe_url("http://172.32.0.1/x"));
     }
+
+    #[test]
+    fn blocks_ipv6_and_shared_address() {
+        assert!(!is_safe_url("http://[::1]/hook"));
+        assert!(!is_safe_url("http://[fe80::1]/hook"));
+        assert!(!is_safe_url("http://[fc00::1]/hook"));
+        assert!(!is_safe_url("http://[fd00::1]/hook"));
+        assert!(!is_safe_url("http://100.64.5.5/x"));
+    }
 }
+

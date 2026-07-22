@@ -1,9 +1,8 @@
 /**
  * Thin client for the octo REST API.
- *
- * All responses use the envelope `{ statusCode, message, data }`. `apiFetch` unwraps `data` on
- * success and throws an `ApiError` carrying the server message on failure.
  */
+
+import { clearToken } from "./auth";
 
 export const API_URL =
   process.env.NEXT_PUBLIC_OCTO_API_URL ?? "http://localhost:8080";
@@ -41,11 +40,19 @@ export async function apiFetch<T>(
   let body: Envelope<T> | null = null;
   try {
     body = (await res.json()) as Envelope<T>;
-  } catch {
-    // non-JSON response
-  }
+  } catch { }
 
   if (!res.ok) {
+    // Handling 401: Clear session and redirect to login
+    if (res.status === 401 && window.location.pathname !== "/login") {
+      clearToken(); // استعملنا الدالة اللي كاينه في auth.ts
+      
+      const currentPath = window.location.pathname + window.location.search;
+      window.location.href = `/login?redirect=${encodeURIComponent(currentPath)}`;
+      
+      return new Promise(() => {});
+    }
+
     throw new ApiError(body?.message ?? `Request failed (${res.status})`, res.status);
   }
   return body!.data;

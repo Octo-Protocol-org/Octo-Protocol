@@ -189,3 +189,60 @@ async fn payment_to_other_account_is_skipped() {
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
     assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn missing_amount_and_starting_balance_is_skipped() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // Neither `amount` nor `starting_balance` present: amount_str falls back to "", and
+    // amount::to_stroops("") must return None, so process() must skip cleanly rather than panic.
+    let mut rec = base_record("op-no-amount-1");
+    rec.amount = None;
+    rec.starting_balance = None;
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Skipped);
+    assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn credit_asset_with_missing_code_falls_back_to_unknown() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // A non-native asset_type with no asset_code must fall back to the literal "unknown" rather
+    // than panicking or leaving the field empty.
+    let mut rec = base_record("op-credit-no-code-1");
+    rec.asset_type = Some("credit_alphanum4".into());
+    rec.asset_code = None;
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: false });
+
+    let txs = store.list_transactions(wallet_id).await.unwrap();
+    assert_eq!(txs.len(), 1);
+    assert_eq!(txs[0].asset_code, "unknown");
+}
+
+#[tokio::test]
+async fn missing_transaction_field_yields_no_memo_and_no_panic() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // No joined `transaction` at all: memo_id()'s `self.transaction.as_ref()?` must short-circuit
+    // to None without panicking, and the recorded deposit must carry no memo/ledger.
+    let mut rec = base_record("op-no-tx-1");
+    rec.transaction = None;
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: false });
+
+    let txs = store.list_transactions(wallet_id).await.unwrap();
+    assert_eq!(txs.len(), 1);
+    assert_eq!(txs[0].memo_id, None);
+    assert_eq!(txs[0].ledger, None);
+}

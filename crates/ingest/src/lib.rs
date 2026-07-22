@@ -22,6 +22,39 @@ use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::time::Duration;
 use uuid::Uuid;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Shared thread-safe tracker for the last successful poll times of ingestion.
+#[derive(Debug, Clone, Default)]
+pub struct LastPollTracker {
+    last_polls: Arc<Mutex<HashMap<Uuid, i64>>>,
+}
+
+impl LastPollTracker {
+    /// Create a new empty `LastPollTracker`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a successful poll for a wallet.
+    pub fn record_success(&self, wallet_id: Uuid, timestamp: i64) {
+        if let Ok(mut map) = self.last_polls.lock() {
+            map.insert(wallet_id, timestamp);
+        }
+    }
+
+    /// Get the last successful poll timestamp (unix-seconds) for a wallet.
+    pub fn last_poll(&self, wallet_id: Uuid) -> Option<i64> {
+        self.last_polls.lock().ok().and_then(|map| map.get(&wallet_id).copied())
+    }
+
+    /// Get a copy of all tracked poll times.
+    pub fn all_last_polls(&self) -> HashMap<Uuid, i64> {
+        self.last_polls.lock().map(|map| map.clone()).unwrap_or_default()
+    }
+}
+
 
 /// Outcome of processing a single payment record.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,6 +74,7 @@ pub struct Ingestor {
     wallet_id: Uuid,
     account_g: String,
     webhooks: Option<WebhookSender>,
+    tracker: Option<LastPollTracker>,
 }
 
 impl Ingestor {
@@ -51,12 +85,38 @@ impl Ingestor {
             wallet_id,
             account_g,
             webhooks: None,
+            tracker: None,
+        }
+    }
+
+    /// Create an Ingestor with explicit resilience configuration (used by `Supervisor::tick`
+    /// when `bin/server` wires env-var resilience config through).
+    pub fn new_with_resilience(
+        store: Store,
+        horizon_url: &str,
+        wallet_id: Uuid,
+        account_g: String,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
+    ) -> Self {
+        Self {
+            store,
+            horizon: HorizonPayments::with_resilience(horizon_url, retry, circuit),
+            wallet_id,
+            account_g,
+            webhooks: None,
         }
     }
 
     /// Attach a webhook sender so new deposits fire a `deposit.created` event.
     pub fn with_webhooks(mut self, sender: WebhookSender) -> Self {
         self.webhooks = Some(sender);
+        self
+    }
+
+    /// Attach a tracker to record successful poll times.
+    pub fn with_tracker(mut self, tracker: LastPollTracker) -> Self {
+        self.tracker = Some(tracker);
         self
     }
 
@@ -79,6 +139,15 @@ impl Ingestor {
                 .await?;
             count += 1;
         }
+
+        if let Some(ref tracker) = self.tracker {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            tracker.record_success(self.wallet_id, now);
+        }
+
         Ok(count)
     }
 
@@ -257,6 +326,7 @@ pub struct Supervisor {
     horizon_url: String,
     webhooks: WebhookSender,
     network: &'static str,
+    tracker: LastPollTracker,
 }
 
 impl Supervisor {
@@ -271,6 +341,7 @@ impl Supervisor {
             horizon_url,
             webhooks,
             network,
+            tracker: LastPollTracker::new(),
         }
     }
 
@@ -292,19 +363,36 @@ impl Supervisor {
             if w.network != self.network {
                 continue;
             }
-            let ingestor = Ingestor::new(
+            let ingestor = Ingestor::new_with_resilience(
                 self.store.clone(),
                 &self.horizon_url,
                 w.id,
                 w.stellar_account_g.clone(),
+                self.retry.clone(),
+                self.circuit.clone(),
             )
-            .with_webhooks(self.webhooks.clone());
+            .with_webhooks(self.webhooks.clone())
+            .with_tracker(self.tracker.clone());
             match ingestor.poll_once(page_limit).await {
                 Ok(n) => total += n,
                 Err(e) => tracing::warn!(wallet = %w.id, error = ?e, "wallet poll failed"),
             }
         }
         Ok(total)
+    }
+
+    /// Get a clone of the `LastPollTracker` to inspect poll lag.
+    ///
+    /// # Example
+    /// ```
+    /// # use octo_ingest::{Supervisor, LastPollTracker};
+    /// # // How a caller (like AppState or a health router) reads poll timestamps:
+    /// # // let supervisor: Supervisor = ...;
+    /// # // let tracker: LastPollTracker = supervisor.last_poll_tracker();
+    /// # // if let Some(ts) = tracker.last_poll(wallet_id) { ... }
+    /// ```
+    pub fn last_poll_tracker(&self) -> LastPollTracker {
+        self.tracker.clone()
     }
 }
 
@@ -392,5 +480,75 @@ mod tests {
             ledger: None,
         });
         assert_eq!(memo_id_of(&r), None);
+    }
+
+    // --- i64/u64 boundary tests -------------------------------------------
+    //
+    // muxed_id uses i64::try_from(decoded.id).ok() where decoded.id is u64.
+    // Any id above i64::MAX causes try_from to fail and the deposit becomes
+    // unattributed (None) rather than erroring. These tests lock that
+    // documented behavior in as an explicit regression guard.
+    //
+    // NOTE: if this silent-truncation behavior should change, do NOT fix it
+    // here — this file is test-only per issue #60. Raise the concern in the
+    // PR so a maintainer can decide (see the related backend tracking issue).
+
+    #[test]
+    fn muxed_id_at_i64_max_is_attributed() {
+        // i64::MAX fits in u64 and must round-trip through i64::try_from cleanly.
+        let muxed = octo_wallet_core::encode_muxed(BASE, i64::MAX as u64).unwrap();
+        let mut r = rec();
+        r.to_muxed = Some(muxed);
+        assert_eq!(
+            muxed_id_of(BASE, &r),
+            Some(i64::MAX),
+            "a muxed id of exactly i64::MAX must be attributed correctly"
+        );
+    }
+
+    #[test]
+    fn muxed_id_above_i64_max_is_unattributed_not_error() {
+        // i64::MAX + 1 overflows i64::try_from → must return None, not panic.
+        let above_max: u64 = i64::MAX as u64 + 1;
+        let muxed = octo_wallet_core::encode_muxed(BASE, above_max).unwrap();
+        let mut r = rec();
+        r.to_muxed = Some(muxed);
+        assert_eq!(
+            muxed_id_of(BASE, &r),
+            None,
+            "a muxed id above i64::MAX must be silently unattributed (current documented behavior)"
+        );
+    }
+
+    #[test]
+    fn memo_id_at_i64_max_is_attributed() {
+        // "9223372036854775807" is i64::MAX as a decimal string — must parse cleanly.
+        let mut r = rec();
+        r.transaction = Some(TransactionRecord {
+            memo_type: Some("id".into()),
+            memo: Some("9223372036854775807".into()), // i64::MAX
+            ledger: Some(1),
+        });
+        assert_eq!(
+            memo_id_of(&r),
+            Some(i64::MAX),
+            "memo string equal to i64::MAX must be attributed correctly"
+        );
+    }
+
+    #[test]
+    fn memo_id_above_i64_max_is_unattributed_not_error() {
+        // "9223372036854775808" is i64::MAX + 1 — parse::<i64>() fails → must return None.
+        let mut r = rec();
+        r.transaction = Some(TransactionRecord {
+            memo_type: Some("id".into()),
+            memo: Some("9223372036854775808".into()), // i64::MAX + 1
+            ledger: Some(1),
+        });
+        assert_eq!(
+            memo_id_of(&r),
+            None,
+            "memo string one above i64::MAX must be silently unattributed (current documented behavior)"
+        );
     }
 }

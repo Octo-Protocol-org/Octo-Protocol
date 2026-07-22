@@ -37,6 +37,9 @@ the `G...` + numeric-memo fallback for senders that don't support muxed.
 payment is attributed to a customer by its **muxed id** or **memo id**, recorded as a `deposit`
 transaction, and a signed webhook fires.
 
+For the full contract around cursor resume, dedup, reorg handling, and the quarantine path
+see [`docs/ingest-integration.md`](ingest-integration.md).
+
 ### Withdraw
 `api` → `wallet-core` decrypts the seed in-memory, derives the key, signs a payment op, **zeroizes**
 → submit via Horizon → record + webhook on confirmation.
