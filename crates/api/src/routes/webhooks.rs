@@ -114,19 +114,6 @@ fn generate_secret() -> String {
     format!("{a}{b}")
 }
 
-#[derive(Debug, Serialize)]
-pub struct WebhookDeliveryView {
-    pub id: Uuid,
-    pub endpoint_id: Uuid,
-    pub event_type: String,
-    pub payload: serde_json::Value,
-    pub status: String,
-    pub attempts: i32,
-    pub response_code: Option<i32>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// `GET /v1/wallets/:id/webhooks`
 pub async fn list_webhooks(
     State(state): State<AppState>,
@@ -152,41 +139,22 @@ pub async fn list_webhooks(
     Ok(Envelope::ok(views))
 }
 
-/// `GET /v1/wallets/:id/webhooks/:endpoint_id/deliveries`
-pub async fn list_deliveries(
+/// `DELETE /v1/wallets/:id/webhooks/:endpoint_id` — deactivate an endpoint so it stops receiving
+/// deliveries. Idempotent: deactivating an already-inactive endpoint still returns 200.
+pub async fn delete_webhook(
     State(state): State<AppState>,
     Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-) -> ApiResult<Json<Envelope<Vec<WebhookDeliveryView>>>> {
+) -> ApiResult<StatusCode> {
     authorize_wallet(&headers, &state, wallet_id).await?;
 
-    // Confirm the wallet exists (404 otherwise).
-    let _ = state.store().get_wallet(wallet_id).await?;
-
-    // Confirm the endpoint exists and belongs to the wallet.
+    // Don't leak whether the endpoint exists under a different wallet.
     let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
     if endpoint.wallet_id != wallet_id {
         return Err(ApiError::NotFound);
     }
 
-    // Retrieve deliveries (limit to last 50).
-    let deliveries = state.store().list_webhook_deliveries(endpoint_id, 50).await?;
-
-    let views: Vec<WebhookDeliveryView> = deliveries
-        .into_iter()
-        .map(|d| WebhookDeliveryView {
-            id: d.id,
-            endpoint_id: d.endpoint_id,
-            event_type: d.event_type,
-            payload: d.payload,
-            status: d.status,
-            attempts: d.attempts,
-            response_code: d.response_code,
-            created_at: d.created_at,
-            updated_at: d.updated_at,
-        })
-        .collect();
-
-    Ok(Envelope::ok(views))
+    state.store().deactivate_webhook_endpoint(endpoint_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 

@@ -17,7 +17,7 @@
 //! does not apply here.
 
 use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Errors talking to Horizon.
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +31,7 @@ pub enum HorizonError {
 }
 
 /// One payment record from Horizon (the fields octo needs).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PaymentRecord {
     /// The operation TOID — globally unique; used as the idempotent dedup key.
     pub id: String,
@@ -68,7 +68,7 @@ pub struct PaymentRecord {
 }
 
 /// The joined transaction fields we use.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransactionRecord {
     #[serde(default)]
     pub memo_type: Option<String>,
@@ -201,5 +201,13 @@ impl std::fmt::Display for IngestFetchError {
             Self::Decode => write!(f, "decode error"),
             Self::Permanent => write!(f, "permanent error"),
         }
+    }
+}
+
+impl octo_resilience::Retriable for IngestFetchError {
+    fn is_retriable(&self) -> bool {
+        // Only transient transport/5xx failures are retried; a permanent error or an unparseable
+        // body is a definitive outcome that retrying wouldn't change.
+        matches!(self, IngestFetchError::Transport)
     }
 }

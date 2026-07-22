@@ -13,7 +13,12 @@
 //!   without missing or double-processing.
 #![forbid(unsafe_code)]
 
-pub mod amount;
+/// Decimal-amount parsing lives in `wallet-core` so the API's withdrawal pre-flight balance
+/// check and this ingest path share one implementation. Re-exported here to keep the
+/// `octo_ingest::amount::to_stroops` path working for existing callers.
+pub mod amount {
+    pub use octo_wallet_core::amount::to_stroops;
+}
 pub mod horizon;
 
 use horizon::{HorizonPayments, PaymentRecord};
@@ -105,6 +110,7 @@ impl Ingestor {
             wallet_id,
             account_g,
             webhooks: None,
+            tracker: None,
         }
     }
 
@@ -327,14 +333,39 @@ pub struct Supervisor {
     webhooks: WebhookSender,
     network: &'static str,
     tracker: LastPollTracker,
+    retry: octo_resilience::RetryPolicy,
+    circuit: octo_resilience::CircuitBreaker,
 }
 
 impl Supervisor {
+    /// Construct a supervisor with default Horizon resilience settings (retry policy + a fresh
+    /// circuit breaker). `bin/server` uses [`Supervisor::new_with_resilience`] to pass env-configured
+    /// values instead.
     pub fn new(
         store: Store,
         horizon_url: String,
         webhooks: WebhookSender,
         network: &'static str,
+    ) -> Self {
+        Self::new_with_resilience(
+            store,
+            horizon_url,
+            webhooks,
+            network,
+            octo_resilience::RetryPolicy::default(),
+            octo_resilience::CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
+        )
+    }
+
+    /// Construct a supervisor with explicit Horizon resilience configuration. Each supervisor owns
+    /// its own circuit-breaker instance so ingest failures are counted independently of the API's.
+    pub fn new_with_resilience(
+        store: Store,
+        horizon_url: String,
+        webhooks: WebhookSender,
+        network: &'static str,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
     ) -> Self {
         Self {
             store,
@@ -342,6 +373,8 @@ impl Supervisor {
             webhooks,
             network,
             tracker: LastPollTracker::new(),
+            retry,
+            circuit,
         }
     }
 

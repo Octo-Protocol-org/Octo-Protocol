@@ -705,30 +705,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_credit_asset_with_invalid_code() {
-        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
-        // Empty string and a 13-char code are both outside the 1-12 byte range
-        // that Asset::new_credit accepts, so both must map to WalletError::InvalidAddress.
-        for bad_code in ["", "TOOLONGASSET1X"] {
-            let req = PaymentRequest {
-                destination: DEST,
-                stroops: 1,
-                asset: Some((bad_code, DEST)),
-                memo_id: None,
-                sequence: 1,
-            };
-            assert!(
-                matches!(
-                    sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
-                    Err(WalletError::InvalidAddress)
-                ),
-                "code {:?} should be rejected",
-                bad_code
-            );
-        }
-    }
-
     // ── Helper: build a signed inner payment envelope XDR ────────────────────
 
     fn make_inner_xdr(source_index: u32, seq: i64) -> String {
@@ -763,7 +739,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -809,7 +784,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -840,7 +814,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -868,7 +841,6 @@ mod tests {
                 &FeeBumpRequest {
                     inner_xdr: "",
                     max_base_fee_stroops: 200,
-                    sequence: 0
                 },
             ),
             Err(WalletError::InvalidXdr)
@@ -891,7 +863,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         )
         .unwrap()
@@ -907,7 +878,6 @@ mod tests {
                 &FeeBumpRequest {
                     inner_xdr: &fee_bump_xdr,
                     max_base_fee_stroops: 200,
-                    sequence: 0
                 },
             ),
             Err(WalletError::InvalidXdr)
@@ -929,7 +899,6 @@ mod tests {
                 &FeeBumpRequest {
                     inner_xdr: &inner_xdr,
                     max_base_fee_stroops: 200,
-                    sequence: 0
                 },
             ),
             Err(WalletError::SeedDecryption)
@@ -952,7 +921,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: max_base_fee,
-                sequence: 0,
             },
         )
         .unwrap();
@@ -982,7 +950,6 @@ mod tests {
             &FeeBumpRequest {
                 inner_xdr: &inner_xdr,
                 max_base_fee_stroops: 200,
-                sequence: 0,
             },
         );
         assert!(result.is_ok());

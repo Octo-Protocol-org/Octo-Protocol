@@ -91,7 +91,7 @@ async fn fresh_ingestor(store: &Store) -> (Ingestor, Uuid) {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            label: None,
+            sealed_scheme: 1,            label: None,
             user_id: None,
             description: None,
         })
@@ -166,7 +166,7 @@ async fn assert_exactly_distinct_recorded(
     sequence: &[usize],
 ) {
     let distinct: BTreeSet<usize> = sequence.iter().copied().collect();
-    let txs = store.list_transactions(wallet_id).await.expect("list");
+    let txs = store.list_transactions(wallet_id, 100, None).await.expect("list");
     assert_eq!(
         txs.len(),
         distinct.len(),

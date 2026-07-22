@@ -69,7 +69,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            label: Some("testnet-wallet"),
+            sealed_scheme: 1,            label: Some("testnet-wallet"),
             user_id: None,
             description: None,
         })
@@ -83,7 +83,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            label: Some("mainnet-wallet"),
+            sealed_scheme: 1,            label: Some("mainnet-wallet"),
             user_id: None,
             description: None,
         })

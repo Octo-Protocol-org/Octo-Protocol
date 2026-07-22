@@ -39,7 +39,7 @@ async fn setup() -> Option<(Store, Ingestor, Uuid)> {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            label: None,
+            sealed_scheme: 1,            label: None,
             user_id: None,
             description: None,
         })
@@ -96,7 +96,7 @@ async fn deposit_to_muxed_address_is_attributed() {
     assert_eq!(outcome, Processed::Recorded { attributed: true });
 
     // The recorded transaction links to the customer address.
-    let txs = store.list_transactions(wallet_id).await.unwrap();
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0].address_id, Some(addr.id));
     assert_eq!(txs[0].amount_stroops, 50_000_000);
@@ -128,7 +128,7 @@ async fn deposit_with_memo_id_is_attributed() {
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: true });
-    let txs = store.list_transactions(wallet_id).await.unwrap();
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
     assert_eq!(txs[0].address_id, Some(addr.id));
     assert_eq!(txs[0].memo_id, Some(addr.muxed_id));
 }
@@ -144,7 +144,7 @@ async fn unattributed_deposit_is_quarantined() {
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: false });
 
-    let txs = store.list_transactions(wallet_id).await.unwrap();
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0].address_id, None, "unattributed → quarantined");
 }
@@ -163,7 +163,7 @@ async fn duplicate_operation_is_idempotent() {
     // Same Horizon op id again → no double-credit.
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Duplicate);
 
-    assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 1);
+    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -175,7 +175,7 @@ async fn failed_tx_is_skipped() {
     let mut rec = base_record("op-failed-1");
     rec.transaction_successful = false;
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
-    assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 0);
+    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -187,7 +187,7 @@ async fn payment_to_other_account_is_skipped() {
     let mut rec = base_record("op-other-1");
     rec.to = Some("GSOMEOTHERACCOUNT".into());
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
-    assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 0);
+    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -204,7 +204,7 @@ async fn missing_amount_and_starting_balance_is_skipped() {
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Skipped);
-    assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 0);
+    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -222,7 +222,7 @@ async fn credit_asset_with_missing_code_falls_back_to_unknown() {
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: false });
 
-    let txs = store.list_transactions(wallet_id).await.unwrap();
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0].asset_code, "unknown");
 }
@@ -241,7 +241,7 @@ async fn missing_transaction_field_yields_no_memo_and_no_panic() {
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: false });
 
-    let txs = store.list_transactions(wallet_id).await.unwrap();
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0].memo_id, None);
     assert_eq!(txs[0].ledger, None);

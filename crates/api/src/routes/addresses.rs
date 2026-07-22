@@ -5,7 +5,7 @@
 //! `docs/deposit-model.md`).
 
 use crate::auth::authorize_wallet;
-use crate::error::{ApiError, ApiResult, Envelope};
+use crate::error::{ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::routes::wallets::ListParams;
 use crate::state::AppState;
@@ -131,6 +131,7 @@ pub async fn list_addresses(
     }
     let next_cursor = if has_more { items.last().map(|a| a.id) } else { None };
 
+    let base = wallet.stellar_account_g.clone();
     let views = items
         .into_iter()
         .map(|a| AddressView {

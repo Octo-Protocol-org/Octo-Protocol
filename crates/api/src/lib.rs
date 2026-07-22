@@ -16,10 +16,13 @@ mod state;
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
-use axum::routing::{delete, get, post};
+use axum::extract::Request;
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::limit::RequestBodyLimitLayer;
 
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
 ///
@@ -36,7 +39,6 @@ pub fn build_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT))
         .route("/health", get(health))
         .route("/v1/auth/signup", post(auth::signup))
         .route("/v1/auth/login", post(auth::login))
@@ -74,10 +76,6 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::delete(routes::webhooks::delete_webhook),
         )
         .route(
-            "/v1/wallets/:id/webhooks/:endpoint_id/deliveries",
-            get(routes::webhooks::list_deliveries),
-        )
-        .route(
             "/v1/wallets/:id/api-key",
             post(routes::apikeys::generate_key)
                 .get(routes::apikeys::get_key)
@@ -96,11 +94,11 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
         )
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_errors))
-                .layer(cors),
-        )
+        // Enforce the request-body ceiling ahead of every handler and return the oversize
+        // rejection in the standard envelope (a bare `RequestBodyLimitLayer` would answer with a
+        // plain, un-enveloped 413).
+        .layer(middleware::from_fn(enforce_body_limit))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -109,13 +107,18 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Custom error handler to wrap oversized body rejections (413) in the standard envelope.
-async fn handle_errors(err: BoxError) -> Response {
-    if err.is::<tower::timeout::error::Elapsed>() {
-        return (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response();
-    }
+/// Reject any request whose declared `Content-Length` exceeds [`REQUEST_BODY_LIMIT`], answering
+/// with a `413` in the standard envelope. Requests without a `Content-Length` fall through to the
+/// handler, where the `Bytes`/`Json` extractor's own body cap still bounds them.
+async fn enforce_body_limit(req: Request, next: Next) -> Response {
+    let over_limit = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|len| len > REQUEST_BODY_LIMIT);
 
-    if err.is::<axum::extract::rejection::PayloadTooLarge>() {
+    if over_limit {
         return error::Envelope::error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Request body too large".to_string(),
@@ -124,9 +127,5 @@ async fn handle_errors(err: BoxError) -> Response {
         .into_response();
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Unhandled internal error: {}", err),
-    )
-        .into_response()
+    next.run(req).await
 }

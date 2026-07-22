@@ -207,11 +207,20 @@ pub fn is_safe_url(url: &str) -> bool {
         Some((_, rest)) => rest,
         None => return false,
     };
-    let raw_host = after_scheme
-        .split(['/', ':', '?', '#'])
-        .next()
-        .unwrap_or("");
-    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    // A bracketed IPv6 literal (`[::1]`, `[fe80::1]:9000`) must be extracted whole: splitting on
+    // ':' the way we do for host:port would chop the address at its first internal colon and
+    // defeat every IPv6 block below.
+    let host = if let Some(rest) = after_scheme.strip_prefix('[') {
+        match rest.split(']').next().filter(|h| !h.is_empty()) {
+            Some(h) => h,
+            None => return false,
+        }
+    } else {
+        after_scheme
+            .split(['/', ':', '?', '#'])
+            .next()
+            .unwrap_or("")
+    };
 
     if host.is_empty() {
         return false;

@@ -120,3 +120,23 @@ impl<T: Serialize> Envelope<T> {
         )
     }
 }
+
+impl Envelope<Option<serde_json::Value>> {
+    /// Build an error response in the standard envelope. Used by middleware-level handlers (e.g.
+    /// the body-size-limit `HandleErrorLayer`) that produce a response outside the normal
+    /// `ApiError` path. `status` sets both the HTTP status and the envelope `statusCode`.
+    pub fn error(
+        status: StatusCode,
+        message: String,
+        data: Option<serde_json::Value>,
+    ) -> (StatusCode, Json<Envelope<Option<serde_json::Value>>>) {
+        (
+            status,
+            Json(Envelope {
+                status_code: status.as_u16(),
+                message,
+                data,
+            }),
+        )
+    }
+}

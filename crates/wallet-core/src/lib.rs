@@ -17,6 +17,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod address;
+pub mod amount;
 pub mod asset;
 pub mod derive;
 mod error;
@@ -26,6 +27,7 @@ pub mod signer;
 pub use address::{
     decode_muxed, deposit_address, encode_muxed, is_valid_account, DecodedMuxed, DepositAddress,
 };
+pub use amount::to_stroops;
 pub use asset::is_valid_asset_code;
 pub use derive::WalletSeed;
 pub use error::WalletError;

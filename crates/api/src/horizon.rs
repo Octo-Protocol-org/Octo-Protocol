@@ -115,19 +115,14 @@ pub fn has_trustline(balances: &[Balance], code: &str, issuer: &str) -> bool {
 
 /// Parse a Horizon decimal amount string (e.g. `"100.0000000"`) into integer stroops without
 /// going through floating point (avoids rounding error near balance/reserve boundaries).
+///
+/// Delegates to the shared `wallet-core` helper rather than re-deriving the digit-by-digit
+/// parse: that implementation uses checked arithmetic (an absurdly large balance string yields
+/// `None` instead of overflowing) and rejects negatives and over-precise input outright. Every
+/// caller here treats `None` as "no usable balance", so malformed input fails closed into a
+/// rejected withdrawal rather than a bogus stroops figure.
 fn parse_amount_stroops(s: &str) -> Option<i64> {
-    let (whole, frac) = match s.split_once('.') {
-        Some((w, f)) => (w, f),
-        None => (s, ""),
-    };
-    let whole: i64 = whole.parse().ok()?;
-    let mut frac = frac.to_string();
-    while frac.len() < 7 {
-        frac.push('0');
-    }
-    frac.truncate(7);
-    let frac: i64 = frac.parse().ok()?;
-    Some(whole * 10_000_000 + frac)
+    octo_wallet_core::amount::to_stroops(s)
 }
 
 /// The result of submitting a transaction to Horizon.
@@ -244,30 +239,47 @@ impl Horizon {
             self.base_url.trim_end_matches('/'),
             account_g
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ApiError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(ApiError::Internal);
-        }
-        let account: AccountResponse = resp.json().await.map_err(|_| ApiError::Internal)?;
-        let sequence = account
-            .sequence
-            .parse::<i64>()
-            .map_err(|_| ApiError::Internal)?;
-        Ok(AccountInfo {
-            balances: account.balances,
-            sequence,
-            subentry_count: account.subentry_count,
-            num_sponsoring: account.num_sponsoring,
-            num_sponsored: account.num_sponsored,
+        let http = self.http.clone();
+        // Retried on transient 5xx/transport failures under the same circuit breaker as
+        // `balances` — the withdrawal pre-flight depends on this call, so a blip on the way to
+        // fetching balances/sequence shouldn't fail the whole withdrawal on the first try.
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let url = url.clone();
+            let http = http.clone();
+            async move {
+                let resp = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| FetchError::Transport)?;
+
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(FetchError::NotFound);
+                }
+                if resp.status().is_server_error() {
+                    return Err(FetchError::Transport); // retriable
+                }
+                if !resp.status().is_success() {
+                    return Err(FetchError::Permanent);
+                }
+                let account: AccountResponse =
+                    resp.json().await.map_err(|_| FetchError::Permanent)?;
+                let sequence = account
+                    .sequence
+                    .parse::<i64>()
+                    .map_err(|_| FetchError::Permanent)?;
+                Ok(AccountInfo {
+                    balances: account.balances,
+                    sequence,
+                    subentry_count: account.subentry_count,
+                    num_sponsoring: account.num_sponsoring,
+                    num_sponsored: account.num_sponsored,
+                })
+            }
         })
+        .await;
+
+        map_result(result)
     }
 
     /// Submit a signed transaction (base64 XDR envelope) to Horizon.
@@ -281,14 +293,8 @@ impl Horizon {
     /// caller can record the failure; only transport/HTTP errors return `Err`.
     pub async fn submit_transaction(&self, envelope_xdr: &str) -> Result<SubmitResult, ApiError> {
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .form(&[("tx", envelope_xdr)])
-            .timeout(SUBMIT_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
+        let http = self.http.clone();
+        let xdr = envelope_xdr.to_string();
 
         let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
             let url = url.clone();
@@ -298,6 +304,7 @@ impl Horizon {
                 let resp = http
                     .post(&url)
                     .form(&[("tx", &xdr)])
+                    .timeout(SUBMIT_TIMEOUT)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
@@ -358,6 +365,15 @@ impl std::fmt::Display for FetchError {
             Self::Permanent => write!(f, "permanent error"),
             Self::TxRejected => write!(f, "transaction rejected"),
         }
+    }
+}
+
+impl octo_resilience::Retriable for FetchError {
+    fn is_retriable(&self) -> bool {
+        // Only transient transport/5xx failures are worth retrying. A 404, an unparseable body,
+        // or a network-rejected transaction are definitive answers — retrying them (and counting
+        // them as circuit failures) would spuriously open the breaker.
+        matches!(self, FetchError::Transport)
     }
 }
 
@@ -424,6 +440,72 @@ mod tests {
         format!("http://{addr}")
     }
 
+    fn balance(asset_type: &str, code: Option<&str>, issuer: Option<&str>, amount: &str) -> Balance {
+        Balance {
+            asset_type: asset_type.to_string(),
+            asset_code: code.map(|c| c.to_string()),
+            asset_issuer: issuer.map(|i| i.to_string()),
+            balance: amount.to_string(),
+        }
+    }
+
+    fn account_with(balances: Vec<Balance>) -> AccountInfo {
+        AccountInfo {
+            balances,
+            sequence: 1,
+            subentry_count: 0,
+            num_sponsoring: 0,
+            num_sponsored: 0,
+        }
+    }
+
+    /// A balance string large enough to overflow `whole * 10_000_000` must yield "no usable
+    /// balance" rather than overflowing. The pre-flight check reads this as a zero balance and
+    /// rejects the withdrawal, which is the safe direction.
+    #[test]
+    fn absurd_balance_string_fails_closed_instead_of_overflowing() {
+        let acct = account_with(vec![balance("native", None, None, "922337203685477.5808")]);
+        assert_eq!(acct.native_balance_stroops(), 0);
+    }
+
+    /// Horizon should never report a negative balance, but if it does it must not parse into a
+    /// plausible-looking positive-ish figure the reserve arithmetic would then trust.
+    #[test]
+    fn negative_balance_string_fails_closed() {
+        let acct = account_with(vec![balance("native", None, None, "-1.5000000")]);
+        assert_eq!(acct.native_balance_stroops(), 0);
+    }
+
+    /// Over-precise input is rejected outright rather than silently truncated to 7 decimals.
+    #[test]
+    fn over_precise_balance_string_fails_closed() {
+        let acct = account_with(vec![balance("native", None, None, "1.23456789")]);
+        assert_eq!(acct.native_balance_stroops(), 0);
+    }
+
+    #[test]
+    fn well_formed_balances_still_parse() {
+        let acct = account_with(vec![
+            balance("native", None, None, "100.0000000"),
+            balance("credit_alphanum4", Some("USDC"), Some("GISSUER"), "42.5"),
+        ]);
+        assert_eq!(acct.native_balance_stroops(), 1_000_000_000);
+        assert_eq!(
+            acct.asset_balance_stroops("USDC", "GISSUER"),
+            Some(425_000_000)
+        );
+        assert_eq!(acct.asset_balance_stroops("USDC", "GOTHER"), None);
+    }
+
+    /// The reserve formula: 2 base entries + subentries, at 0.5 XLM each.
+    #[test]
+    fn min_reserve_tracks_subentry_count() {
+        let mut acct = account_with(vec![]);
+        assert_eq!(acct.min_reserve_stroops(), 10_000_000);
+        acct.subentry_count = 2;
+        assert_eq!(acct.min_reserve_stroops(), 20_000_000);
+    }
+
     #[tokio::test]
     async fn horizon_client_times_out_and_maps_to_internal_error() {
         let base_url = hanging_server().await;
@@ -433,6 +515,16 @@ mod tests {
                 .build()
                 .unwrap(),
             base_url,
+            // A single attempt + fresh breaker keeps this timeout test fast and focused on the
+            // transport-timeout -> ApiError::Internal mapping (no retry/backoff involved).
+            circuit: CircuitBreaker::new(5, Duration::from_secs(30)),
+            retry: RetryPolicy {
+                max_attempts: 1,
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+                multiplier: 1.0,
+                jitter_factor: 0.0,
+            },
         };
 
         let result = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;

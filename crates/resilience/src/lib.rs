@@ -252,7 +252,19 @@ pub enum CallKind {
 /// - `Ok(T)` — the call succeeded.
 /// - `Err(ResilienceError::Circuit)` — the circuit was open (no network call made).
 /// - `Err(ResilienceError::Exhausted(e))` — all attempts failed; `e` is the last error.
-pub async fn execute<F, Fut, T, E>(
+/// Whether a failed call should be retried and counted toward opening the circuit.
+///
+/// Permanent errors — a definitive `404`, an unparseable body, a transaction the network rejected
+/// on its merits — return `false`: [`execute`] answers with them immediately, does **not** retry,
+/// and does **not** record a circuit failure. Those outcomes mean the service gave a real answer,
+/// so counting them would spuriously open the breaker (e.g. two sequential lookups of a
+/// non-existent account must not look like an outage). Only genuinely transient errors (transport
+/// failures, 5xx) return `true`.
+pub trait Retriable {
+    fn is_retriable(&self) -> bool;
+}
+
+pub async fn execute<Fut, T, E>(
     circuit: &CircuitBreaker,
     policy: &RetryPolicy,
     kind: CallKind,
@@ -260,7 +272,7 @@ pub async fn execute<F, Fut, T, E>(
 ) -> Result<T, ResilienceError<E>>
 where
     Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
+    E: std::fmt::Debug + Retriable,
 {
     circuit.check().map_err(|_| ResilienceError::Circuit)?;
 
@@ -278,6 +290,11 @@ where
                 return Ok(val);
             }
             Err(e) => {
+                // A permanent error is a real answer, not a fault: return it straight away without
+                // retrying or tripping the breaker.
+                if !e.is_retriable() {
+                    return Err(ResilienceError::Exhausted(e));
+                }
                 circuit.on_failure();
                 // Re-check: if this failure just opened the circuit, stop retrying.
                 if circuit.check().is_err() {
@@ -397,6 +414,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    // These tests model transient failures, so their ad-hoc error types are always retriable.
+    impl Retriable for &str {
+        fn is_retriable(&self) -> bool {
+            true
+        }
+    }
+    impl Retriable for () {
+        fn is_retriable(&self) -> bool {
+            true
+        }
+    }
 
     // --- RetryPolicy ---------------------------------------------------------
 
@@ -605,7 +634,7 @@ mod tests {
         };
 
         // Open the circuit.
-        let _ = execute::<_, _, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
+        let _ = execute::<_, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
             Err("open it")
         })
         .await;

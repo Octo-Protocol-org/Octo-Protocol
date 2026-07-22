@@ -165,12 +165,14 @@ async fn test_oversized_body_returns_envelope() {
     // التحقق من أننا نرجع 413
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     
-    // التحقق من أن الجسم (body) يطابق الـ Envelope
+    // The 413 body must be the standard `{ statusCode, message, data }` envelope, not a plain
+    // string, so clients get a uniform error shape even for middleware-level rejections.
     let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-    let envelope: Envelope = serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
-    
-    assert_eq!(envelope.status_code, 413);
-    assert!(!envelope.message.is_empty());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
+
+    assert_eq!(envelope["statusCode"], 413);
+    assert!(!envelope["message"].as_str().unwrap_or("").is_empty());
 }
 
 #[tokio::test]
@@ -567,15 +569,6 @@ async fn api_key_for(app: &axum::Router, token: &str, wallet_id: &str) -> String
         .as_str()
         .unwrap()
         .to_string()
-}
-
-fn delete_auth(uri: &str, token: &str) -> Request<Body> {
-    Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
 }
 
 #[tokio::test]

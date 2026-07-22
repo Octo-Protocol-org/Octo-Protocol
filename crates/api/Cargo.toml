@@ -43,3 +43,6 @@ stellar-base.workspace = true
 dotenvy = "0.15"
 reqwest.workspace = true
 wiremock = "0.6"
+# OpenAPI drift check (see tests/drift_tests.rs): validate live responses against docs/openapi.yaml.
+serde_yaml = "0.9"
+jsonschema = "0.26"

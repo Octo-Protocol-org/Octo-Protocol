@@ -27,3 +27,4 @@ dotenvy = "0.15"
 axum.workspace = true
 octo-webhooks.workspace = true
 proptest.workspace = true
+wiremock = "0.6"
