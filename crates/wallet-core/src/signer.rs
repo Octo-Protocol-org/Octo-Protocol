@@ -30,6 +30,12 @@ pub enum StellarNetwork {
     Public,
     /// Test network.
     Testnet,
+    /// Local standalone network (Stellar quickstart default).
+    ///
+    /// Uses the well-known quickstart passphrase `"Standalone Network ; February 2017"` so that
+    /// contributors can run integration tests against a local Stellar node without depending on
+    /// public testnet availability or friendbot rate limits.
+    Standalone,
 }
 
 impl StellarNetwork {
@@ -37,6 +43,9 @@ impl StellarNetwork {
         match self {
             StellarNetwork::Public => Network::new_public(),
             StellarNetwork::Testnet => Network::new_test(),
+            StellarNetwork::Standalone => {
+                Network::new("Standalone Network ; February 2017".to_string())
+            }
         }
     }
 
@@ -45,22 +54,27 @@ impl StellarNetwork {
         match self {
             StellarNetwork::Public => b"octo:mainnet",
             StellarNetwork::Testnet => b"octo:testnet",
+            StellarNetwork::Standalone => b"octo:standalone",
         }
     }
 
-    /// The canonical lowercase name (`"mainnet"` / `"testnet"`) used in the DB and API.
+    /// The canonical lowercase name (`"mainnet"` / `"testnet"` / `"standalone"`) used in the DB
+    /// and API.
     pub fn as_str(self) -> &'static str {
         match self {
             StellarNetwork::Public => "mainnet",
             StellarNetwork::Testnet => "testnet",
+            StellarNetwork::Standalone => "standalone",
         }
     }
 
-    /// Parse from the canonical name. Accepts `mainnet`/`public` and `testnet`/`test`.
+    /// Parse from the canonical name. Accepts `mainnet`/`public`, `testnet`/`test`, and
+    /// `standalone`.
     pub fn parse(s: &str) -> Option<StellarNetwork> {
         match s {
             "mainnet" | "public" => Some(StellarNetwork::Public),
             "testnet" | "test" => Some(StellarNetwork::Testnet),
+            "standalone" => Some(StellarNetwork::Standalone),
             _ => None,
         }
     }
@@ -829,6 +843,66 @@ mod tests {
         assert!(
             result.is_ok(),
             "fee at exactly MIN_BASE_FEE (100 stroops) must be accepted"
+        );
+    }
+
+    // Issue #83: StellarNetwork::Standalone tests.
+    #[test]
+    fn standalone_network_round_trips_through_parse_and_as_str() {
+        assert_eq!(
+            StellarNetwork::parse("standalone"),
+            Some(StellarNetwork::Standalone)
+        );
+        assert_eq!(StellarNetwork::Standalone.as_str(), "standalone");
+        // Round-trip: parse -> as_str -> parse must yield the same variant.
+        let net = StellarNetwork::parse("standalone").unwrap();
+        assert_eq!(StellarNetwork::parse(net.as_str()), Some(net));
+    }
+
+    #[test]
+    fn standalone_crypto_context_differs_from_mainnet_and_testnet() {
+        let standalone_ctx = StellarNetwork::Standalone.crypto_context();
+        let mainnet_ctx = StellarNetwork::Public.crypto_context();
+        let testnet_ctx = StellarNetwork::Testnet.crypto_context();
+        assert_ne!(standalone_ctx, mainnet_ctx);
+        assert_ne!(standalone_ctx, testnet_ctx);
+        assert_ne!(mainnet_ctx, testnet_ctx);
+    }
+
+    #[test]
+    fn seed_sealed_for_standalone_cannot_open_under_testnet_or_mainnet() {
+        let (mk, sealed_standalone) = sealed_vector_seed(StellarNetwork::Standalone);
+        let req = PaymentRequest {
+            destination: DEST,
+            stroops: 1,
+            asset: None,
+            memo_id: None,
+            sequence: 1,
+        };
+        // Standalone-sealed seed must not open as testnet.
+        assert!(
+            matches!(
+                sign_payment(&mk, &sealed_standalone, StellarNetwork::Testnet, 0, &req),
+                Err(WalletError::SeedDecryption)
+            ),
+            "standalone seed opened as testnet must fail"
+        );
+        // Standalone-sealed seed must not open as mainnet.
+        assert!(
+            matches!(
+                sign_payment(&mk, &sealed_standalone, StellarNetwork::Public, 0, &req),
+                Err(WalletError::SeedDecryption)
+            ),
+            "standalone seed opened as mainnet must fail"
+        );
+        // Conversely, a testnet-sealed seed cannot be opened as standalone.
+        let (mk2, sealed_testnet) = sealed_vector_seed(StellarNetwork::Testnet);
+        assert!(
+            matches!(
+                sign_payment(&mk2, &sealed_testnet, StellarNetwork::Standalone, 0, &req),
+                Err(WalletError::SeedDecryption)
+            ),
+            "testnet seed opened as standalone must fail"
         );
     }
 }
