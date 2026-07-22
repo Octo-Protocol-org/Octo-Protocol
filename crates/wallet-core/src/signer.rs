@@ -208,16 +208,11 @@ pub fn sign_fee_bump(
         BytesM, DecoratedSignature, FeeBumpTransaction as XdrFeeBump, FeeBumpTransactionEnvelope,
         FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash, MuxedAccount, Signature,
         SignatureHint, TransactionEnvelope, TransactionSignaturePayload,
-        TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRDeserialize, XDRSerialize,
+        TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRSerialize,
     };
 
     // Parse and validate the inner XDR — must be a v1 TransactionEnvelope.
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(req.inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    let inner_v1 = match inner_env {
-        TransactionEnvelope::Tx(v1) => v1,
-        _ => return Err(WalletError::InvalidXdr),
-    };
+    let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
     let seed_bytes = open(master_key, sealed, network.crypto_context())?;
@@ -294,16 +289,11 @@ pub fn compute_inner_tx_hash(
 ) -> Result<[u8; 32], WalletError> {
     use sha2::{Digest, Sha256};
     use stellar_base::xdr::{
-        Hash, TransactionEnvelope, TransactionSignaturePayload,
-        TransactionSignaturePayloadTaggedTransaction, XDRDeserialize, XDRSerialize,
+        Hash, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+        XDRSerialize,
     };
 
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    let inner_tx = match inner_env {
-        TransactionEnvelope::Tx(v1) => v1.tx,
-        _ => return Err(WalletError::InvalidXdr),
-    };
+    let inner_tx = parse_inner_v1(inner_xdr)?.tx;
 
     let network_id_bytes = network.to_base().network_id();
     let network_hash: [u8; 32] = network_id_bytes
@@ -317,6 +307,23 @@ pub fn compute_inner_tx_hash(
     };
     let payload_xdr = sig_payload.xdr_bytes().map_err(|_| WalletError::Signing)?;
     Ok(Sha256::digest(&payload_xdr).into())
+}
+
+/// Parse a base64 XDR string and require it to be a v1 `TransactionEnvelope` (`Tx` variant).
+///
+/// Both `sign_fee_bump` and `compute_inner_tx_hash` need this same guard: the envelope must be
+/// a v1 Tx, not a fee-bump or the legacy v0 form. Centralising the check here ensures the two
+/// call sites cannot silently drift apart as the fee-bump path grows.
+fn parse_inner_v1(
+    inner_xdr: &str,
+) -> Result<stellar_base::xdr::TransactionV1Envelope, WalletError> {
+    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
+    let env =
+        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
+    match env {
+        TransactionEnvelope::Tx(v1) => Ok(v1),
+        _ => Err(WalletError::InvalidXdr),
+    }
 }
 
 /// Parse a destination that may be a `G...` account or an `M...` muxed address.
@@ -590,7 +597,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap();
 
@@ -631,7 +638,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap();
 
@@ -658,7 +665,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap();
 
@@ -682,7 +689,7 @@ mod tests {
                 &sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest { inner_xdr: "", max_base_fee_stroops: 200, sequence: 0 },
+                &FeeBumpRequest { inner_xdr: "", max_base_fee_stroops: 200 },
             ),
             Err(WalletError::InvalidXdr)
         ));
@@ -701,7 +708,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         )
         .unwrap()
         .envelope_xdr;
@@ -713,7 +720,7 @@ mod tests {
                 &sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest { inner_xdr: &fee_bump_xdr, max_base_fee_stroops: 200, sequence: 0 },
+                &FeeBumpRequest { inner_xdr: &fee_bump_xdr, max_base_fee_stroops: 200 },
             ),
             Err(WalletError::InvalidXdr)
         ));
@@ -731,7 +738,7 @@ mod tests {
                 &mainnet_sealed,
                 StellarNetwork::Testnet,
                 0,
-                &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+                &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
             ),
             Err(WalletError::SeedDecryption)
         ));
@@ -750,7 +757,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: max_base_fee, sequence: 0 },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: max_base_fee },
         )
         .unwrap();
 
@@ -776,7 +783,7 @@ mod tests {
             &sealed,
             StellarNetwork::Testnet,
             0,
-            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200, sequence: 0 },
+            &FeeBumpRequest { inner_xdr: &inner_xdr, max_base_fee_stroops: 200 },
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().source_account, MASTER_ACCOUNT_0);
