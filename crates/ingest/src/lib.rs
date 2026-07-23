@@ -25,6 +25,11 @@ use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// The widely-used testnet USDC issuer — must match `crates/api/src/routes/payment_links.rs`'s
+/// constant of the same name (kept separate rather than shared since this crate has no
+/// dependency on `octo-api`).
+const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
 /// Shared thread-safe tracker for the last successful poll times of ingestion.
 #[derive(Debug, Clone, Default)]
 pub struct LastPollTracker {
@@ -236,10 +241,53 @@ impl Ingestor {
         match self.store.record_deposit(&dep).await? {
             Some(tx) => {
                 self.fire_deposit_webhook(&tx).await;
+                self.confirm_payment_link(&tx).await;
                 Ok(Processed::Recorded { attributed })
             }
             None => Ok(Processed::Duplicate),
         }
+    }
+
+    /// If this deposit landed on a payment link's dedicated address, confirm its oldest pending
+    /// payment and fire `payment_link.paid`. Best-effort: a lookup miss just means it wasn't one.
+    async fn confirm_payment_link(&self, tx: &octo_store::Transaction) {
+        // v1 payment links are USDC-only — a deposit in any other asset (e.g. native XLM sent to
+        // the address by mistake) must not be mistaken for the USDC payment the link is waiting
+        // on, or the merchant's dashboard would report a payment they never actually received.
+        if tx.asset_code != "USDC" || tx.asset_issuer.as_deref() != Some(USDC_TESTNET_ISSUER) {
+            return;
+        }
+        let Some(address_id) = tx.address_id else { return };
+        let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await else {
+            return;
+        };
+        let Ok(Some(payment)) = self.store.oldest_pending_payment_link_payment(link.id).await
+        else {
+            return;
+        };
+        if self
+            .store
+            .confirm_payment_link_payment(payment.id, tx.id)
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let Some(sender) = &self.webhooks else { return };
+        let event = Event {
+            event_type: "payment_link.paid".to_string(),
+            data: serde_json::json!({
+                "payment_link_id": link.id,
+                "payment_id": payment.id,
+                "slug": link.slug,
+                "payer_name": payment.payer_name,
+                "payer_email": payment.payer_email,
+                "amount_usdc_stroops": payment.amount_usdc_stroops,
+                "stellar_tx_hash": tx.stellar_tx_hash,
+            }),
+        };
+        sender.dispatch(self.wallet_id, &event).await;
     }
 
     /// Fire a `deposit.created` webhook for a newly-recorded deposit. The event echoes the
@@ -384,30 +432,62 @@ impl Supervisor {
     }
 
     /// One supervision pass: poll every wallet on this network once.
+    ///
+    /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]), not one at a
+    /// time. Sequential polling meant a single slow/unfunded wallet's Horizon round-trip (or
+    /// retry-with-backoff) blocked every wallet behind it in the list — with hundreds of wallets,
+    /// a deposit on a late one could sit unprocessed for minutes despite the nominal poll
+    /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
+    /// request volume sane regardless of how many wallets exist.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
         let wallets = self.store.list_wallets().await?;
-        let mut total = 0;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
+        let mut tasks = tokio::task::JoinSet::new();
+
         for w in wallets {
             if w.network != self.network {
                 continue;
             }
-            let ingestor = Ingestor::new_with_resilience(
-                self.store.clone(),
-                &self.horizon_url,
-                w.id,
-                w.stellar_account_g.clone(),
-                self.retry.clone(),
-                self.circuit.clone(),
-            )
-            .with_webhooks(self.webhooks.clone())
-            .with_tracker(self.tracker.clone());
-            match ingestor.poll_once(page_limit).await {
-                Ok(n) => total += n,
-                Err(e) => tracing::warn!(wallet = %w.id, error = ?e, "wallet poll failed"),
+            let store = self.store.clone();
+            let horizon_url = self.horizon_url.clone();
+            let webhooks = self.webhooks.clone();
+            let tracker = self.tracker.clone();
+            let retry = self.retry.clone();
+            let circuit = self.circuit.clone();
+            let semaphore = semaphore.clone();
+            tasks.spawn(async move {
+                // Held for the duration of this wallet's poll; bounds how many Horizon requests
+                // are in flight at once without limiting how many wallets we *queue*.
+                let _permit = semaphore.acquire_owned().await;
+                let ingestor = Ingestor::new_with_resilience(
+                    store,
+                    &horizon_url,
+                    w.id,
+                    w.stellar_account_g.clone(),
+                    retry,
+                    circuit,
+                )
+                .with_webhooks(webhooks)
+                .with_tracker(tracker);
+                (w.id, ingestor.poll_once(page_limit).await)
+            });
+        }
+
+        let mut total = 0;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((_wallet_id, Ok(n))) => total += n,
+                Ok((wallet_id, Err(e))) => {
+                    tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed")
+                }
+                Err(e) => tracing::warn!(error = ?e, "wallet poll task panicked"),
             }
         }
         Ok(total)
     }
+
+    /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
+    const MAX_CONCURRENT_POLLS: usize = 20;
 
     /// Get a clone of the `LastPollTracker` to inspect poll lag.
     ///

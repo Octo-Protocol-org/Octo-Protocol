@@ -116,6 +116,49 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
         )
+        .route(
+            "/v1/wallets/:id/whitelist/config",
+            get(routes::whitelist::get_config).put(routes::whitelist::put_config),
+        )
+        .route(
+            "/v1/wallets/:id/whitelist",
+            get(routes::whitelist::list_addresses).post(routes::whitelist::add_address),
+        )
+        .route(
+            "/v1/wallets/:id/whitelist/:entry_id",
+            delete(routes::whitelist::remove_address),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links",
+            post(routes::payment_links::create_payment_link)
+                .get(routes::payment_links::list_payment_links),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id",
+            get(routes::payment_links::get_payment_link)
+                .put(routes::payment_links::set_payment_link_active),
+        )
+        // Public: no auth, reachable by anyone with the link.
+        .route(
+            "/v1/pay/:slug",
+            get(routes::payment_links::get_public_payment_link),
+        )
+        .route(
+            "/v1/pay/:slug/intent",
+            post(routes::payment_links::create_payment_intent),
+        )
+        .route(
+            "/v1/pay/:slug/payments/:payment_id",
+            get(routes::payment_links::get_payment_status),
+        )
+        .route(
+            "/v1/pay/:slug/signing-info",
+            get(routes::payment_links::public_signing_info),
+        )
+        .route(
+            "/v1/pay/:slug/submit-signed",
+            post(routes::payment_links::submit_payment),
+        )
         // axum's own body limit: it produces a real `LengthLimitError`-backed rejection that the
         // framework renders as 413, so no fallible tower layer (and no HandleErrorLayer) is
         // needed. tower_http's RequestBodyLimitLayer would require one and does not compose

@@ -80,6 +80,33 @@ pub async fn submit_signed(
     // Pure validation: v1 envelope, ≥1 signature, source == this wallet, op allowlist.
     let payment = validate_signed_xdr(&signed_xdr, &wallet.stellar_account_g)?;
 
+    // Withdrawal allowlist: if the wallet has opted in, a Payment/PathPayment destination must be
+    // pre-approved. Checked BEFORE anything touches Horizon, so a blocked send never reaches the
+    // network. Off by default (see migration 0013) — enabling this can never retroactively lock a
+    // wallet out of an address it already used.
+    if let Some(p) = &payment {
+        let allowlist_enabled = state
+            .store()
+            .get_withdrawal_allowlist_config(wallet_id)
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .is_some_and(|c| c.enabled);
+        if allowlist_enabled {
+            let base_destination = octo_wallet_core::to_base_account(&p.destination)
+                .map_err(|_| ApiError::BadRequest("destination is not a valid address".into()))?;
+            let ok = state
+                .store()
+                .is_address_whitelisted(wallet_id, &base_destination)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            if !ok {
+                return Err(ApiError::Forbidden(
+                    "destination is not on this wallet's withdrawal allowlist".into(),
+                ));
+            }
+        }
+    }
+
     // Compute the canonical tx hash up-front so the response/record always reference it, even
     // when Horizon submission errors out at the transport layer.
     let precomputed_hash = hex::encode(

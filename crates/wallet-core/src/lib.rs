@@ -24,7 +24,8 @@ pub mod provision;
 pub mod signer;
 
 pub use address::{
-    decode_muxed, deposit_address, encode_muxed, is_valid_account, DecodedMuxed, DepositAddress,
+    decode_muxed, deposit_address, encode_muxed, is_valid_account, to_base_account, DecodedMuxed,
+    DepositAddress,
 };
 pub use asset::is_valid_asset_code;
 pub use derive::WalletSeed;

@@ -208,6 +208,29 @@ pub struct GasSponsorshipConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The withdrawal-allowlist config for a wallet (one row per wallet).
+///
+/// `enabled = false` by default: a wallet must opt in before the allowlist is enforced, so
+/// turning this feature on can never retroactively lock a wallet out of an address it already
+/// used.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WithdrawalAllowlistConfig {
+    pub wallet_id: Uuid,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An approved withdrawal destination for a wallet.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WhitelistedAddress {
+    pub id: Uuid,
+    pub wallet_id: Uuid,
+    pub address: String,
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A new deposit to record (input to the idempotent insert).
 #[derive(Debug, Clone)]
 pub struct NewDeposit {
@@ -224,4 +247,45 @@ pub struct NewDeposit {
     pub horizon_op_id: String,
     pub ledger: Option<i64>,
     pub memo_id: Option<i64>,
+}
+
+/// A shareable payment link, backed by a dedicated deposit address.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PaymentLink {
+    pub id: Uuid,
+    pub wallet_id: Uuid,
+    pub address_id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub image_url: Option<String>,
+    pub amount_usdc_stroops: Option<i64>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Input to create a new payment link.
+#[derive(Debug, Clone)]
+pub struct NewPaymentLink<'a> {
+    pub wallet_id: Uuid,
+    pub address_id: Uuid,
+    pub slug: &'a str,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub image_url: Option<&'a str>,
+    pub amount_usdc_stroops: Option<i64>,
+}
+
+/// One payment attempt against a payment link.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PaymentLinkPayment {
+    pub id: Uuid,
+    pub payment_link_id: Uuid,
+    pub transaction_id: Option<Uuid>,
+    pub payer_name: Option<String>,
+    pub payer_email: Option<String>,
+    pub amount_usdc_stroops: i64,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
 }

@@ -116,7 +116,7 @@ fn source_matches(source: &MuxedAccount, account_g: &str) -> bool {
 
 /// Render a muxed account as its canonical strkey (`G…` or `M…`).
 /// (`stellar_strkey` renders into a no-alloc `heapless::String`; convert to `std::String`.)
-fn muxed_to_string(m: &MuxedAccount) -> String {
+pub(crate) fn muxed_to_string(m: &MuxedAccount) -> String {
     match m {
         MuxedAccount::Ed25519(uint256) => StrkeyPK(uint256.0).to_string().as_str().to_owned(),
         MuxedAccount::MuxedEd25519(muxed) => stellar_strkey::ed25519::MuxedAccount {
@@ -130,7 +130,7 @@ fn muxed_to_string(m: &MuxedAccount) -> String {
 }
 
 /// Split an XDR asset into (code, issuer) the way the store records them.
-fn asset_parts(asset: &Asset) -> (String, Option<String>) {
+pub(crate) fn asset_parts(asset: &Asset) -> (String, Option<String>) {
     match asset {
         Asset::Native => ("native".to_string(), None),
         Asset::CreditAlphanum4(a) => (

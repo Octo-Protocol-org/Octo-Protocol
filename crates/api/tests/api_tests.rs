@@ -577,6 +577,16 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn put_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn custodial_withdraw_is_gone() {
     let Some(state) = test_state().await else {
@@ -1543,4 +1553,161 @@ async fn pagination_limit_boundaries_are_validated_consistently_with_sponsored_t
             "limit=200 must be OK for {uri}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Payment links
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn payment_link_public_routes_require_no_auth_and_404_unknown_slugs() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+
+    // No Authorization header at all — must not be treated as unauthenticated-401, just 404.
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/pay/does-not-exist"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/pay/does-not-exist/intent",
+            r#"{"amount_usdc_stroops":100}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(get(&format!(
+            "/v1/pay/does-not-exist/payments/{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn payment_link_management_requires_wallet_ownership() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let owner = auth_token(&app).await;
+    let other = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &owner).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/payment-links");
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&uri, r#"{"name":"Support"}"#, &other))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a non-owner must not learn the wallet exists"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&uri, r#"{"name":"Support"}"#, &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let slug = created["data"]["slug"].as_str().unwrap().to_string();
+    assert_eq!(created["data"]["active"], true);
+    assert_eq!(created["data"]["collected_usdc_stroops"], 0);
+
+    // The public page for a freshly created, active, flexible-amount link is reachable with no
+    // auth and echoes back its deposit address.
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/v1/pay/{slug}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let public = body_json(resp).await;
+    assert_eq!(public["data"]["name"], "Support");
+    assert!(public["data"]["deposit_address"].as_str().unwrap().starts_with('M'));
+
+    // Deactivating requires ownership too.
+    let link_id = created["data"]["id"].as_str().unwrap();
+    let deactivate_uri = format!("/v1/wallets/{wallet_id}/payment-links/{link_id}");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(&deactivate_uri, r#"{"active":false}"#, &other))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(&deactivate_uri, r#"{"active":false}"#, &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["active"], false);
+
+    // An inactive link's public page must 404, not leak its (now-off) details.
+    let resp = app
+        .oneshot(get(&format!("/v1/pay/{slug}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn payment_link_intent_rejects_flexible_amount_without_one() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            r#"{"name":"Flexible"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let slug = body_json(resp).await["data"]["slug"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No amount supplied for a flexible link → 400, not a panic or a free $0 intent.
+    let resp = app
+        .clone()
+        .oneshot(post_json(&format!("/v1/pay/{slug}/intent"), "{}"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/v1/pay/{slug}/intent"),
+            r#"{"payer_name":"Ada","payer_email":"ada@example.com","amount_usdc_stroops":5000000}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let intent = body_json(resp).await;
+    assert_eq!(intent["data"]["amount_usdc_stroops"], 5_000_000);
+    assert!(intent["data"]["payment_id"].as_str().is_some());
 }
