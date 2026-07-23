@@ -915,6 +915,182 @@ async fn audit_logs_record_and_list() {
     assert!(arr.iter().all(|l| l["category"] == "wallet"));
 }
 
+#[tokio::test]
+async fn audit_logs_are_strictly_scoped_to_the_authenticated_user() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+
+    // User A signs up and performs an auditable action with a distinctive marker.
+    let email_a = format!("audit-a-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email_a}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    let data_a = body_json(resp).await;
+    let token_a = data_a["data"]["token"].as_str().unwrap().to_string();
+    let user_id_a = data_a["data"]["user"]["id"].as_str().unwrap().to_string();
+
+    app.clone()
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            r#"{"label":"USER-A-ONLY-MARKER"}"#,
+            &token_a,
+        ))
+        .await
+        .unwrap();
+
+    // User B signs up and performs its own auditable action with a different marker.
+    let email_b = format!("audit-b-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email_b}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    let data_b = body_json(resp).await;
+    let token_b = data_b["data"]["token"].as_str().unwrap().to_string();
+    let user_id_b = data_b["data"]["user"]["id"].as_str().unwrap().to_string();
+
+    app.clone()
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            r#"{"label":"USER-B-ONLY-MARKER"}"#,
+            &token_b,
+        ))
+        .await
+        .unwrap();
+
+    // User B's view of /v1/audit-logs (scoped purely by the token's user_id — there's no
+    // wallet-id path param on this route) must never contain any of user A's rows.
+    let resp = app
+        .clone()
+        .oneshot(get_auth("/v1/audit-logs", &token_b))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let logs_b = body_json(resp).await;
+    let arr_b = logs_b["data"].as_array().unwrap();
+    assert!(
+        arr_b.iter().all(|l| l["user_id"] == user_id_b),
+        "user B's audit log listing contained rows not owned by user B: {arr_b:?}"
+    );
+    assert!(
+        arr_b.iter().all(|l| l["user_id"] != user_id_a),
+        "user B's audit log listing leaked user A's rows: {arr_b:?}"
+    );
+    let targets_b: Vec<&str> = arr_b.iter().filter_map(|l| l["target"].as_str()).collect();
+    assert!(
+        targets_b.iter().any(|t| t.contains("USER-B-ONLY-MARKER")),
+        "user B should see its own marker among its audit rows: {targets_b:?}"
+    );
+    assert!(
+        !targets_b.iter().any(|t| t.contains("USER-A-ONLY-MARKER")),
+        "user B must never see user A's marker: {targets_b:?}"
+    );
+
+    // Symmetric check: user A's view must never contain user B's rows.
+    let resp = app
+        .oneshot(get_auth("/v1/audit-logs", &token_a))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let logs_a = body_json(resp).await;
+    let arr_a = logs_a["data"].as_array().unwrap();
+    assert!(
+        arr_a.iter().all(|l| l["user_id"] == user_id_a),
+        "user A's audit log listing contained rows not owned by user A: {arr_a:?}"
+    );
+    assert!(
+        arr_a.iter().all(|l| l["user_id"] != user_id_b),
+        "user A's audit log listing leaked user B's rows: {arr_a:?}"
+    );
+    let targets_a: Vec<&str> = arr_a.iter().filter_map(|l| l["target"].as_str()).collect();
+    assert!(
+        targets_a.iter().any(|t| t.contains("USER-A-ONLY-MARKER")),
+        "user A should see its own marker among its audit rows: {targets_a:?}"
+    );
+    assert!(
+        !targets_a.iter().any(|t| t.contains("USER-B-ONLY-MARKER")),
+        "user A must never see user B's marker: {targets_a:?}"
+    );
+}
+
+#[tokio::test]
+async fn audit_logs_category_all_behaves_like_no_filter() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+
+    // Signup records "created an account"; capture the token.
+    let email = format!("audit-all-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    let token = body_json(resp).await["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Create a wallet → records "created master wallet", so there's more than one row/category.
+    app.clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+
+    // Omitting `category` entirely.
+    let resp = app
+        .clone()
+        .oneshot(get_auth("/v1/audit-logs", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let unfiltered = body_json(resp).await;
+    let arr_unfiltered = unfiltered["data"].as_array().unwrap().clone();
+    assert!(
+        !arr_unfiltered.is_empty(),
+        "expected at least the signup event"
+    );
+
+    // `category=all` is documented (AuditQuery) to behave exactly like no filter.
+    let resp = app
+        .oneshot(get_auth("/v1/audit-logs?category=all", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let all = body_json(resp).await;
+    let arr_all = all["data"].as_array().unwrap().clone();
+
+    assert_eq!(
+        arr_unfiltered, arr_all,
+        "category=all should return exactly the same rows as omitting category"
+    );
+}
+
+#[tokio::test]
+async fn audit_logs_without_token_is_401() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    // No Authorization header at all → 401 (audit-logs requires `authenticate`).
+    let resp = app.oneshot(get("/v1/audit-logs")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // --- sponsored transaction tests -------------------------------------------
 
 async fn insert_sponsored_tx(
