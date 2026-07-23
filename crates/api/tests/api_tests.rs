@@ -553,6 +553,187 @@ async fn api_key_requires_ownership() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// SHA-256 hex of a raw API key — mirrors `hash_key`/`hash_api_key` in
+/// `crates/api/src/routes/apikeys.rs` / `crates/api/src/auth.rs` (both private, so the
+/// hashing scheme is reproduced here to inspect the store directly).
+fn hash_key_for_test(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
+}
+
+#[tokio::test]
+async fn regenerating_api_key_invalidates_the_previous_one() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    // Keep a handle to the store so we can inspect `api_keys` rows directly (upsert-on-conflict
+    // is implemented in `Store::upsert_api_key`; the only way to confirm it *replaces* rather
+    // than *appends* a row is to check the hash lookup, not just the HTTP responses).
+    let store = state.store().clone();
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id_str = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wallet_id: uuid::Uuid = wallet_id_str.parse().unwrap();
+
+    // First generation.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let j = body_json(resp).await;
+    let key1 = j["data"]["api_key"].as_str().unwrap().to_string();
+    let prefix1 = j["data"]["prefix"].as_str().unwrap().to_string();
+
+    // key1 resolves to this wallet via the store's key-hash lookup (used by API-key auth).
+    let resolved = store
+        .wallet_id_for_key_hash(&hash_key_for_test(&key1))
+        .await
+        .expect("query");
+    assert_eq!(resolved, Some(wallet_id));
+
+    // key1 works for an authenticated API-key request.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/addresses"),
+            &key1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Regenerate: POST again with the (dashboard) owner token.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let j = body_json(resp).await;
+    let key2 = j["data"]["api_key"].as_str().unwrap().to_string();
+    let prefix2 = j["data"]["prefix"].as_str().unwrap().to_string();
+
+    // The response always carries a fresh secret and prefix, distinct from the first.
+    assert_ne!(key1, key2, "regeneration must mint a new secret");
+    assert_ne!(
+        prefix1, prefix2,
+        "regeneration must mint a new display prefix"
+    );
+    assert!(key2.starts_with("octo_sk_test_"), "key2 was {key2}");
+    assert!(key2.starts_with(&prefix2), "prefix2 must match key2");
+
+    // `upsert_api_key` is `INSERT ... ON CONFLICT (wallet_id) DO UPDATE`, i.e. one row per
+    // wallet — so key1's hash must no longer resolve to *any* wallet (fully replaced, not
+    // appended alongside key2).
+    let resolved = store
+        .wallet_id_for_key_hash(&hash_key_for_test(&key1))
+        .await
+        .expect("query");
+    assert_eq!(
+        resolved, None,
+        "the previous key's hash must no longer resolve once regenerated"
+    );
+
+    // key2's hash resolves to the wallet.
+    let resolved = store
+        .wallet_id_for_key_hash(&hash_key_for_test(&key2))
+        .await
+        .expect("query");
+    assert_eq!(resolved, Some(wallet_id));
+
+    // The old key is fully invalidated for authenticated requests too — 401, not just a stale
+    // lookup.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/addresses"),
+            &key1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The new key works.
+    let resp = app
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/addresses"),
+            &key2,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// Documents the observed behavior of presenting an `octo_sk_...` API key as the bearer
+/// credential on `POST /v1/wallets/:id/api-key` (i.e. a key trying to regenerate/replace
+/// itself).
+///
+/// `generate_key` gates access through `owned_wallet`, which calls `auth::authenticate` — *not*
+/// `auth::authorize_wallet` (the helper that explicitly branches on the `octo_sk_` prefix to
+/// accept API keys for wallet-scoped operations like creating addresses). `authenticate` only
+/// ever validates `Authorization: Bearer <JWT>`: it calls `verify_token`, which `split('.')`s the
+/// token and immediately returns `None` unless there are exactly three dot-separated segments
+/// with a matching header. An `octo_sk_<network>_<hex>` key contains no `.` characters at all, so
+/// `verify_token` returns `None` and `authenticate` returns `Err(ApiError::Unauthorized)` before
+/// any wallet-ownership or key-prefix logic even runs.
+///
+/// So: an API key can **not** self-regenerate (or view via GET, which is gated the same way).
+/// This reads as intentional rather than a gap — it's the same "dashboard JWT only" posture that
+/// `delete_key`'s doc comment states explicitly and that `require_login` enforces elsewhere
+/// (`api_key_cannot_withdraw`, `delete_api_key_rejects_api_key_auth` cover the analogous cases
+/// for withdrawals and revocation). Minting/replacing/viewing wallet credentials is treated as a
+/// sensitive, dashboard-only action, consistent across all three api-key routes — `generate_key`
+/// and `get_key` just happen not to spell that out in a doc comment the way `delete_key` does.
+#[tokio::test]
+async fn api_key_bearer_calling_generate_key_behavior_is_documented() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = api_key_for(&app, &token, &wallet_id).await;
+
+    // Attempt to self-regenerate using the API key itself as the bearer credential.
+    let resp = app
+        .oneshot(post_auth(&format!("/v1/wallets/{wallet_id}/api-key"), &key))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an octo_sk_ API key must not be accepted by owned_wallet's authenticate()-based gate"
+    );
+}
+
 /// Generate an API key for a wallet and return the full key string.
 async fn api_key_for(app: &axum::Router, token: &str, wallet_id: &str) -> String {
     let resp = app
