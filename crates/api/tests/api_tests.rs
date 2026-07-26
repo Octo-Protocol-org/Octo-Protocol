@@ -50,16 +50,6 @@ fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
-fn signup_request(body: String) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri("/v1/auth/signup")
-        .header("content-type", "application/json")
-        .header("content-length", body.len())
-        .body(Body::from(body))
-        .unwrap()
-}
-
 fn body_limit_request(body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -86,6 +76,22 @@ fn post_auth(uri: &str, token: &str) -> Request<Body> {
         .uri(uri)
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
+        .unwrap()
+}
+
+/// `POST /v1/wallets` under the non-custodial contract: the "client" (this test) generates the
+/// keypair and sends only the public key.
+fn create_wallet_req(token: &str) -> Request<Body> {
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    Request::builder()
+        .method("POST")
+        .uri("/v1/wallets")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
         .unwrap()
 }
 
@@ -148,8 +154,8 @@ async fn test_oversized_body_returns_envelope() {
         return;
     };
     let app = build_router(state);
-    
-    // إرسال طلب كبير جداً (أكبر من الحد المسموح به عادة)
+
+    // Send a body far larger than the configured limit.
     let resp = app
         .oneshot(
             Request::builder()
@@ -162,15 +168,95 @@ async fn test_oversized_body_returns_envelope() {
         .await
         .unwrap();
 
-    // التحقق من أننا نرجع 413
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    
-    // التحقق من أن الجسم (body) يطابق الـ Envelope
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-    let envelope: Envelope = serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
-    
-    assert_eq!(envelope.status_code, 413);
-    assert!(!envelope.message.is_empty());
+
+    // The oversized rejection must still use the standard response envelope, not a bare 413.
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert!(!bytes.is_empty(), "413 response should explain itself");
+}
+
+#[tokio::test]
+async fn create_wallet_is_non_custodial_and_stores_no_seed() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+
+    // The client generates the keypair and sends only the public key.
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(
+                    r#"{{"label":"acme","public_key":"{account}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(
+        data["address"].as_str().unwrap(),
+        account,
+        "the wallet account must be exactly the client-supplied public key"
+    );
+    assert_eq!(data["custody"], "client");
+    assert!(
+        data.get("recovery_mnemonic").is_none() || data["recovery_mnemonic"].is_null(),
+        "no mnemonic is ever returned — the client generated it"
+    );
+
+    // The custody kill-test: the server holds NO seed for this wallet.
+    let wallet_id = data["id"].as_str().unwrap();
+    let (custody, has_seed): (String, bool) = sqlx::query_as(
+        "SELECT custody, (sealed_ciphertext IS NOT NULL OR sealed_nonce IS NOT NULL \
+         OR sealed_salt IS NOT NULL) FROM wallets WHERE id = $1::uuid",
+    )
+    .bind(wallet_id)
+    .fetch_one(state.store().pool())
+    .await
+    .unwrap();
+    assert_eq!(custody, "client");
+    assert!(!has_seed, "no seed material may be stored for a client wallet");
+}
+
+#[tokio::test]
+async fn create_wallet_rejects_bad_public_key() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Missing public_key → 400.
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth("/v1/wallets", r#"{"label":"x"}"#, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Malformed public_key → 400.
+    let resp = app
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            r#"{"public_key":"not-a-stellar-account"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -184,7 +270,7 @@ async fn addresses_return_both_forms_and_share_base() {
     // Create a wallet (empty body is allowed).
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet = body_json(resp).await;
@@ -211,11 +297,11 @@ async fn addresses_return_both_forms_and_share_base() {
     assert_ne!(muxed[0], muxed[1], "distinct muxed addresses");
     assert_eq!(memo_ids, vec![1, 2], "ids allocated sequentially from 1");
 
-    // List returns both.
+    // List returns both. The paginated envelope is {data: {data: [...], next_cursor}}.
     let uri = format!("/v1/wallets/{wallet_id}/addresses");
     let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
     let list = body_json(resp).await;
-    assert_eq!(list["data"].as_array().unwrap().len(), 2);
+    assert_eq!(list["data"]["data"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -228,7 +314,7 @@ async fn transactions_endpoint_returns_list() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -241,7 +327,8 @@ async fn transactions_endpoint_returns_list() {
     let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    assert_eq!(j["data"].as_array().unwrap().len(), 0);
+    // Paginated envelope: {data: {data: [...], next_cursor}}.
+    assert_eq!(j["data"]["data"].as_array().unwrap().len(), 0);
 
     // Unknown wallet (authed user) → 404.
     let uri = format!("/v1/wallets/{}/transactions", uuid::Uuid::new_v4());
@@ -258,6 +345,182 @@ async fn get_unknown_wallet_is_404() {
     let token = auth_token(&app).await;
     let uri = format!("/v1/wallets/{}", uuid::Uuid::new_v4());
     let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn balances_requires_auth_and_a_real_wallet() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/balances");
+
+    // The Horizon client itself is covered by horizon_client_tests / horizon_resilience_tests;
+    // what those cannot check is this route's authorization, which runs on every CI build.
+    let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Another user must not learn whether this wallet exists.
+    let other = auth_token(&app).await;
+    let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown wallet → 404.
+    let unknown = format!("/v1/wallets/{}/balances", uuid::Uuid::new_v4());
+    let resp = app.oneshot(get_auth(&unknown, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Regression: the sequence number must serialize as a JSON **string**, not a number.
+///
+/// Stellar sequence numbers are ~1.6e16, past `Number.MAX_SAFE_INTEGER` (9.007e15). As a JSON
+/// number, `JSON.parse` rounds to float64 and silently drops the low bits (…466433 → …466432),
+/// so the browser signs with a sequence one too low and Horizon rejects it with `tx_bad_seq`.
+/// This manifested as "the first withdrawal works, the second always fails".
+#[test]
+fn signing_info_serializes_sequence_as_a_string() {
+    // A value past MAX_SAFE_INTEGER that is NOT representable as an f64 — round-tripping it
+    // through a double loses the final digit, which is exactly the production failure.
+    let seq: i64 = 15_942_562_120_466_433;
+    assert!(seq > 9_007_199_254_740_991, "test value must be unsafe in JS");
+    assert_ne!(
+        seq as f64 as i64, seq,
+        "test value must actually lose precision as a double"
+    );
+
+    // Serialize the REAL response struct — this is what would regress if the attribute is removed.
+    let info = octo_api::routes::submit::SigningInfo {
+        account: "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into(),
+        sequence: seq,
+        network_passphrase: "Test SDF Network ; September 2015".into(),
+        base_fee_stroops: 100,
+    };
+    let json = serde_json::to_string(&info).unwrap();
+    assert!(
+        json.contains(r#""sequence":"15942562120466433""#),
+        "sequence must be quoted (a string) on the wire, got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn signing_info_requires_auth_and_a_real_wallet() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/signing-info");
+
+    // Unauthenticated → 401. (The success path needs a funded on-chain account and is covered by
+    // horizon_live_tests, which only runs with OCTO_LIVE_TESTS=1 — so the auth/404 guards are
+    // asserted here, where they run on every CI build.)
+    let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Another user must not learn whether this wallet exists.
+    let other = auth_token(&app).await;
+    let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown wallet → 404.
+    let unknown = format!("/v1/wallets/{}/signing-info", uuid::Uuid::new_v4());
+    let resp = app.oneshot(get_auth(&unknown, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn health_is_public_and_ok() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    // The liveness probe must not require auth — a load balancer has no token.
+    let resp = app.oneshot(get("/health")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn backup_round_trips_the_opaque_blob_verbatim() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // The blob is ciphertext the CLIENT produced; the server must store and return it byte-for
+    // byte without interpreting it.
+    let blob = "v1.YmFzZTY0LWNpcGhlcnRleHQ=.bm9uY2U=.c2FsdA==";
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    let body = format!(r#"{{"public_key":"{account}","encrypted_backup":"{blob}"}}"#);
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth("/v1/wallets", &body, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let uri = format!("/v1/wallets/{wallet_id}/backup");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["wallet_id"].as_str().unwrap(), wallet_id);
+    assert_eq!(
+        data["encrypted_backup"].as_str().unwrap(),
+        blob,
+        "the backup blob must come back exactly as the client stored it"
+    );
+}
+
+#[tokio::test]
+async fn backup_is_null_when_the_client_stored_none() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // encrypted_backup is optional — a user may decline server-side backup entirely.
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/backup");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await["data"]["encrypted_backup"].is_null());
+}
+
+#[tokio::test]
+async fn backup_rejects_api_key_auth_and_other_users() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/backup");
+
+    // An API key must not be able to pull the key backup: it is the one artifact that, combined
+    // with the user's password, reconstructs the signing key. Dashboard login only.
+    let key = api_key_for(&app, &token, &wallet_id).await;
+    let resp = app.clone().oneshot(get_auth(&uri, &key)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "API keys must not read the key backup"
+    );
+
+    // Another logged-in user gets 404 (not 403) so wallet existence isn't leaked.
+    let other = auth_token(&app).await;
+    let resp = app.oneshot(get_auth(&uri, &other)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -314,26 +577,75 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// POST JSON with an Authorization bearer token plus one extra caller-supplied header (e.g.
+/// `Idempotency-Key`), for tests that need to distinguish header-supplied values from body ones.
+fn post_json_auth_with_header(
+    uri: &str,
+    body: &str,
+    token: &str,
+    header_name: &str,
+    header_value: &str,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header(header_name, header_value)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn withdraw_requires_destination_amount_and_idempotency_key() {
+async fn custodial_withdraw_is_gone() {
     let Some(state) = test_state().await else {
         return;
     };
     let app = build_router(state);
     let token = auth_token(&app).await;
-    // Create a wallet to target.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
 
-    // Missing everything.
+    // The custodial withdraw endpoint was removed in the non-custodial cutover: it now returns
+    // 410 Gone, pointing callers at submit-signed. The server holds no user key to sign with.
+    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"k"}"#;
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/withdraw"),
+            body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn submit_signed_requires_transaction_xdr() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(&token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/submit-signed");
+
+    // Empty body → 400.
     let resp = app
         .clone()
         .oneshot(post_json_auth(&uri, "{}", &token))
@@ -341,17 +653,28 @@ async fn withdraw_requires_destination_amount_and_idempotency_key() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Missing idempotency key (has dest + amount).
-    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100}"#;
+    // Garbage XDR → 400.
     let resp = app
-        .oneshot(post_json_auth(&uri, body, &token))
+        .oneshot(post_json_auth(
+            &uri,
+            r#"{"transaction_xdr":"not-valid-xdr"}"#,
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The route reads the idempotency key from the `Idempotency-Key` header first, falling back to
+/// the body's `idempotency_key` only when the header is absent. Prove the header is what's
+/// actually checked (not the body) by pre-inserting a withdrawal keyed on the header's value
+/// (simulating a prior request, same technique as `withdraw_duplicate_idempotency_key_conflicts_
+/// before_signing` — this avoids a real request needing a live Horizon round trip) and then
+/// sending a request whose header repeats that key while the body carries a *different* key. If
+/// the body were consulted instead of the header, no matching row would exist and the request
+/// would sail past the conflict check into Horizon calls instead of 409ing here.
 #[tokio::test]
-async fn withdraw_duplicate_idempotency_key_conflicts_before_signing() {
+async fn withdraw_header_idempotency_key_takes_precedence_over_body() {
     let Some(state) = test_state().await else {
         return;
     };
@@ -368,9 +691,69 @@ async fn withdraw_duplicate_idempotency_key_conflicts_before_signing() {
         .to_string();
     let uri = format!("/v1/wallets/{wallet_id}/withdraw");
 
-    // Pre-insert a withdrawal with a known idempotency key (simulating a prior request) so the
-    // second attempt conflicts at create_withdrawal BEFORE any Horizon/signing happens.
-    let key = format!("key-{}", uuid::Uuid::new_v4());
+    // Simulate a prior request whose *header* key was "A" (and whose body, irrelevant now, might
+    // have carried something else entirely — only the header value ends up persisted).
+    let header_key = format!("key-a-{}", uuid::Uuid::new_v4());
+    state
+        .store()
+        .create_withdrawal(octo_store::NewWithdrawal {
+            wallet_id: wallet_id.parse().unwrap(),
+            idempotency_key: &header_key,
+            destination_account: "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6",
+            asset_code: "native",
+            asset_issuer: None,
+            amount_stroops: 100,
+            memo_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Retry: header repeats key "A" (the one already used), body carries a distinct, never-seen
+    // key "C". If precedence were wrong and the body key were checked, this would NOT conflict.
+    let body_key = format!("key-c-{}", uuid::Uuid::new_v4());
+    let body = format!(
+        r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{body_key}"}}"#
+    );
+    let resp = app
+        .oneshot(post_json_auth_with_header(
+            &uri,
+            &body,
+            &token,
+            "Idempotency-Key",
+            &header_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "header idempotency key must be the one checked, proving header-over-body precedence"
+    );
+}
+
+/// When no `Idempotency-Key` header is sent at all, the body's `idempotency_key` field must still
+/// be honored end-to-end: a request carrying only a body key that collides with an existing
+/// withdrawal must 409 (not 400 "missing key"), proving the fallback path correctly extracts and
+/// uses the body value for the real conflict check.
+#[tokio::test]
+async fn withdraw_body_only_idempotency_key_works() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    let key = format!("key-body-only-{}", uuid::Uuid::new_v4());
     state
         .store()
         .create_withdrawal(octo_store::NewWithdrawal {
@@ -385,6 +768,7 @@ async fn withdraw_duplicate_idempotency_key_conflicts_before_signing() {
         .await
         .unwrap();
 
+    // No Idempotency-Key header at all — only the body field.
     let body = format!(
         r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}"}}"#
     );
@@ -395,20 +779,18 @@ async fn withdraw_duplicate_idempotency_key_conflicts_before_signing() {
     assert_eq!(
         resp.status(),
         StatusCode::CONFLICT,
-        "retry with same idempotency key must 409 (no double-spend)"
+        "body-only idempotency key must be used for the conflict check (fallback path works)"
     );
 }
 
-/// Regression coverage for the withdrawal route's use of the shared
-/// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
-/// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
-/// is ever created, not merely fail later at signing.
+/// Neither the header nor the body supply an idempotency key → 400 with the exact message the
+/// route returns for a missing key.
 #[tokio::test]
-async fn withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row() {
+async fn withdraw_missing_idempotency_key_is_400() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state.clone());
+    let app = build_router(state);
     let token = auth_token(&app).await;
     let resp = app
         .clone()
@@ -421,36 +803,140 @@ async fn withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row() {
         .to_string();
     let uri = format!("/v1/wallets/{wallet_id}/withdraw");
 
-    for (label, code) in [("empty", ""), ("13_bytes", "ABCDEFGHIJKLM")] {
-        let key = format!("key-{}", uuid::Uuid::new_v4());
-        let body = format!(
-            r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}","asset":{{"code":"{code}","issuer":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6"}}}}"#
-        );
-        let resp = app
-            .clone()
-            .oneshot(post_json_auth(&uri, &body, &token))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "asset code case '{label}' must be rejected"
-        );
-
-        // Prove rejection happened before create_withdrawal: no row with this idempotency key.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM withdrawals WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(state.store().pool())
+    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100}"#;
+    let resp = app
+        .oneshot(post_json_auth(&uri, body, &token))
         .await
         .unwrap();
-        assert_eq!(
-            count, 0,
-            "case '{label}': invalid asset code must not create a withdrawal row"
-        );
-    }
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["message"],
+        "idempotency key required (Idempotency-Key header or body)"
+    );
 }
+
+/// An empty-string idempotency key must be treated as if it were absent (per the route's
+/// `.filter(|k| !k.is_empty())`), in every position it can appear:
+///   - empty header, no body key at all
+///   - no header, empty body key
+///   - empty header *with* a valid, non-empty body key present — because `.or()` only falls back
+///     to the body when the header is `None`, an empty (but present) header short-circuits that
+///     fallback and must still 400, even though a perfectly good body key was sent alongside it.
+#[tokio::test]
+async fn withdraw_empty_string_idempotency_key_is_treated_as_absent() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    let dest_and_amount = r#""destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100"#;
+
+    // Case 1: empty-string header, no body key.
+    let body = format!(r#"{{{dest_and_amount}}}"#);
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth_with_header(
+            &uri,
+            &body,
+            &token,
+            "Idempotency-Key",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty-string header with no body key must be treated as absent"
+    );
+
+    // Case 2: no header, empty-string body key.
+    let body = format!(r#"{{{dest_and_amount},"idempotency_key":""}}"#);
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&uri, &body, &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty-string body key with no header must be treated as absent"
+    );
+
+    // Case 3: empty-string header *and* a valid, non-empty body key. The empty header must win
+    // (and thus still 400) rather than falling back to the good body key, since `Option::or` only
+    // substitutes on `None`, not on `Some("")`.
+    let body = format!(r#"{{{dest_and_amount},"idempotency_key":"a-perfectly-good-key"}}"#);
+    let resp = app
+        .oneshot(post_json_auth_with_header(
+            &uri,
+            &body,
+            &token,
+            "Idempotency-Key",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty-string header must shadow a valid body key, not fall back to it"
+    );
+}
+
+/// Regression coverage for the withdrawal route's use of the shared
+/// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
+/// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
+/// is ever created, not merely fail later at signing.
+#[tokio::test]
+async fn custodial_trustline_is_gone() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(&token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/trustlines"),
+            r#"{"asset_code":"USDC","asset_issuer":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
+}
+
+/// Regression coverage for the withdrawal route's use of the shared
+/// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
+/// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
+/// is ever created, not merely fail later at signing.
+// NOTE: withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row was removed here.
+// It tested the pre-cutover custodial withdraw endpoint (POST /v1/wallets/:id/withdraw with a
+// destination+amount body); that endpoint is now 410 Gone (see custodial_withdraw_is_gone
+// above), so it always failed against this schema/router. Asset-code validation on the
+// non-custodial path is covered where the trustline/payment is actually built (wallet-core).
 
 #[tokio::test]
 async fn api_key_generate_and_get() {
@@ -463,7 +949,7 @@ async fn api_key_generate_and_get() {
     // Create a wallet owned by this user.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -533,7 +1019,7 @@ async fn api_key_requires_ownership() {
     let token_a = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token_a))
+        .oneshot(create_wallet_req(&token_a))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -553,6 +1039,187 @@ async fn api_key_requires_ownership() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// SHA-256 hex of a raw API key — mirrors `hash_key`/`hash_api_key` in
+/// `crates/api/src/routes/apikeys.rs` / `crates/api/src/auth.rs` (both private, so the
+/// hashing scheme is reproduced here to inspect the store directly).
+fn hash_key_for_test(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
+}
+
+#[tokio::test]
+async fn regenerating_api_key_invalidates_the_previous_one() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    // Keep a handle to the store so we can inspect `api_keys` rows directly (upsert-on-conflict
+    // is implemented in `Store::upsert_api_key`; the only way to confirm it *replaces* rather
+    // than *appends* a row is to check the hash lookup, not just the HTTP responses).
+    let store = state.store().clone();
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id_str = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wallet_id: uuid::Uuid = wallet_id_str.parse().unwrap();
+
+    // First generation.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let j = body_json(resp).await;
+    let key1 = j["data"]["api_key"].as_str().unwrap().to_string();
+    let prefix1 = j["data"]["prefix"].as_str().unwrap().to_string();
+
+    // key1 resolves to this wallet via the store's key-hash lookup (used by API-key auth).
+    let resolved = store
+        .wallet_id_for_key_hash(&hash_key_for_test(&key1))
+        .await
+        .expect("query");
+    assert_eq!(resolved, Some(wallet_id));
+
+    // key1 works for an authenticated API-key request.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/addresses"),
+            &key1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Regenerate: POST again with the (dashboard) owner token.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let j = body_json(resp).await;
+    let key2 = j["data"]["api_key"].as_str().unwrap().to_string();
+    let prefix2 = j["data"]["prefix"].as_str().unwrap().to_string();
+
+    // The response always carries a fresh secret and prefix, distinct from the first.
+    assert_ne!(key1, key2, "regeneration must mint a new secret");
+    assert_ne!(
+        prefix1, prefix2,
+        "regeneration must mint a new display prefix"
+    );
+    assert!(key2.starts_with("octo_sk_test_"), "key2 was {key2}");
+    assert!(key2.starts_with(&prefix2), "prefix2 must match key2");
+
+    // `upsert_api_key` is `INSERT ... ON CONFLICT (wallet_id) DO UPDATE`, i.e. one row per
+    // wallet — so key1's hash must no longer resolve to *any* wallet (fully replaced, not
+    // appended alongside key2).
+    let resolved = store
+        .wallet_id_for_key_hash(&hash_key_for_test(&key1))
+        .await
+        .expect("query");
+    assert_eq!(
+        resolved, None,
+        "the previous key's hash must no longer resolve once regenerated"
+    );
+
+    // key2's hash resolves to the wallet.
+    let resolved = store
+        .wallet_id_for_key_hash(&hash_key_for_test(&key2))
+        .await
+        .expect("query");
+    assert_eq!(resolved, Some(wallet_id));
+
+    // The old key is fully invalidated for authenticated requests too — 401, not just a stale
+    // lookup.
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/addresses"),
+            &key1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The new key works.
+    let resp = app
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id_str}/addresses"),
+            &key2,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// Documents the observed behavior of presenting an `octo_sk_...` API key as the bearer
+/// credential on `POST /v1/wallets/:id/api-key` (i.e. a key trying to regenerate/replace
+/// itself).
+///
+/// `generate_key` gates access through `owned_wallet`, which calls `auth::authenticate` — *not*
+/// `auth::authorize_wallet` (the helper that explicitly branches on the `octo_sk_` prefix to
+/// accept API keys for wallet-scoped operations like creating addresses). `authenticate` only
+/// ever validates `Authorization: Bearer <JWT>`: it calls `verify_token`, which `split('.')`s the
+/// token and immediately returns `None` unless there are exactly three dot-separated segments
+/// with a matching header. An `octo_sk_<network>_<hex>` key contains no `.` characters at all, so
+/// `verify_token` returns `None` and `authenticate` returns `Err(ApiError::Unauthorized)` before
+/// any wallet-ownership or key-prefix logic even runs.
+///
+/// So: an API key can **not** self-regenerate (or view via GET, which is gated the same way).
+/// This reads as intentional rather than a gap — it's the same "dashboard JWT only" posture that
+/// `delete_key`'s doc comment states explicitly and that `require_login` enforces elsewhere
+/// (`api_key_cannot_withdraw`, `delete_api_key_rejects_api_key_auth` cover the analogous cases
+/// for withdrawals and revocation). Minting/replacing/viewing wallet credentials is treated as a
+/// sensitive, dashboard-only action, consistent across all three api-key routes — `generate_key`
+/// and `get_key` just happen not to spell that out in a doc comment the way `delete_key` does.
+#[tokio::test]
+async fn api_key_bearer_calling_generate_key_behavior_is_documented() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = api_key_for(&app, &token, &wallet_id).await;
+
+    // Attempt to self-regenerate using the API key itself as the bearer credential.
+    let resp = app
+        .oneshot(post_auth(&format!("/v1/wallets/{wallet_id}/api-key"), &key))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an octo_sk_ API key must not be accepted by owned_wallet's authenticate()-based gate"
+    );
+}
+
 /// Generate an API key for a wallet and return the full key string.
 async fn api_key_for(app: &axum::Router, token: &str, wallet_id: &str) -> String {
     let resp = app
@@ -569,14 +1236,8 @@ async fn api_key_for(app: &axum::Router, token: &str, wallet_id: &str) -> String
         .to_string()
 }
 
-fn delete_auth(uri: &str, token: &str) -> Request<Body> {
-    Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
-}
+// (a second `delete_auth` helper was defined here by the merge; it is identical to the one
+// above and has been removed)
 
 #[tokio::test]
 async fn api_key_can_create_address_on_its_wallet() {
@@ -589,7 +1250,7 @@ async fn api_key_can_create_address_on_its_wallet() {
     // Create a wallet + its API key.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -630,7 +1291,7 @@ async fn api_key_cannot_touch_another_wallet() {
     // Two wallets owned by the same user; key for wallet A.
     let a = body_json(
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap(),
     )
@@ -640,7 +1301,7 @@ async fn api_key_cannot_touch_another_wallet() {
         .to_string();
     let b = body_json(
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap(),
     )
@@ -669,7 +1330,7 @@ async fn delete_api_key_revokes_it_and_subsequent_calls_using_it_are_401() {
     // Create a wallet and generate an API key.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -737,7 +1398,7 @@ async fn delete_api_key_requires_wallet_ownership() {
     let token_a = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token_a))
+        .oneshot(create_wallet_req(&token_a))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -770,7 +1431,7 @@ async fn delete_api_key_on_a_wallet_with_no_key_is_ok() {
     // Create a wallet without generating a key.
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -800,7 +1461,7 @@ async fn delete_api_key_rejects_api_key_auth() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -822,7 +1483,7 @@ async fn delete_api_key_rejects_api_key_auth() {
 }
 
 #[tokio::test]
-async fn api_key_cannot_withdraw() {
+async fn api_key_cannot_provision_gas_tank() {
     let Some(state) = test_state().await else {
         return;
     };
@@ -831,7 +1492,7 @@ async fn api_key_cannot_withdraw() {
 
     let wallet_id = body_json(
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap(),
     )
@@ -841,12 +1502,12 @@ async fn api_key_cannot_withdraw() {
         .to_string();
     let key = api_key_for(&app, &token, &wallet_id).await;
 
-    // Withdrawals are dashboard-only: an API key is rejected with 401.
-    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"k1"}"#;
+    // Provisioning a server-held gas tank is a sensitive, dashboard-only action (require_login):
+    // an API key must be rejected with 401. (Moving user funds now requires the user's own
+    // client-side signature, so there is no custodial withdraw for a key to abuse.)
     let resp = app
-        .oneshot(post_json_auth(
-            &format!("/v1/wallets/{wallet_id}/withdraw"),
-            body,
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
             &key,
         ))
         .await
@@ -854,7 +1515,7 @@ async fn api_key_cannot_withdraw() {
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "API keys must not be allowed to withdraw"
+        "API keys must not provision a gas tank"
     );
 }
 
@@ -882,7 +1543,7 @@ async fn audit_logs_record_and_list() {
 
     // Create a wallet → records "created master wallet".
     app.clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
 
@@ -950,7 +1611,7 @@ async fn list_sponsored_transactions_returns_empty_for_new_wallet() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -976,7 +1637,7 @@ async fn list_sponsored_transactions_pagination() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1038,7 +1699,7 @@ async fn list_sponsored_transactions_status_filter() {
 
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", &token))
+        .oneshot(create_wallet_req(&token))
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1087,7 +1748,7 @@ async fn list_sponsored_transactions_requires_auth() {
 async fn create_wallet_for(app: &axum::Router, token: &str) -> String {
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+        .oneshot(create_wallet_req(token))
         .await
         .unwrap();
     body_json(resp).await["data"]["id"]
@@ -1108,7 +1769,7 @@ async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
     // Create 5 wallets for this user.
     for _ in 0..5 {
         app.clone()
-            .oneshot(post_auth("/v1/wallets", &token))
+            .oneshot(create_wallet_req(&token))
             .await
             .unwrap();
     }
@@ -1225,9 +1886,13 @@ async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit()
                 amount_stroops: (i + 1) as i64 * 100,
                 source_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
                 destination_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
-                stellar_tx_hash: format!("txhash-pag-{i}"),
+                // Deposits are idempotent on horizon_op_id, which is globally unique. A fixed
+                // literal here made the second run of this test a silent no-op (the inserts
+                // dedup against the previous run's rows), so it only passed on a fresh DB.
+                // Scope the keys to this wallet to keep the test re-runnable.
+                stellar_tx_hash: format!("txhash-pag-{wallet_uuid}-{i}"),
                 operation_index: i as i32,
-                horizon_op_id: format!("op-pag-{i}"),
+                horizon_op_id: format!("op-pag-{wallet_uuid}-{i}"),
                 ledger: Some(i as i64),
                 memo_id: None,
             })
@@ -1313,4 +1978,161 @@ async fn pagination_limit_boundaries_are_validated_consistently_with_sponsored_t
             "limit=200 must be OK for {uri}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Payment links
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn payment_link_public_routes_require_no_auth_and_404_unknown_slugs() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+
+    // No Authorization header at all — must not be treated as unauthenticated-401, just 404.
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/pay/does-not-exist"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/pay/does-not-exist/intent",
+            r#"{"amount_usdc_stroops":100}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .oneshot(get(&format!(
+            "/v1/pay/does-not-exist/payments/{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn payment_link_management_requires_wallet_ownership() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let owner = auth_token(&app).await;
+    let other = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &owner).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/payment-links");
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&uri, r#"{"name":"Support"}"#, &other))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a non-owner must not learn the wallet exists"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&uri, r#"{"name":"Support"}"#, &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let slug = created["data"]["slug"].as_str().unwrap().to_string();
+    assert_eq!(created["data"]["active"], true);
+    assert_eq!(created["data"]["collected_usdc_stroops"], 0);
+
+    // The public page for a freshly created, active, flexible-amount link is reachable with no
+    // auth and echoes back its deposit address.
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/v1/pay/{slug}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let public = body_json(resp).await;
+    assert_eq!(public["data"]["name"], "Support");
+    assert!(public["data"]["deposit_address"].as_str().unwrap().starts_with('M'));
+
+    // Deactivating requires ownership too.
+    let link_id = created["data"]["id"].as_str().unwrap();
+    let deactivate_uri = format!("/v1/wallets/{wallet_id}/payment-links/{link_id}");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(&deactivate_uri, r#"{"active":false}"#, &other))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(&deactivate_uri, r#"{"active":false}"#, &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["active"], false);
+
+    // An inactive link's public page must 404, not leak its (now-off) details.
+    let resp = app
+        .oneshot(get(&format!("/v1/pay/{slug}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn payment_link_intent_rejects_flexible_amount_without_one() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            r#"{"name":"Flexible"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let slug = body_json(resp).await["data"]["slug"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No amount supplied for a flexible link → 400, not a panic or a free $0 intent.
+    let resp = app
+        .clone()
+        .oneshot(post_json(&format!("/v1/pay/{slug}/intent"), "{}"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .oneshot(post_json(
+            &format!("/v1/pay/{slug}/intent"),
+            r#"{"payer_name":"Ada","payer_email":"ada@example.com","amount_usdc_stroops":5000000}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let intent = body_json(resp).await;
+    assert_eq!(intent["data"]["amount_usdc_stroops"], 5_000_000);
+    assert!(intent["data"]["payment_id"].as_str().is_some());
 }

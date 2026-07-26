@@ -136,15 +136,36 @@ pub struct SubmitResult {
     pub hash: String,
     pub successful: bool,
     pub ledger: Option<i64>,
+    /// Horizon result codes when the tx failed, e.g. `("tx_failed", ["op_low_reserve"])`.
+    /// Empty on success or when Horizon didn't return them.
+    pub transaction_code: Option<String>,
+    pub operation_codes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SubmitResponse {
+    #[serde(default)]
     hash: String,
     #[serde(default)]
     successful: bool,
     #[serde(default)]
     ledger: Option<i64>,
+    #[serde(default)]
+    extras: Option<SubmitExtras>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SubmitExtras {
+    #[serde(default)]
+    result_codes: Option<ResultCodes>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResultCodes {
+    #[serde(default)]
+    transaction: Option<String>,
+    #[serde(default)]
+    operations: Vec<String>,
 }
 
 /// A thin Horizon client with retry/backoff and circuit-breaker protection.
@@ -239,35 +260,59 @@ impl Horizon {
     /// Fetch balances, sequence, and reserve inputs for an account in a single Horizon call.
     /// `NotFound` if the account does not exist on-chain yet.
     pub async fn account_info(&self, account_g: &str) -> Result<AccountInfo, ApiError> {
+        // This is a read-only call, so it goes through the same retry + circuit-breaker path as
+        // `balances`. (It previously issued a bare, unwrapped GET, so a transient 5xx from
+        // Horizon failed immediately instead of being retried.)
         let url = format!(
             "{}/accounts/{}",
             self.base_url.trim_end_matches('/'),
             account_g
         );
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ApiError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(ApiError::Internal);
-        }
-        let account: AccountResponse = resp.json().await.map_err(|_| ApiError::Internal)?;
-        let sequence = account
-            .sequence
-            .parse::<i64>()
-            .map_err(|_| ApiError::Internal)?;
-        Ok(AccountInfo {
-            balances: account.balances,
-            sequence,
-            subentry_count: account.subentry_count,
-            num_sponsoring: account.num_sponsoring,
-            num_sponsored: account.num_sponsored,
+        let http = self.http.clone();
+
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let url = url.clone();
+            let http = http.clone();
+            async move {
+                let resp = http
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|_| FetchError::Transport)?;
+
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(FetchError::NotFound);
+                }
+                if resp.status().is_server_error() {
+                    return Err(FetchError::Transport); // retriable
+                }
+                if !resp.status().is_success() {
+                    return Err(FetchError::Permanent);
+                }
+
+                let account: AccountResponse =
+                    resp.json().await.map_err(|_| FetchError::Permanent)?;
+                let sequence = account
+                    .sequence
+                    .parse::<i64>()
+                    .map_err(|_| FetchError::Permanent)?;
+                Ok(AccountInfo {
+                    balances: account.balances,
+                    sequence,
+                    subentry_count: account.subentry_count,
+                    num_sponsoring: account.num_sponsoring,
+                    num_sponsored: account.num_sponsored,
+                })
+            }
         })
+        .await;
+
+        match result {
+            Ok(info) => Ok(info),
+            Err(ResilienceError::Circuit) => Err(ApiError::Internal),
+            Err(ResilienceError::Exhausted(FetchError::NotFound)) => Err(ApiError::NotFound),
+            Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
+        }
     }
 
     /// Submit a signed transaction (base64 XDR envelope) to Horizon.
@@ -280,15 +325,13 @@ impl Horizon {
     /// Returns the result even when the transaction failed on-chain (`successful == false`) so the
     /// caller can record the failure; only transport/HTTP errors return `Err`.
     pub async fn submit_transaction(&self, envelope_xdr: &str) -> Result<SubmitResult, ApiError> {
+        // NOTE: an eager, unwrapped POST used to sit here ahead of the resilience-wrapped call
+        // below. It fired a *duplicate* submission on every call and referenced `http`/`xdr`
+        // locals that were never bound (so this did not compile). Removed — the single submit
+        // now happens inside `execute`, with SUBMIT_TIMEOUT applied to that request.
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .form(&[("tx", envelope_xdr)])
-            .timeout(SUBMIT_TIMEOUT)
-            .send()
-            .await
-            .map_err(|_| ApiError::Internal)?;
+        let http = self.http.clone();
+        let xdr = envelope_xdr.to_string();
 
         let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
             let url = url.clone();
@@ -298,10 +341,15 @@ impl Horizon {
                 let resp = http
                     .post(&url)
                     .form(&[("tx", &xdr)])
+                    .timeout(SUBMIT_TIMEOUT)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
 
+                // Horizon returns 400 with a problem document when the tx is rejected (e.g. bad
+                // seq, no reserve). Parse it either way so we can surface the specific result
+                // codes — with client-signed transactions the caller needs to know *why* it
+                // failed in order to correct and re-sign.
                 let status = resp.status();
                 let body: SubmitResponse = match resp.json().await {
                     Ok(b) => b,
@@ -312,10 +360,17 @@ impl Horizon {
                         return Err(FetchError::TxRejected);
                     }
                 };
+                let (transaction_code, operation_codes) = body
+                    .extras
+                    .and_then(|e| e.result_codes)
+                    .map(|rc| (rc.transaction, rc.operations))
+                    .unwrap_or((None, Vec::new()));
                 Ok(SubmitResult {
                     hash: body.hash,
                     successful: body.successful,
                     ledger: body.ledger,
+                    transaction_code,
+                    operation_codes,
                 })
             }
         })
@@ -348,6 +403,15 @@ enum FetchError {
     Permanent,
     /// `POST /transactions` returned no parseable hash — tx rejected. Permanent.
     TxRejected,
+}
+
+impl octo_resilience::Retriable for FetchError {
+    fn is_retriable(&self) -> bool {
+        // Only transport-level failures (network error, timeout, 5xx) are worth another attempt.
+        // 404 / other 4xx / a rejected tx are settled answers — retrying them would also let a
+        // few of them trip the circuit breaker and mask the real error.
+        matches!(self, FetchError::Transport)
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -433,6 +497,13 @@ mod tests {
                 .build()
                 .unwrap(),
             base_url,
+            // This test exercises the transport timeout, so keep resilience out of the way:
+            // a single attempt and a breaker that won't trip within the test.
+            retry: RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            circuit: CircuitBreaker::new(u32::MAX, Duration::from_secs(60)),
         };
 
         let result = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;

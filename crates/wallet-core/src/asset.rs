@@ -3,44 +3,13 @@
 //!
 //! ## Finding: this validator is deliberately length-only, not alphanumeric-only
 //!
-//! The XDR type names `AssetCode4`/`AssetCode12` (and stellar-core's ledger-level
-//! `isAssetValid` check, used when a **new** trustline/asset is issued via `ChangeTrust`)
-//! suggest an ASCII-alphanumeric character-set restriction. But this codebase never issues an
-//! asset or opens a trustline — every call site here only ever *references* an asset that
-//! (by assumption) already exists on-chain, by code + issuer, to build a `Payment` operation.
-//! For that use, the acceptance boundary that actually matters is the one enforced by
-//! `stellar_base::asset::Asset::new_credit` (via `CreditAsset::new`), the constructor this crate
-//! calls to build that operation: it validates **only the byte length** of the code (1 to 12
-//! UTF-8 bytes; 1-4 becomes `AlphaNum4`, 5-12 becomes `AlphaNum12`) and copies the raw bytes into
-//! a zero-padded fixed-size buffer with no ASCII or alphanumeric check at all — see
-//! `stellar-base-0.7.0/src/asset.rs`, `CreditAsset::new`.
-//!
-//! A stricter validator that also rejected non-alphanumeric bytes would therefore *disagree*
-//! with `Asset::new_credit`'s real behavior — rejecting codes the library (and thus a real
-//! Payment operation) would actually accept — which is exactly the trap this ticket's own
-//! description warns against. Any code that doesn't match a real trustline simply fails
-//! downstream (no such trustline / no matching balance) regardless of its character content, so
-//! rejecting non-alphanumeric bytes here would not prevent anything the network doesn't already
-//! prevent — it would only make this crate's pre-validation diverge from the library it wraps.
-//! `custom_validation_never_disagrees_with_asset_new_credits_actual_acceptance` below proves this
-//! equivalence with a property-test corpus, cross-validating directly against `Asset::new_credit`
-//! rather than against an independent reimplementation of the spec.
-//!
-//! If a future product requirement wants to *additionally* reject non-alphanumeric codes as a
-//! UX / defense-in-depth measure (independent of what the network would accept), that should be
-//! a separate, clearly-named check layered on top of — not folded into — this function, since
-//! folding it in would make this function disagree with `Asset::new_credit`.
+//! Accepts asset codes matching `Asset::new_credit` — 1 to 12 UTF-8 bytes, no alphanumeric restriction.
+//! This mirrors actual Stellar behavior for referencing on-chain assets, not issuing new ones.
+//! For stricter (e.g., alphanumeric) checks, layer such validation separately.
 
-/// Returns `true` iff `code` is an acceptable Stellar credit-asset code: 1 to 12 UTF-8 bytes.
-///
-/// This is the shared primitive for every site in this codebase that accepts or forwards a
-/// caller-supplied asset code destined for [`stellar_base::asset::Asset::new_credit`] — it
-/// exactly matches that function's real acceptance boundary (see the module doc-comment for why
-/// this is length-only rather than alphanumeric-only). Never reimplement this check locally at a
-/// call site.
-///
-/// `code.len()` is the UTF-8 **byte** length (not char count), matching how `Asset::new_credit`
-/// measures it — a multi-byte character can push a short-looking code over the boundary.
+/// Returns `true` if `code` is a valid Stellar asset code: 1 to 12 UTF-8 bytes.
+/// Matches `Asset::new_credit` acceptance; do not duplicate this logic.
+/// Note: len is in bytes, so multi-byte chars may exceed limit.
 pub fn is_valid_asset_code(code: &str) -> bool {
     (1..=12).contains(&code.len())
 }
@@ -177,7 +146,7 @@ mod tests {
             byte in any::<u8>(),
         ) {
             // Printable ASCII only, so this always round-trips through String validly.
-            let b = (byte % (0x7e - 0x20) + 0x20) as u8;
+            let b = byte % (0x7e - 0x20) + 0x20;
             let code: String = std::iter::repeat(b as char).take(len).collect();
             prop_assert_eq!(is_valid_asset_code(&code), asset_new_credit_accepts(&code));
         }

@@ -8,23 +8,42 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-/// A master wallet (one per network), holding the sealed HD seed.
+/// A master wallet.
+///
+/// Custody models (see `migrations/0008_client_custody.sql`):
+/// - `custody == "client"`: non-custodial — the USER's private key exists only client-side and
+///   the server can never sign for `stellar_account_g`. If `sealed_*` are set on such a row,
+///   they hold the seed of the separate **gas-tank** fee account (`gas_tank_account_g`), which
+///   only ever carries fee float for sponsorship. `encrypted_backup` is an opaque
+///   client-encrypted blob the server cannot decrypt.
+/// - `custody == "server"`: legacy — the sealed seed is the user account's own seed.
 #[derive(Debug, Clone, FromRow)]
 pub struct Wallet {
     pub id: Uuid,
     pub network: String,
     pub stellar_account_g: String,
-    pub sealed_ciphertext: Vec<u8>,
-    pub sealed_nonce: Vec<u8>,
-    pub sealed_salt: Vec<u8>,
-    /// Scheme version tag for the sealed HD seed. See `octo_crypto::SCHEME_V1`.
-    pub sealed_scheme: i16,
+    pub sealed_ciphertext: Option<Vec<u8>>,
+    pub sealed_nonce: Option<Vec<u8>>,
+    pub sealed_salt: Option<Vec<u8>>,
+    /// Scheme version tag for the sealed seed (see `octo_crypto::SCHEME_V1`). `None` on
+    /// client-custody rows that carry no sealed seed at all.
+    pub sealed_scheme: Option<i16>,
     pub next_muxed_id: i64,
     pub label: Option<String>,
     pub user_id: Option<Uuid>,
     pub description: Option<String>,
+    pub custody: String,
+    pub encrypted_backup: Option<String>,
+    pub gas_tank_account_g: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Wallet {
+    /// True when the private key lives only client-side (server cannot sign).
+    pub fn is_client_custody(&self) -> bool {
+        self.custody == "client"
+    }
 }
 
 /// A per-customer deposit address (off-chain row).
@@ -189,6 +208,29 @@ pub struct GasSponsorshipConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The withdrawal-allowlist config for a wallet (one row per wallet).
+///
+/// `enabled = false` by default: a wallet must opt in before the allowlist is enforced, so
+/// turning this feature on can never retroactively lock a wallet out of an address it already
+/// used.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WithdrawalAllowlistConfig {
+    pub wallet_id: Uuid,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An approved withdrawal destination for a wallet.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WhitelistedAddress {
+    pub id: Uuid,
+    pub wallet_id: Uuid,
+    pub address: String,
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A new deposit to record (input to the idempotent insert).
 #[derive(Debug, Clone)]
 pub struct NewDeposit {
@@ -205,4 +247,45 @@ pub struct NewDeposit {
     pub horizon_op_id: String,
     pub ledger: Option<i64>,
     pub memo_id: Option<i64>,
+}
+
+/// A shareable payment link, backed by a dedicated deposit address.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PaymentLink {
+    pub id: Uuid,
+    pub wallet_id: Uuid,
+    pub address_id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub image_url: Option<String>,
+    pub amount_usdc_stroops: Option<i64>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Input to create a new payment link.
+#[derive(Debug, Clone)]
+pub struct NewPaymentLink<'a> {
+    pub wallet_id: Uuid,
+    pub address_id: Uuid,
+    pub slug: &'a str,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub image_url: Option<&'a str>,
+    pub amount_usdc_stroops: Option<i64>,
+}
+
+/// One payment attempt against a payment link.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PaymentLinkPayment {
+    pub id: Uuid,
+    pub payment_link_id: Uuid,
+    pub transaction_id: Option<Uuid>,
+    pub payer_name: Option<String>,
+    pub payer_email: Option<String>,
+    pub amount_usdc_stroops: i64,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
 }

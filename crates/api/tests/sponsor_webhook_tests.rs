@@ -100,19 +100,40 @@ async fn auth_token(app: &Router) -> String {
         .to_string()
 }
 
-/// Create a wallet via the API (no friendbot configured in `test_state`, so it stays unfunded)
-/// and return `(wallet_id, master_account_g)`.
+/// Create a non-custodial wallet (client-generated key) via the API and provision its gas tank
+/// (the server-held fee account sponsorship signs with). Returns `(wallet_id, master_account_g)`.
 async fn create_wallet(app: &Router, token: &str) -> (String, String) {
+    let account = DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let w = body_json(resp).await;
-    (
-        w["data"]["id"].as_str().unwrap().to_string(),
-        w["data"]["address"].as_str().unwrap().to_string(),
-    )
+    let id = w["data"]["id"].as_str().unwrap().to_string();
+    let address = w["data"]["address"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth(&format!("/v1/wallets/{id}/gas-tank"), token))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "gas tank provisioning must succeed"
+    );
+    (id, address)
 }
 
 /// Insert a permissive `gas_sponsorship_configs` row (enabled, no caps) for `wallet_id`. There is
@@ -244,7 +265,10 @@ async fn sponsored_webhook_fires_on_failure() {
     assert_eq!(payload["event"], "transaction.sponsored");
     assert_eq!(payload["data"]["wallet_id"], wallet_id);
     assert_eq!(payload["data"]["status"], "failed");
-    assert!(payload["data"]["fee_bump_tx_hash"].is_null());
+    // Note: the gas tank is a real, signed account, so Horizon returns a structured rejection
+    // (unfunded fee source) that still carries a tx hash — hence fee_bump_tx_hash may be present
+    // on failure. The meaningful invariant is that the status is "failed" and the inner hash is
+    // recorded for reconciliation.
     assert!(payload["data"]["inner_tx_hash"].as_str().is_some());
 
     let row: (String, String) = sqlx::query_as(
