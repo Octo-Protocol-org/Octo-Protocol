@@ -73,7 +73,18 @@ impl AppState {
     ) -> Self {
         let mut secret = vec![0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-        Self::build(store, master_key, network, horizon_url, friendbot_url, secret, retry, circuit)
+        // `master_key_next` is None here; callers opt into rotation via `with_master_key_next`.
+        Self::build(
+            store,
+            master_key,
+            None,
+            network,
+            horizon_url,
+            friendbot_url,
+            secret,
+            retry,
+            circuit,
+        )
     }
 
     /// Set the JWT signing secret (e.g. from the `JWT_SECRET` env var) so tokens survive restarts.

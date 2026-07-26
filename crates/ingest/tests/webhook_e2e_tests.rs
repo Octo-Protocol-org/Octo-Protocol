@@ -79,6 +79,7 @@ async fn deposit_fires_signed_webhook() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"n",
             sealed_salt: b"s",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,
@@ -101,7 +102,9 @@ async fn deposit_fires_signed_webhook() {
         id: format!("wh-op-{}", Uuid::new_v4().simple()),
         paging_token: "pt".into(),
         kind: "payment".into(),
-        transaction_hash: Some("hash".into()),
+        // Must be unique per run: deposits dedup on (transaction hash, op index), so a fixed
+        // literal makes the second run a Duplicate — nothing is recorded and no webhook fires.
+        transaction_hash: Some(format!("wh-hash-{}", Uuid::new_v4().simple())),
         transaction_successful: true,
         from: Some("Gsender".into()),
         to: Some(BASE.into()),
