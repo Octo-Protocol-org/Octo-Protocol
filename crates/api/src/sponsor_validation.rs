@@ -111,8 +111,15 @@ mod tests {
     use super::*;
     use octo_wallet_core::{import_wallet, sign_payment, PaymentRequest, StellarNetwork};
     use stellar_base::xdr::{
-        Memo, MuxedAccount, Operation, OperationBody, Preconditions, SequenceNumber, Transaction,
-        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, XDRSerialize,
+        AllowTrustOp, Asset, BeginSponsoringFutureReservesOp, BumpSequenceOp, ChangeTrustOp,
+        ClaimClaimableBalanceOp, ClawbackClaimableBalanceOp, ClawbackOp, CreateAccountOp,
+        CreateClaimableBalanceOp, CreatePassiveSellOfferOp, ExtendFootprintTtlOp,
+        InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
+        ManageDataOp, ManageSellOfferOp, Memo, MuxedAccount, Operation, OperationBody,
+        PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, Preconditions,
+        RestoreFootprintOp, RevokeSponsorshipOp, SequenceNumber, SetOptionsOp,
+        SetTrustLineFlagsOp, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256, XDRSerialize,
     };
 
     const VECTOR_MK: [u8; 32] = [7u8; 32];
@@ -219,5 +226,164 @@ mod tests {
     fn rejects_malformed_xdr() {
         let result = validate_inner_xdr("this-is-not-valid-xdr!!!", DEST);
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
+    }
+
+    /// Every `OperationBody` variant that is *not* in [`ALLOWED_OP_TYPES`], paired with its
+    /// expected `op_type_name`. Field values are minimal/arbitrary (mostly `Default::default()`)
+    /// — only the operation *kind* is under test here, never the semantic validity of its
+    /// payload, so defaulted inner fields (zeroed amounts, empty vecs, `None` options, etc.) are
+    /// intentional and sufficient.
+    ///
+    /// All 24 non-allowlisted variants are covered; none were awkward enough to skip — every
+    /// inner XDR struct in this crate's `stellar-xdr` version derives `Default` when the `alloc`
+    /// feature is enabled (it is, via `std`), including deeply-nested ones like
+    /// `RevokeSponsorshipOp`'s default `LedgerKey` and `InvokeHostFunctionOp`'s default
+    /// `HostFunction`.
+    fn forbidden_op_cases() -> Vec<(&'static str, OperationBody)> {
+        vec![
+            (
+                "CreateAccount",
+                OperationBody::CreateAccount(CreateAccountOp::default()),
+            ),
+            (
+                "ManageSellOffer",
+                OperationBody::ManageSellOffer(ManageSellOfferOp::default()),
+            ),
+            (
+                "CreatePassiveSellOffer",
+                OperationBody::CreatePassiveSellOffer(CreatePassiveSellOfferOp::default()),
+            ),
+            (
+                "SetOptions",
+                OperationBody::SetOptions(SetOptionsOp::default()),
+            ),
+            (
+                "ChangeTrust",
+                OperationBody::ChangeTrust(ChangeTrustOp::default()),
+            ),
+            (
+                "AllowTrust",
+                OperationBody::AllowTrust(AllowTrustOp::default()),
+            ),
+            (
+                "AccountMerge",
+                OperationBody::AccountMerge(MuxedAccount::default()),
+            ),
+            ("Inflation", OperationBody::Inflation),
+            (
+                "ManageData",
+                OperationBody::ManageData(ManageDataOp::default()),
+            ),
+            (
+                "BumpSequence",
+                OperationBody::BumpSequence(BumpSequenceOp::default()),
+            ),
+            (
+                "ManageBuyOffer",
+                OperationBody::ManageBuyOffer(ManageBuyOfferOp::default()),
+            ),
+            (
+                "CreateClaimableBalance",
+                OperationBody::CreateClaimableBalance(CreateClaimableBalanceOp::default()),
+            ),
+            (
+                "ClaimClaimableBalance",
+                OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp::default()),
+            ),
+            (
+                "BeginSponsoringFutureReserves",
+                OperationBody::BeginSponsoringFutureReserves(
+                    BeginSponsoringFutureReservesOp::default(),
+                ),
+            ),
+            (
+                "EndSponsoringFutureReserves",
+                OperationBody::EndSponsoringFutureReserves,
+            ),
+            (
+                "RevokeSponsorship",
+                OperationBody::RevokeSponsorship(RevokeSponsorshipOp::default()),
+            ),
+            ("Clawback", OperationBody::Clawback(ClawbackOp::default())),
+            (
+                "ClawbackClaimableBalance",
+                OperationBody::ClawbackClaimableBalance(ClawbackClaimableBalanceOp::default()),
+            ),
+            (
+                "SetTrustLineFlags",
+                OperationBody::SetTrustLineFlags(SetTrustLineFlagsOp::default()),
+            ),
+            (
+                "LiquidityPoolDeposit",
+                OperationBody::LiquidityPoolDeposit(LiquidityPoolDepositOp::default()),
+            ),
+            (
+                "LiquidityPoolWithdraw",
+                OperationBody::LiquidityPoolWithdraw(LiquidityPoolWithdrawOp::default()),
+            ),
+            (
+                "InvokeHostFunction",
+                OperationBody::InvokeHostFunction(InvokeHostFunctionOp::default()),
+            ),
+            (
+                "ExtendFootprintTtl",
+                OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp::default()),
+            ),
+            (
+                "RestoreFootprint",
+                OperationBody::RestoreFootprint(RestoreFootprintOp::default()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_non_allowlisted_operation_kind_is_rejected() {
+        for (name, body) in forbidden_op_cases() {
+            // Source != master so the self-sponsorship guard never masks the op-type rejection.
+            let xdr = make_envelope(vec![body], [4u8; 32]);
+            let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+            assert!(
+                matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains(name)),
+                "expected '{name}' to be rejected by name, got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_allowlisted_operation_kinds_are_individually_accepted() {
+        let destination = MuxedAccount::Ed25519(Uint256([9u8; 32]));
+        let cases: Vec<OperationBody> = vec![
+            OperationBody::Payment(PaymentOp {
+                destination: destination.clone(),
+                asset: Asset::Native,
+                amount: 100,
+            }),
+            OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+                send_asset: Asset::Native,
+                send_amount: 100,
+                destination: destination.clone(),
+                dest_asset: Asset::Native,
+                dest_min: 1,
+                path: vec![].try_into().unwrap(),
+            }),
+            OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+                send_asset: Asset::Native,
+                send_max: 100,
+                destination,
+                dest_asset: Asset::Native,
+                dest_amount: 1,
+                path: vec![].try_into().unwrap(),
+            }),
+        ];
+        for body in cases {
+            let name = op_type_name(&body);
+            // Source != master: correctly sourced, not self-sponsoring.
+            let xdr = make_envelope(vec![body], [5u8; 32]);
+            let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+            assert!(
+                result.is_ok(),
+                "expected '{name}' to be accepted, got: {result:?}"
+            );
+        }
     }
 }
