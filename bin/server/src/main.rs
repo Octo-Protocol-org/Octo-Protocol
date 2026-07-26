@@ -135,6 +135,7 @@ impl Config {
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
 
         let network_str = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
+        // Accepted values: "mainnet" | "public", "testnet" | "test", "standalone".
         let network = StellarNetwork::parse(&network_str)
             .with_context(|| format!("invalid NETWORK: {network_str}"))?;
 

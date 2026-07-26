@@ -41,6 +41,12 @@ pub enum StellarNetwork {
     Public,
     /// Test network.
     Testnet,
+    /// Local standalone network (Stellar quickstart default).
+    ///
+    /// Uses the well-known quickstart passphrase `"Standalone Network ; February 2017"` so that
+    /// contributors can run integration tests against a local Stellar node without depending on
+    /// public testnet availability or friendbot rate limits.
+    Standalone,
 }
 
 impl StellarNetwork {
@@ -48,6 +54,9 @@ impl StellarNetwork {
         match self {
             StellarNetwork::Public => Network::new_public(),
             StellarNetwork::Testnet => Network::new_test(),
+            StellarNetwork::Standalone => {
+                Network::new("Standalone Network ; February 2017".to_string())
+            }
         }
     }
 
@@ -64,22 +73,27 @@ impl StellarNetwork {
         match self {
             StellarNetwork::Public => b"octo:mainnet",
             StellarNetwork::Testnet => b"octo:testnet",
+            StellarNetwork::Standalone => b"octo:standalone",
         }
     }
 
-    /// The canonical lowercase name (`"mainnet"` / `"testnet"`) used in the DB and API.
+    /// The canonical lowercase name (`"mainnet"` / `"testnet"` / `"standalone"`) used in the DB
+    /// and API.
     pub fn as_str(self) -> &'static str {
         match self {
             StellarNetwork::Public => "mainnet",
             StellarNetwork::Testnet => "testnet",
+            StellarNetwork::Standalone => "standalone",
         }
     }
 
-    /// Parse from the canonical name. Accepts `mainnet`/`public` and `testnet`/`test`.
+    /// Parse from the canonical name. Accepts `mainnet`/`public`, `testnet`/`test`, and
+    /// `standalone`.
     pub fn parse(s: &str) -> Option<StellarNetwork> {
         match s {
             "mainnet" | "public" => Some(StellarNetwork::Public),
             "testnet" | "test" => Some(StellarNetwork::Testnet),
+            "standalone" => Some(StellarNetwork::Standalone),
             _ => None,
         }
     }
@@ -325,16 +339,18 @@ pub fn sign_fee_bump(
         BytesM, DecoratedSignature, FeeBumpTransaction as XdrFeeBump, FeeBumpTransactionEnvelope,
         FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash, MuxedAccount, Signature,
         SignatureHint, TransactionEnvelope, TransactionSignaturePayload,
-        TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRDeserialize, XDRSerialize,
+        TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRSerialize,
     };
 
+    // Reject fees below the Stellar network minimum before touching key material.
+    // A sub-minimum fee would be rejected by Horizon at submit time, wasting a budget
+    // reservation (try_reserve_sponsored_transaction) and a full sign cycle.
+    if req.max_base_fee_stroops < MIN_BASE_FEE.to_i64() {
+        return Err(WalletError::InvalidAmount);
+    }
+
     // Parse and validate the inner XDR — must be a v1 TransactionEnvelope.
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(req.inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    let inner_v1 = match inner_env {
-        TransactionEnvelope::Tx(v1) => v1,
-        _ => return Err(WalletError::InvalidXdr),
-    };
+    let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
     let seed_bytes = open(master_key, sealed, network.crypto_context())?;
@@ -411,16 +427,11 @@ pub fn compute_inner_tx_hash(
 ) -> Result<[u8; 32], WalletError> {
     use sha2::{Digest, Sha256};
     use stellar_base::xdr::{
-        Hash, TransactionEnvelope, TransactionSignaturePayload,
-        TransactionSignaturePayloadTaggedTransaction, XDRDeserialize, XDRSerialize,
+        Hash, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+        XDRSerialize,
     };
 
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    let inner_tx = match inner_env {
-        TransactionEnvelope::Tx(v1) => v1.tx,
-        _ => return Err(WalletError::InvalidXdr),
-    };
+    let inner_tx = parse_inner_v1(inner_xdr)?.tx;
 
     let network_id_bytes = network.to_base().network_id();
     let network_hash: [u8; 32] = network_id_bytes
