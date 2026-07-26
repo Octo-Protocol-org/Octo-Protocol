@@ -45,6 +45,15 @@ fn validate_response(spec: &Value, path: &str, method: &str, status: &str, respo
         ))
         .expect("Schema not found in OpenAPI spec");
 
+    // The response schema is usually a `$ref` into `#/components/schemas/...`. Validating the
+    // bare sub-schema leaves that pointer unresolvable, so splice it into a document that still
+    // carries `components` and let the validator resolve the reference.
+    let mut doc = schema.clone();
+    if let (Some(obj), Some(components)) = (doc.as_object_mut(), spec.get("components")) {
+        obj.insert("components".to_string(), components.clone());
+    }
+    let schema = &doc;
+
     let validator = Validator::new(schema).expect("Invalid JSON schema");
     let result = validator.validate(response_body);
     if let Err(errors) = result {
@@ -56,6 +65,33 @@ fn validate_response(spec: &Value, path: &str, method: &str, status: &str, respo
     }
 }
 
+/// Sign up a fresh user and return its bearer token. Every /v1/wallets route is authenticated,
+/// so the drift test needs a real token or it only ever exercises the 401 path.
+async fn auth_token(app: &axum::Router) -> String {
+    let email = format!("drift-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    json["data"]["token"]
+        .as_str()
+        .expect("signup must return a token")
+        .to_string()
+}
+
 #[tokio::test]
 async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let state = match test_state().await {
@@ -64,9 +100,18 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     };
     let app = build_router(state);
     let spec = load_openapi_spec();
+    let token = auth_token(&app).await;
 
-    // 1. Success case: Create wallet
+    // 1. Success case: Create wallet.
+    //
+    // Non-custodial contract: the client generates the keypair and sends only the public key.
+    // `public_key` is required — a body with just label/description is now a 400.
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
     let req_body = serde_json::json!({
+        "public_key": account,
         "label": "drift-test-wallet",
         "description": "testing schema drift"
     });
@@ -75,6 +120,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .method("POST")
         .uri("/v1/wallets")
         .header("Content-Type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::from(req_body.to_string()))
         .unwrap();
 
@@ -85,25 +131,23 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
     let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
 
-    // Validate 200 response shape
-    validate_response(&spec, "~1v1~1wallets", "post", "200", &body_json);
+    // Validate the documented 201 response shape.
+    validate_response(&spec, "~1v1~1wallets", "post", "201", &body_json);
 
-    // 2. Error case: Missing required fields or bad payload to an endpoint, e.g. withdrawing without funds
+    // 2. Error case: hitting the withdraw endpoint should return a real error envelope,
+    // matching the documented ErrorResponse shape (410 Gone).
     let wallet_id = body_json["data"]["id"].as_str().unwrap();
 
-    // Withdraw with missing required 'asset' code/issuer
     let withdraw_body = serde_json::json!({
         "destination": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         "amount_stroops": 100,
-        "asset": {
-            "code": "USDC" // missing issuer
-        }
     });
 
     let withdraw_req = Request::builder()
         .method("POST")
         .uri(format!("/v1/wallets/{}/withdraw", wallet_id))
         .header("Content-Type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::from(withdraw_body.to_string()))
         .unwrap();
 
@@ -122,13 +166,14 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let result = error_validator.validate(&w_json);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);
-        panic!("Error response did not match OpenAPI schema for 422");
+        panic!("Error response did not match the documented ErrorResponse schema (410 Gone)");
     }
 
     // 3. Success case: Get wallet details
     let get_wallet_req = Request::builder()
         .method("GET")
         .uri(format!("/v1/wallets/{}", wallet_id))
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
 

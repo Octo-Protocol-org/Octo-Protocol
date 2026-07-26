@@ -75,6 +75,23 @@ pub fn is_valid_account(address: &str) -> bool {
     PublicKey::from_string(address).is_ok()
 }
 
+/// Reduce an address to its base `G...` account, whether given as `G...` or `M...`.
+///
+/// A transaction's destination can be recorded as either form depending on which one the client
+/// happened to send, but they name the same underlying account — anything that compares
+/// destinations against a stored list (e.g. a withdrawal allowlist) must normalize first, or an
+/// entry saved as `G...` would silently fail to match the same account's `M...` form.
+pub fn to_base_account(address: &str) -> Result<String, WalletError> {
+    if let Ok(decoded) = decode_muxed(address) {
+        let pk = PublicKey(decoded.ed25519);
+        return Ok(format!("{pk}"));
+    }
+    if is_valid_account(address) {
+        return Ok(address.to_string());
+    }
+    Err(WalletError::InvalidAddress)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

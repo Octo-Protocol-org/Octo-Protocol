@@ -94,13 +94,29 @@ pub async fn sponsor(
         .await?; // BudgetExceeded -> 429, Conflict -> 409
 
     // 5. Sign the fee-bump (decrypt -> derive -> sign -> zeroize, inside wallet-core).
-    let sealed = SealedSeed::from_parts_with_scheme(
-        wallet.sealed_ciphertext.clone(),
-        &wallet.sealed_nonce,
-        &wallet.sealed_salt,
-        wallet.sealed_scheme as u8,
-    )
-    .map_err(|_| ApiError::Internal)?;
+    // Only server-custody rows (legacy wallets / gas-tank fee accounts) carry a sealed seed.
+    // A client-custody wallet has no server-side key: sponsorship for those requires a funded
+    // gas tank, which is provisioned separately.
+    let (Some(ciphertext), Some(nonce), Some(salt)) = (
+        wallet.sealed_ciphertext.as_ref(),
+        wallet.sealed_nonce.as_ref(),
+        wallet.sealed_salt.as_ref(),
+    ) else {
+        let _ = state
+            .store()
+            .finalize_sponsored_transaction(reserved.id, "failed", None, Some("no gas tank"))
+            .await;
+        return Err(ApiError::Forbidden(
+            "this wallet is client-custody and has no gas-tank account to pay fees from; \
+             provision and fund a gas tank to enable sponsorship"
+                .into(),
+        ));
+    };
+    // Keep the versioned-scheme path (PR #158) so master-key rotation keeps working. Rows
+    // written before the scheme tag existed fall back to V1.
+    let scheme = wallet.sealed_scheme.unwrap_or(octo_crypto::SCHEME_V1 as i16);
+    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
+        .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {
         inner_xdr: &inner_xdr,
         max_base_fee_stroops: max_fee,

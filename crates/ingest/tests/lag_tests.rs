@@ -66,6 +66,7 @@ async fn poll_once_updates_the_last_poll_timestamp_on_success() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"n",
             sealed_salt: b"s",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,
@@ -105,6 +106,7 @@ async fn failed_poll_does_not_update_the_last_poll_timestamp() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"n",
             sealed_salt: b"s",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,

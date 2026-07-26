@@ -16,6 +16,9 @@
 pub mod amount;
 pub mod horizon;
 
+#[cfg(test)]
+mod backfill_tests;
+
 use horizon::{HorizonPayments, PaymentRecord};
 use octo_store::{NewDeposit, Store};
 use octo_wallet_core::decode_muxed;
@@ -24,6 +27,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
+
+/// The widely-used testnet USDC issuer — must match `crates/api/src/routes/payment_links.rs`'s
+/// constant of the same name (kept separate rather than shared since this crate has no
+/// dependency on `octo-api`).
+const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 /// Shared thread-safe tracker for the last successful poll times of ingestion.
 #[derive(Debug, Clone, Default)]
@@ -110,6 +118,7 @@ impl Ingestor {
             wallet_id,
             account_g,
             webhooks: None,
+            tracker: None,
         }
     }
 
@@ -231,7 +240,7 @@ impl Ingestor {
             source_account: rec.from.clone(),
             destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
             stellar_tx_hash: tx_hash,
-            operation_index: 0,
+            operation_index: operation_index_from_toid(&rec.id).unwrap_or(0),
             horizon_op_id: rec.id.clone(),
             ledger,
             memo_id,
@@ -240,10 +249,53 @@ impl Ingestor {
         match self.store.record_deposit(&dep).await? {
             Some(tx) => {
                 self.fire_deposit_webhook(&tx).await;
+                self.confirm_payment_link(&tx).await;
                 Ok(Processed::Recorded { attributed })
             }
             None => Ok(Processed::Duplicate),
         }
+    }
+
+    /// If this deposit landed on a payment link's dedicated address, confirm its oldest pending
+    /// payment and fire `payment_link.paid`. Best-effort: a lookup miss just means it wasn't one.
+    async fn confirm_payment_link(&self, tx: &octo_store::Transaction) {
+        // v1 payment links are USDC-only — a deposit in any other asset (e.g. native XLM sent to
+        // the address by mistake) must not be mistaken for the USDC payment the link is waiting
+        // on, or the merchant's dashboard would report a payment they never actually received.
+        if tx.asset_code != "USDC" || tx.asset_issuer.as_deref() != Some(USDC_TESTNET_ISSUER) {
+            return;
+        }
+        let Some(address_id) = tx.address_id else { return };
+        let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await else {
+            return;
+        };
+        let Ok(Some(payment)) = self.store.oldest_pending_payment_link_payment(link.id).await
+        else {
+            return;
+        };
+        if self
+            .store
+            .confirm_payment_link_payment(payment.id, tx.id)
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let Some(sender) = &self.webhooks else { return };
+        let event = Event {
+            event_type: "payment_link.paid".to_string(),
+            data: serde_json::json!({
+                "payment_link_id": link.id,
+                "payment_id": payment.id,
+                "slug": link.slug,
+                "payer_name": payment.payer_name,
+                "payer_email": payment.payer_email,
+                "amount_usdc_stroops": payment.amount_usdc_stroops,
+                "stellar_tx_hash": tx.stellar_tx_hash,
+            }),
+        };
+        sender.dispatch(self.wallet_id, &event).await;
     }
 
     /// Fire a `deposit.created` webhook for a newly-recorded deposit. The event echoes the
@@ -312,6 +364,24 @@ impl Ingestor {
     }
 }
 
+/// Extract the operation index from a Horizon TOID (Transaction Operation ID).
+/// 
+/// A TOID has the format: `{ledger}-{tx_index}-{op_index}`, where:
+/// - `ledger` is the ledger sequence number
+/// - `tx_index` is the transaction's index within that ledger
+/// - `op_index` is the operation's index within that transaction
+/// 
+/// Returns `None` if the TOID format is invalid or parsing fails.
+pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
+    // Split on hyphens and take the third component (operation index)
+    let parts: Vec<&str> = toid.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    
+    parts[2].parse::<i32>().ok()
+}
+
 /// Errors from the ingest worker.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
@@ -332,6 +402,9 @@ pub struct Supervisor {
     webhooks: WebhookSender,
     network: &'static str,
     tracker: LastPollTracker,
+    /// Retry/circuit config handed to each per-wallet `Ingestor` built in `tick`.
+    retry: octo_resilience::RetryPolicy,
+    circuit: octo_resilience::CircuitBreaker,
 }
 
 impl Supervisor {
@@ -341,12 +414,36 @@ impl Supervisor {
         webhooks: WebhookSender,
         network: &'static str,
     ) -> Self {
+        // Same defaults the rest of the workspace uses for Horizon clients: open after 5
+        // consecutive failures, probe again after 30s.
+        Self::new_with_resilience(
+            store,
+            horizon_url,
+            webhooks,
+            network,
+            octo_resilience::RetryPolicy::default(),
+            octo_resilience::CircuitBreaker::new(5, Duration::from_secs(30)),
+        )
+    }
+
+    /// Like [`Supervisor::new`] but with explicit resilience configuration (used by
+    /// `bin/server`, which reads retry/circuit settings from env vars).
+    pub fn new_with_resilience(
+        store: Store,
+        horizon_url: String,
+        webhooks: WebhookSender,
+        network: &'static str,
+        retry: octo_resilience::RetryPolicy,
+        circuit: octo_resilience::CircuitBreaker,
+    ) -> Self {
         Self {
             store,
             horizon_url,
             webhooks,
             network,
             tracker: LastPollTracker::new(),
+            retry,
+            circuit,
         }
     }
 
@@ -361,30 +458,62 @@ impl Supervisor {
     }
 
     /// One supervision pass: poll every wallet on this network once.
+    ///
+    /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]), not one at a
+    /// time. Sequential polling meant a single slow/unfunded wallet's Horizon round-trip (or
+    /// retry-with-backoff) blocked every wallet behind it in the list — with hundreds of wallets,
+    /// a deposit on a late one could sit unprocessed for minutes despite the nominal poll
+    /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
+    /// request volume sane regardless of how many wallets exist.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
         let wallets = self.store.list_wallets().await?;
-        let mut total = 0;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
+        let mut tasks = tokio::task::JoinSet::new();
+
         for w in wallets {
             if w.network != self.network {
                 continue;
             }
-            let ingestor = Ingestor::new_with_resilience(
-                self.store.clone(),
-                &self.horizon_url,
-                w.id,
-                w.stellar_account_g.clone(),
-                self.retry.clone(),
-                self.circuit.clone(),
-            )
-            .with_webhooks(self.webhooks.clone())
-            .with_tracker(self.tracker.clone());
-            match ingestor.poll_once(page_limit).await {
-                Ok(n) => total += n,
-                Err(e) => tracing::warn!(wallet = %w.id, error = ?e, "wallet poll failed"),
+            let store = self.store.clone();
+            let horizon_url = self.horizon_url.clone();
+            let webhooks = self.webhooks.clone();
+            let tracker = self.tracker.clone();
+            let retry = self.retry.clone();
+            let circuit = self.circuit.clone();
+            let semaphore = semaphore.clone();
+            tasks.spawn(async move {
+                // Held for the duration of this wallet's poll; bounds how many Horizon requests
+                // are in flight at once without limiting how many wallets we *queue*.
+                let _permit = semaphore.acquire_owned().await;
+                let ingestor = Ingestor::new_with_resilience(
+                    store,
+                    &horizon_url,
+                    w.id,
+                    w.stellar_account_g.clone(),
+                    retry,
+                    circuit,
+                )
+                .with_webhooks(webhooks)
+                .with_tracker(tracker);
+                (w.id, ingestor.poll_once(page_limit).await)
+            });
+        }
+
+        let mut total = 0;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((_wallet_id, Ok(n))) => total += n,
+                Ok((wallet_id, Err(e))) => {
+                    tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed")
+                }
+                Err(e) => tracing::warn!(error = ?e, "wallet poll task panicked"),
             }
         }
         Ok(total)
     }
+
+    /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
+    const MAX_CONCURRENT_POLLS: usize = 20;
 
     /// Get a clone of the `LastPollTracker` to inspect poll lag.
     ///
@@ -555,5 +684,41 @@ mod tests {
             None,
             "memo string one above i64::MAX must be silently unattributed (current documented behavior)"
         );
+    }
+
+    #[test]
+    fn operation_index_from_toid_parses_correctly() {
+        // Standard TOID format: ledger-tx_index-op_index
+        assert_eq!(operation_index_from_toid("12345-1-0"), Some(0));
+        assert_eq!(operation_index_from_toid("12345-1-1"), Some(1));
+        assert_eq!(operation_index_from_toid("12345-10-5"), Some(5));
+        assert_eq!(operation_index_from_toid("999999999-0-99"), Some(99));
+    }
+
+    #[test]
+    fn operation_index_from_toid_handles_invalid_format() {
+        // Missing parts
+        assert_eq!(operation_index_from_toid("12345-1"), None);
+        assert_eq!(operation_index_from_toid("12345"), None);
+        assert_eq!(operation_index_from_toid(""), None);
+        
+        // Too many parts
+        assert_eq!(operation_index_from_toid("12345-1-0-extra"), None);
+        
+        // Non-numeric operation index
+        assert_eq!(operation_index_from_toid("12345-1-abc"), None);
+        assert_eq!(operation_index_from_toid("12345-1-"), None);
+    }
+
+    #[test]
+    fn operation_index_from_toid_handles_edge_cases() {
+        // Negative numbers (invalid for operation index but should parse)
+        assert_eq!(operation_index_from_toid("12345-1--1"), Some(-1));
+        
+        // Large numbers within i32 range
+        assert_eq!(operation_index_from_toid("12345-1-2147483647"), Some(i32::MAX));
+        
+        // Numbers outside i32 range should fail
+        assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
     }
 }

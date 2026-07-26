@@ -5,7 +5,7 @@
 //! `docs/deposit-model.md`).
 
 use crate::auth::authorize_wallet;
-use crate::error::{ApiError, ApiResult, Envelope};
+use crate::error::{ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::routes::wallets::ListParams;
 use crate::state::AppState;
@@ -39,6 +39,11 @@ pub struct AddressView {
     pub base_address: String,
     pub memo_id: i64,
     pub metadata: serde_json::Value,
+    /// Lifetime total (stroops) of confirmed deposits credited to this address. Historical
+    /// bookkeeping, not a live balance — deposits to any address land in the wallet's single
+    /// master account (the point of muxed addresses is that there is nothing to sweep), so this
+    /// will not match a per-address on-chain balance query.
+    pub received_stroops: i64,
 }
 
 /// Paginated list response for addresses.
@@ -93,6 +98,7 @@ pub async fn create_address(
         .await;
     }
 
+    // A brand-new address has no deposits yet, so this is always 0 — no query needed.
     let view = AddressView {
         id: address.id,
         customer_ref: address.customer_ref,
@@ -100,6 +106,7 @@ pub async fn create_address(
         base_address: wallet.stellar_account_g,
         memo_id: address.muxed_id,
         metadata: address.metadata,
+        received_stroops: 0,
     };
     let (status, json) = Envelope::created(view);
     Ok((status, json))
@@ -115,6 +122,8 @@ pub async fn list_addresses(
 ) -> ApiResult<Json<Envelope<AddressListResponse>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
+    // Every address view echoes the wallet's base (G...) account alongside its muxed form.
+    let base = wallet.stellar_account_g.clone();
 
     let limit = crate::routes::wallets::validated_limit(q.limit)?;
 
@@ -135,6 +144,16 @@ pub async fn list_addresses(
         None
     };
 
+    // One batched query for all rows on this page instead of N — see
+    // Store::sum_deposits_for_addresses.
+    let ids: Vec<Uuid> = items.iter().map(|a| a.id).collect();
+    let totals = state
+        .store()
+        .sum_deposits_for_addresses(&ids)
+        .await
+        .map_err(|_| crate::error::ApiError::Internal)?;
+    let totals: std::collections::HashMap<Uuid, i64> = totals.into_iter().collect();
+
     let views = items
         .into_iter()
         .map(|a| AddressView {
@@ -144,6 +163,7 @@ pub async fn list_addresses(
             base_address: base.clone(),
             memo_id: a.muxed_id,
             metadata: a.metadata,
+            received_stroops: totals.get(&a.id).copied().unwrap_or(0),
         })
         .collect();
 

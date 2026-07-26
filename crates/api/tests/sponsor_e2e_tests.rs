@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use octo_api::{build_router, AppState};
-use octo_store::Store;
+use octo_store::{NewSponsoredTx, Store};
 use octo_wallet_core::StellarNetwork;
 use std::sync::{Arc, Mutex, Once};
 use stellar_base::crypto::DalekKeyPair;
@@ -112,17 +112,42 @@ async fn auth_token(app: &Router) -> String {
         .to_string()
 }
 
+/// Create a non-custodial wallet (client-generated key) and provision its gas tank so the
+/// sponsorship path has a server-held fee account to sign fee-bumps with.
 async fn create_wallet(app: &Router, token: &str) -> (String, String) {
+    let account = DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let w = body_json(resp).await;
-    (
-        w["data"]["id"].as_str().unwrap().to_string(),
-        w["data"]["address"].as_str().unwrap().to_string(),
-    )
+    let id = w["data"]["id"].as_str().unwrap().to_string();
+    let address = w["data"]["address"].as_str().unwrap().to_string();
+
+    // Attach the gas tank (the only server-held key for a client wallet).
+    let resp = app
+        .clone()
+        .oneshot(post_auth(&format!("/v1/wallets/{id}/gas-tank"), token))
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "gas tank provisioning must succeed"
+    );
+
+    (id, address)
 }
 
 /// Local mock Horizon that accepts POST /transactions and returns a successful submission.
@@ -389,6 +414,7 @@ async fn e2e_sponsor_update_config_persists() {
     assert_eq!(put_json["data"]["enabled"], true);
     assert_eq!(put_json["data"]["per_tx_fee_cap_stroops"], 500_000);
     assert_eq!(put_json["data"]["daily_budget_stroops"], 10_000_000);
+    assert_eq!(put_json["data"]["fees_spent_today_stroops"], 0);
 
     let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -402,6 +428,50 @@ async fn e2e_sponsor_update_config_persists() {
         get_json["data"]["daily_budget_stroops"],
         put_json["data"]["daily_budget_stroops"]
     );
+}
+
+#[tokio::test]
+async fn e2e_sponsorship_get_counts_only_confirmed_fees_spent_today() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let (wallet_id, _) = create_wallet(&app, &token).await;
+    enable_sponsorship_via_api(&app, &token, &wallet_id).await;
+    let wallet_id = Uuid::parse_str(&wallet_id).expect("wallet UUID");
+
+    state
+        .store()
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("pending-{}", Uuid::new_v4().simple()),
+            fee_stroops: 300,
+        })
+        .await
+        .expect("insert pending sponsored transaction");
+
+    let confirmed = state
+        .store()
+        .record_sponsored_tx(NewSponsoredTx {
+            wallet_id,
+            inner_tx_hash: &format!("confirmed-{}", Uuid::new_v4().simple()),
+            fee_stroops: 700,
+        })
+        .await
+        .expect("insert confirmed sponsored transaction");
+    state
+        .store()
+        .update_sponsored_tx_status(confirmed.id, "confirmed", None, None)
+        .await
+        .expect("confirm sponsored transaction");
+
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["fees_spent_today_stroops"], 700);
 }
 
 #[tokio::test]
@@ -551,6 +621,139 @@ async fn e2e_sponsor_budget_exceeded() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn sponsor_at_exact_fee_cap_succeeds() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+
+    let cap = 250_000_i64;
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &uri,
+            &format!(r#"{{"enabled":true,"per_tx_fee_cap_stroops":{cap}}}"#),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let xdr = random_payment_xdr(&master_g);
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":{cap}}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    if status != StatusCode::CREATED {
+        let json = body_json(resp).await;
+        panic!("expected CREATED at exact cap, got {status}: {json}");
+    }
+}
+
+#[tokio::test]
+async fn sponsor_one_stroop_over_fee_cap_is_rejected() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+
+    let cap = 250_000_i64;
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &uri,
+            &format!(r#"{{"enabled":true,"per_tx_fee_cap_stroops":{cap}}}"#),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let xdr = random_payment_xdr(&master_g);
+    let over_cap = cap + 1;
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":{over_cap}}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains(&cap.to_string()),
+        "expected message to name the cap ({cap}), got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn sponsor_uncapped_per_tx_with_daily_budget_set_succeeds_under_budget() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+
+    // No per_tx_fee_cap_stroops in the request body -> stored as NULL (uncapped per-tx),
+    // while a daily budget is still enforced.
+    let daily_budget = 50_000_000_i64;
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &uri,
+            &format!(r#"{{"enabled":true,"daily_budget_stroops":{daily_budget}}}"#),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let put_json = body_json(resp).await;
+    assert!(
+        put_json["data"]["per_tx_fee_cap_stroops"].is_null(),
+        "per-tx cap must be unset"
+    );
+
+    // A large single fee, well under the daily budget, must be accepted despite having no
+    // per-transaction cap configured.
+    let fee = 20_000_000_i64;
+    let xdr = random_payment_xdr(&master_g);
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":{fee}}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    if status != StatusCode::CREATED {
+        let json = body_json(resp).await;
+        panic!("expected CREATED for uncapped per-tx under budget, got {status}: {json}");
+    }
 }
 
 #[tokio::test]

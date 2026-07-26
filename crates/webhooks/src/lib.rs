@@ -204,14 +204,46 @@ pub fn is_safe_url(url: &str) -> bool {
         Some((_, rest)) => rest,
         None => return false,
     };
-    let raw_host = after_scheme
-        .split(['/', ':', '?', '#'])
-        .next()
-        .unwrap_or("");
-    let host = raw_host.trim_start_matches('[').trim_end_matches(']');
+    // A bracketed IPv6 literal must be extracted before splitting on ':', otherwise
+    // "[fe80::1]/hook" is cut at the first colon and every check below sees "fe80" — matching
+    // nothing, so link-local IPv6 was silently allowed through.
+    let host: &str = if let Some(rest) = after_scheme.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, _)) => inside,
+            None => return false, // malformed bracketed host
+        }
+    } else {
+        after_scheme
+            .split(['/', ':', '?', '#'])
+            .next()
+            .unwrap_or("")
+    };
 
     if host.is_empty() {
         return false;
+    }
+
+    // IPv6 private / non-routable ranges. `host` here is already unbracketed and lowercase.
+    // - ::1        loopback
+    // - fe80::/10  link-local  (fe80..febf)
+    // - fc00::/7   unique local (fc00..fdff)
+    // - ::ffff:x   IPv4-mapped — defer to the IPv4 rules below by unwrapping it
+    if host.contains(':') {
+        if let Some(v4) = host.rsplit_once(':').map(|(_, tail)| tail) {
+            // IPv4-mapped form like ::ffff:127.0.0.1 — re-check the embedded IPv4 literal.
+            if v4.contains('.') {
+                return is_safe_url(&format!("http://{v4}"));
+            }
+        }
+        let first_group = host.split(':').next().unwrap_or("");
+        let is_link_local = first_group.starts_with("fe8")
+            || first_group.starts_with("fe9")
+            || first_group.starts_with("fea")
+            || first_group.starts_with("feb");
+        let is_unique_local = first_group.starts_with("fc") || first_group.starts_with("fd");
+        if is_link_local || is_unique_local {
+            return false;
+        }
     }
     // Block loopback, link-local, metadata, and common private ranges.
     let blocked_exact = [

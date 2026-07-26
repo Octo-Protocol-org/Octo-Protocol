@@ -1,22 +1,12 @@
-//! Withdrawal endpoint: build + sign + submit a payment from the master wallet.
+//! Tombstone for the custodial withdrawal endpoint.
 //!
-//! Security (see `docs/threat-model.md`):
-//! - Idempotency-keyed: a retried request with the same key conflicts instead of double-spending.
-//! - The seed is decrypted, used to sign, and zeroized entirely inside `wallet-core` — this layer
-//!   never sees plaintext key material.
-//! - Only a Payment operation is ever built; the destination and amount are validated server-side.
+//! Removed in the non-custodial cutover: the server no longer holds user wallet keys, so it
+//! cannot sign a payment on the user's behalf. Clients build + sign locally (dashboard/SDK) and
+//! relay through `POST /v1/wallets/:id/submit-signed`.
 
-use crate::error::{ApiError, ApiResult, Envelope};
-use crate::json::parse_optional;
-use crate::state::AppState;
-use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
-use octo_crypto::SealedSeed;
-use octo_wallet_core::{is_valid_account, is_valid_asset_code, sign_payment, PaymentRequest};
-use serde::{Deserialize, Serialize};
-use stellar_base::transaction::MIN_BASE_FEE;
+use crate::error::{ApiError, ApiResult};
+use axum::extract::Path;
+use axum::response::Response;
 use uuid::Uuid;
 
 /// The fee (in stroops) `sign_payment` will charge — always the protocol floor. Kept in sync

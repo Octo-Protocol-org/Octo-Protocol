@@ -47,7 +47,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
-use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -81,6 +80,11 @@ pub struct Claims {
     pub sub: String,
     /// Expiry (unix seconds).
     pub exp: i64,
+    /// Unique token id. Without it, two tokens issued for the same user within the same second
+    /// are byte-identical, so "rotating" a token on refresh would hand back the same string —
+    /// and denylisting the old one would revoke the new one too.
+    #[serde(default)]
+    pub jti: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,13 +185,32 @@ pub async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    let user_id = authenticate(&headers, &state)?;
+    let user_id = authenticate(&headers, &state).await?;
     let user = state
         .store()
         .get_user(user_id)
         .await
         .map_err(|_| ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
+
+    // Rotate, don't just re-issue: deny-list the presented token so a refreshed session leaves
+    // exactly one live token. Without this a leaked token stayed valid for its full TTL even
+    // after the user refreshed.
+    if let Some(old_token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        if let Some(claims) = verify_token(state.jwt_secret(), old_token) {
+            let expires_at =
+                chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
+            state
+                .store()
+                .denylist_token(&hash_token(old_token), user.id, expires_at)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+        }
+    }
 
     crate::audit::record(
         &state,
@@ -349,11 +372,6 @@ pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
     Some(claims)
 }
 
-/// Extract the `exp` claim from a structurally valid, unexpired token.
-fn token_exp(secret: &[u8], token: &str) -> Option<i64> {
-    verify_token(secret, token).map(|c| c.exp)
-}
-
 fn sign_hs256(secret: &[u8], input: &[u8]) -> String {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(input);
@@ -498,4 +516,102 @@ pub async fn require_login(
         }
     }
     authenticate(headers, state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &[u8] = b"unit-test-jwt-secret";
+
+    /// Test-only: build and sign a JWT with an arbitrary `exp`, bypassing `issue_token`'s
+    /// "always TOKEN_TTL_SECS from now" policy so expiry can be tested precisely. Signs the
+    /// token exactly the way `issue_token` does (same header, same `sign_hs256` call) so this
+    /// only varies `exp` — it does not exercise a different code path than production tokens.
+    fn issue_token_with_exp(secret: &[u8], user_id: Uuid, exp: i64) -> String {
+        let claims = Claims { sub: user_id.to_string(), exp };
+        let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
+        let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
+        let sig = sign_hs256(secret, signing_input.as_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token_with_exp(SECRET, user_id, now_secs() - 1);
+        assert!(verify_token(SECRET, &token).is_none());
+    }
+
+    #[test]
+    fn tampered_signature_byte_is_rejected() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
+
+        let sig_bytes = b64_decode(parts[2]).expect("signature segment must be valid base64");
+        for i in 0..sig_bytes.len() {
+            let mut flipped = sig_bytes.clone();
+            flipped[i] ^= 0x01;
+            let flipped_b64 = b64(&flipped);
+            let tampered = format!("{}.{}.{}", parts[0], parts[1], flipped_b64);
+            assert!(
+                verify_token(SECRET, &tampered).is_none(),
+                "flipping byte {i} of the signature should invalidate the token"
+            );
+        }
+
+        // Sanity check: the original, untampered token must still verify.
+        assert!(verify_token(SECRET, &token).is_some());
+    }
+
+    #[test]
+    fn tampered_payload_byte_is_rejected() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
+
+        let payload_bytes = b64_decode(parts[1]).expect("payload segment must be valid base64");
+        for i in 0..payload_bytes.len() {
+            let mut flipped = payload_bytes.clone();
+            flipped[i] ^= 0x01;
+            let flipped_b64 = b64(&flipped);
+            // Still syntactically valid URL-safe base64 (no padding, same charset) — just no
+            // longer matches the signature that was computed over the original payload.
+            let tampered = format!("{}.{}.{}", parts[0], flipped_b64, parts[2]);
+            assert!(
+                verify_token(SECRET, &tampered).is_none(),
+                "flipping byte {i} of the payload should invalidate the token"
+            );
+        }
+
+        assert!(verify_token(SECRET, &token).is_some());
+    }
+
+    #[test]
+    fn non_standard_header_segment_is_rejected() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
+
+        // `{"alg":"none","typ":"JWT"}` — the classic "alg: none" downgrade attempt. The
+        // signature segment is irrelevant here: verify_token must reject on the header check
+        // alone, before ever reaching signature verification.
+        let none_header = b64(br#"{"alg":"none","typ":"JWT"}"#);
+        assert_ne!(none_header, JWT_HEADER_B64);
+        let tampered = format!("{}.{}.{}", none_header, parts[1], parts[2]);
+        assert!(verify_token(SECRET, &tampered).is_none());
+
+        // Also confirm a header that isn't even valid JSON (garbage bytes) is rejected the
+        // same way, and doesn't panic.
+        let garbage_header = b64(b"not-a-jwt-header");
+        assert_ne!(garbage_header, JWT_HEADER_B64);
+        let tampered = format!("{}.{}.{}", garbage_header, parts[1], parts[2]);
+        assert!(verify_token(SECRET, &tampered).is_none());
+
+        assert!(verify_token(SECRET, &token).is_some());
+    }
 }

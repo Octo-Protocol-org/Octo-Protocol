@@ -12,14 +12,15 @@ mod json;
 pub mod routes;
 pub mod sponsor_validation;
 mod state;
+pub mod submit_validation;
 
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::limit::RequestBodyLimitLayer;
 
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
 ///
@@ -35,8 +36,10 @@ pub fn build_router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only
+    // affect routes added before them, so it covered nothing. It is now applied at the end,
+    // together with the error handler that turns an oversized body into a 413 envelope.
     Router::new()
-        .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT))
         .route("/health", get(health))
         .route("/v1/auth/signup", post(auth::signup))
         .route("/v1/auth/login", post(auth::login))
@@ -65,17 +68,15 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/webhooks",
             post(routes::webhooks::create_webhook).get(routes::webhooks::list_webhooks),
         )
+        // NOTE: this deliveries route was registered twice by the merge; axum panics at startup
+        // on a duplicate path, so the second registration was removed.
         .route(
             "/v1/wallets/:id/webhooks/:endpoint_id/deliveries",
             get(routes::webhooks::list_deliveries),
         )
         .route(
             "/v1/wallets/:id/webhooks/:endpoint_id",
-            axum::routing::delete(routes::webhooks::delete_webhook),
-        )
-        .route(
-            "/v1/wallets/:id/webhooks/:endpoint_id/deliveries",
-            get(routes::webhooks::list_deliveries),
+            delete(routes::webhooks::delete_webhook),
         )
         .route(
             "/v1/wallets/:id/api-key",
@@ -83,9 +84,28 @@ pub fn build_router(state: AppState) -> Router {
                 .get(routes::apikeys::get_key)
                 .delete(routes::apikeys::delete_key),
         )
+        // Custodial signing tombstones (410 Gone since the non-custodial cutover).
         .route(
             "/v1/wallets/:id/withdraw",
             post(routes::withdrawals::withdraw),
+        )
+        .route(
+            "/v1/wallets/:id/trustlines",
+            post(routes::trustlines::add_trustline),
+        )
+        // Non-custodial path: clients sign locally and relay through these.
+        .route(
+            "/v1/wallets/:id/submit-signed",
+            post(routes::submit::submit_signed),
+        )
+        .route(
+            "/v1/wallets/:id/signing-info",
+            get(routes::submit::signing_info),
+        )
+        .route("/v1/wallets/:id/backup", get(routes::wallets::get_backup))
+        .route(
+            "/v1/wallets/:id/gas-tank",
+            post(routes::wallets::create_gas_tank),
         )
         .route(
             "/v1/wallets/:id/sponsorship",
@@ -96,11 +116,55 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
         )
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_errors))
-                .layer(cors),
+        .route(
+            "/v1/wallets/:id/whitelist/config",
+            get(routes::whitelist::get_config).put(routes::whitelist::put_config),
         )
+        .route(
+            "/v1/wallets/:id/whitelist",
+            get(routes::whitelist::list_addresses).post(routes::whitelist::add_address),
+        )
+        .route(
+            "/v1/wallets/:id/whitelist/:entry_id",
+            delete(routes::whitelist::remove_address),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links",
+            post(routes::payment_links::create_payment_link)
+                .get(routes::payment_links::list_payment_links),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id",
+            get(routes::payment_links::get_payment_link)
+                .put(routes::payment_links::set_payment_link_active),
+        )
+        // Public: no auth, reachable by anyone with the link.
+        .route(
+            "/v1/pay/:slug",
+            get(routes::payment_links::get_public_payment_link),
+        )
+        .route(
+            "/v1/pay/:slug/intent",
+            post(routes::payment_links::create_payment_intent),
+        )
+        .route(
+            "/v1/pay/:slug/payments/:payment_id",
+            get(routes::payment_links::get_payment_status),
+        )
+        .route(
+            "/v1/pay/:slug/signing-info",
+            get(routes::payment_links::public_signing_info),
+        )
+        .route(
+            "/v1/pay/:slug/submit-signed",
+            post(routes::payment_links::submit_payment),
+        )
+        // axum's own body limit: it produces a real `LengthLimitError`-backed rejection that the
+        // framework renders as 413, so no fallible tower layer (and no HandleErrorLayer) is
+        // needed. tower_http's RequestBodyLimitLayer would require one and does not compose
+        // cleanly with `Router::layer` here.
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -109,24 +173,6 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Custom error handler to wrap oversized body rejections (413) in the standard envelope.
-async fn handle_errors(err: BoxError) -> Response {
-    if err.is::<tower::timeout::error::Elapsed>() {
-        return (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response();
-    }
-
-    if err.is::<axum::extract::rejection::PayloadTooLarge>() {
-        return error::Envelope::error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Request body too large".to_string(),
-            None,
-        )
-        .into_response();
-    }
-
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Unhandled internal error: {}", err),
-    )
-        .into_response()
-}
+// NOTE: a `handle_errors` HandleErrorLayer helper lived here to convert oversized-body errors
+// into a 413 envelope. It is unnecessary with `DefaultBodyLimit` (axum renders that rejection as
+// 413 itself) and did not satisfy `Router::layer`'s Service bounds, so it was removed.

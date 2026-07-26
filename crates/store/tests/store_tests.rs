@@ -7,7 +7,9 @@
 //! print a clear SKIPPED message and pass (so a DB-less `cargo test` of the whole workspace is
 //! green). If a URL is found but the DB is unreachable, the test fails loudly with the reason.
 
-use octo_store::{NewDeposit, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError};
+use octo_store::{
+    NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
+};
 use std::sync::Once;
 use uuid::Uuid;
 
@@ -48,7 +50,7 @@ async fn fresh_wallet(store: &Store) -> Uuid {
             sealed_ciphertext: b"ciphertext",
             sealed_nonce: b"nonce12bytes",
             sealed_salt: b"saltsaltsaltsalt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: Some("test"),
             user_id: None,
             description: None,
@@ -98,7 +100,7 @@ async fn allocate_address_increments_atomically() {
     assert_eq!(b.muxed_id, 2);
     assert_ne!(a.muxed_address, b.muxed_address);
 
-    let list = store.list_addresses(wallet_id).await.expect("list");
+    let list = store.list_addresses(wallet_id, 100, None).await.expect("list");
     assert_eq!(list.len(), 2);
 }
 
@@ -134,7 +136,7 @@ async fn record_deposit_is_idempotent() {
         "duplicate deposit must be a no-op (anti double-credit)"
     );
 
-    let txs = store.list_transactions(wallet_id).await.expect("list");
+    let txs = store.list_transactions(wallet_id, 100, None).await.expect("list");
     assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain op");
 }
 
@@ -166,7 +168,206 @@ async fn different_op_index_same_tx_is_distinct() {
 
     assert!(store.record_deposit(&base).await.expect("op0").is_some());
     assert!(store.record_deposit(&op1).await.expect("op1").is_some());
-    assert_eq!(store.list_transactions(wallet_id).await.unwrap().len(), 2);
+    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn sum_deposits_for_address_totals_only_that_addresss_confirmed_deposits() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let addr_a = store
+        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-a-{id}")), Some("a"), serde_json::json!({}))
+        .await
+        .expect("alloc a");
+    let addr_b = store
+        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-b-{id}")), Some("b"), serde_json::json!({}))
+        .await
+        .expect("alloc b");
+
+    // Two deposits to A, one to B — A's total must be the sum of only its own two, not B's.
+    for (i, amount) in [(0, 10_000_000i64), (1, 2_500_000)] {
+        let tx_hash = Uuid::new_v4().to_string();
+        store
+            .record_deposit(&NewDeposit {
+                wallet_id,
+                address_id: Some(addr_a.id),
+                asset_code: "native".into(),
+                asset_issuer: None,
+                amount_stroops: amount,
+                source_account: Some("Gsender".into()),
+                destination_account: Some("Gmaster".into()),
+                stellar_tx_hash: tx_hash.clone(),
+                operation_index: i,
+                horizon_op_id: format!("{tx_hash}-{i}"),
+                ledger: Some(1),
+                memo_id: None,
+            })
+            .await
+            .expect("record deposit to a");
+    }
+    let tx_hash_b = Uuid::new_v4().to_string();
+    store
+        .record_deposit(&NewDeposit {
+            wallet_id,
+            address_id: Some(addr_b.id),
+            asset_code: "native".into(),
+            asset_issuer: None,
+            amount_stroops: 999_000_000,
+            source_account: Some("Gsender".into()),
+            destination_account: Some("Gmaster".into()),
+            stellar_tx_hash: tx_hash_b.clone(),
+            operation_index: 0,
+            horizon_op_id: format!("{tx_hash_b}-0"),
+            ledger: Some(1),
+            memo_id: None,
+        })
+        .await
+        .expect("record deposit to b");
+
+    assert_eq!(
+        store.sum_deposits_for_address(addr_a.id).await.expect("sum a"),
+        12_500_000,
+        "A's total must be the sum of its own two deposits, unaffected by B's"
+    );
+    assert_eq!(
+        store.sum_deposits_for_address(addr_b.id).await.expect("sum b"),
+        999_000_000
+    );
+
+    // A brand-new address with no deposits sums to 0, not an error.
+    let addr_c = store
+        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-c-{id}")), Some("c"), serde_json::json!({}))
+        .await
+        .expect("alloc c");
+    assert_eq!(store.sum_deposits_for_address(addr_c.id).await.expect("sum c"), 0);
+
+    // The batched form must agree with the per-address form, and only return entries that
+    // actually have deposits (address C has none, so it's absent rather than a zero row).
+    let batched = store
+        .sum_deposits_for_addresses(&[addr_a.id, addr_b.id, addr_c.id])
+        .await
+        .expect("batched sum");
+    let totals: std::collections::HashMap<Uuid, i64> = batched.into_iter().collect();
+    assert_eq!(totals.get(&addr_a.id), Some(&12_500_000));
+    assert_eq!(totals.get(&addr_b.id), Some(&999_000_000));
+    assert_eq!(
+        totals.get(&addr_c.id),
+        None,
+        "an address with zero deposits has no row in the batched result (GROUP BY yields nothing)"
+    );
+
+    // Empty id list must short-circuit to an empty result, not error or scan the whole table.
+    assert_eq!(
+        store.sum_deposits_for_addresses(&[]).await.expect("empty batch"),
+        Vec::new()
+    );
+}
+
+#[tokio::test]
+async fn payment_link_lifecycle_intent_confirm_and_sum() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let addr = store
+        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-{id}")), None, serde_json::json!({}))
+        .await
+        .expect("alloc address");
+
+    let slug = format!("link-{wid}");
+    let link = store
+        .create_payment_link(NewPaymentLink {
+            wallet_id,
+            address_id: addr.id,
+            slug: &slug,
+            name: "Support octo",
+            description: Some("donations"),
+            image_url: None,
+            amount_usdc_stroops: None,
+        })
+        .await
+        .expect("create link");
+    assert_eq!(link.slug, slug);
+    assert!(link.active);
+
+    // Public lookup by slug must work with no wallet_id in hand.
+    let by_slug = store.get_payment_link_by_slug(&slug).await.expect("by slug");
+    assert_eq!(by_slug.id, link.id);
+
+    // A fresh link has nothing collected yet.
+    assert_eq!(store.sum_payment_link_collected(link.id).await.expect("sum"), 0);
+
+    let intent = store
+        .record_payment_link_intent(link.id, Some("Ada"), Some("ada@example.com"), 10_000_000)
+        .await
+        .expect("record intent");
+    assert_eq!(intent.status, "pending");
+
+    let oldest = store
+        .oldest_pending_payment_link_payment(link.id)
+        .await
+        .expect("oldest pending")
+        .expect("one pending row");
+    assert_eq!(oldest.id, intent.id);
+
+    let tx_hash = Uuid::new_v4().to_string();
+    let dep = store
+        .record_deposit(&NewDeposit {
+            wallet_id,
+            address_id: Some(addr.id),
+            asset_code: "USDC".into(),
+            asset_issuer: Some("GISSUER".into()),
+            amount_stroops: 10_000_000,
+            source_account: Some("Gpayer".into()),
+            destination_account: Some("Gmaster".into()),
+            stellar_tx_hash: tx_hash.clone(),
+            operation_index: 0,
+            horizon_op_id: format!("{tx_hash}-0"),
+            ledger: Some(1),
+            memo_id: None,
+        })
+        .await
+        .expect("record deposit")
+        .expect("first insert");
+
+    store
+        .confirm_payment_link_payment(intent.id, dep.id)
+        .await
+        .expect("confirm payment");
+
+    let confirmed = store
+        .get_payment_link_payment(link.id, intent.id)
+        .await
+        .expect("get payment");
+    assert_eq!(confirmed.status, "confirmed");
+    assert_eq!(confirmed.transaction_id, Some(dep.id));
+
+    // Once confirmed, it's no longer the oldest pending (there is none left).
+    assert!(store
+        .oldest_pending_payment_link_payment(link.id)
+        .await
+        .expect("oldest pending after confirm")
+        .is_none());
+
+    assert_eq!(
+        store.sum_payment_link_collected(link.id).await.expect("sum after confirm"),
+        10_000_000
+    );
+
+    let batch = store
+        .sum_payment_link_collected_batch(&[link.id])
+        .await
+        .expect("batch sum");
+    assert_eq!(batch, vec![(link.id, 10_000_000)]);
+
+    // Deactivating is scoped to the owning wallet.
+    let deactivated = store
+        .set_payment_link_active(wallet_id, link.id, false)
+        .await
+        .expect("deactivate");
+    assert!(!deactivated.active);
 }
 
 #[tokio::test]
@@ -304,6 +505,40 @@ async fn sum_fees_today_counts_only_confirmed() {
 }
 
 #[tokio::test]
+async fn sum_fees_today_can_use_wallet_status_created_at_index() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    let mut tx = store.pool().begin().await.expect("begin transaction");
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *tx)
+        .await
+        .expect("disable sequential scans for index eligibility check");
+    let plan: Vec<String> = sqlx::query_scalar(
+        r#"EXPLAIN (COSTS OFF)
+           SELECT COALESCE(SUM(fee_stroops), 0)::bigint
+           FROM sponsored_transactions
+           WHERE wallet_id = $1
+             AND status = 'confirmed'
+             AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')"#,
+    )
+    .bind(wallet_id)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain sum_sponsored_fees_today");
+    let plan = plan.join("\n");
+
+    assert!(
+        plan.contains("idx_sponsored_wallet_status_"),
+        "expected the wallet/status/created_at index, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan"),
+        "sum query must not require a full table scan:\n{plan}"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_inner_tx_hash_is_conflict() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
@@ -377,11 +612,18 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/ (0001_init.sql .. 0007_gas_sponsorship.sql).
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0014.
+    //
+    // NOTE: this version number is a repeat offender — five migrations have now landed with a
+    // colliding 0008 at one point or another (scheme_version, token_denylist,
+    // sponsored_tx_status_index, sponsored_and_audit_indexing, client_custody). sqlx keys
+    // migrations by version, so only one of any colliding set could ever apply and the rest
+    // silently never ran. This assertion is what guards against that recurring, so it must list
+    // every version explicitly rather than just checking a count.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7],
-        "expected exactly the seven known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        "expected exactly the fourteen known migrations to be recorded as applied"
     );
 }
 

@@ -82,7 +82,7 @@ async fn submit_handler(State(s): State<MockState>) -> axum::response::Response<
 
 async fn start_mock(state: MockState) -> (String, MockState) {
     let app = Router::new()
-        .route("/accounts/{account}", get(account_handler))
+        .route("/accounts/:account", get(account_handler))
         .route("/transactions", post(submit_handler))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -18,3 +18,20 @@ where
     }
     serde_json::from_slice::<T>(bytes).map_err(|_| ApiError::BadRequest("invalid JSON body".into()))
 }
+
+/// Serialize an `i64` as a JSON **string**.
+///
+/// For values that can exceed JavaScript's `Number.MAX_SAFE_INTEGER` (9,007,199,254,740,991),
+/// a JSON number is lossy: `JSON.parse` rounds it to the nearest float64, silently changing the
+/// value. Stellar sequence numbers are already ~1.6e16, so they must cross the wire as strings —
+/// which is exactly why Horizon returns them that way too.
+///
+/// Serialize-only on purpose: the types using this are response bodies, so adding a matching
+/// `deserialize` here would just be dead code.
+pub mod i64_as_string {
+    use serde::Serializer;
+
+    pub fn serialize<S: Serializer>(value: &i64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&value.to_string())
+    }
+}

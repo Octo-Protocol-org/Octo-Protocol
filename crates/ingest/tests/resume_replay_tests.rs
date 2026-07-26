@@ -17,7 +17,7 @@ use axum::routing::get;
 use axum::Router;
 use octo_ingest::horizon::{PaymentRecord, TransactionRecord};
 use octo_ingest::{Ingestor, Processed};
-use octo_store::{NewWallet, Store};
+use octo_store::Store;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex, Once};
 use uuid::Uuid;
@@ -106,7 +106,7 @@ async fn mock_payments_handler(
 async fn start_mock_horizon(state: MockState) -> (String, Arc<Mutex<usize>>) {
     let call_count = state.call_count.clone();
     let app = Router::new()
-        .route("/accounts/{account}/payments", get(mock_payments_handler))
+        .route("/accounts/:account/payments", get(mock_payments_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -135,6 +135,7 @@ async fn setup_with_horizon(db_url: &str, horizon_url: &str) -> Option<(Store, I
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,
@@ -178,7 +179,7 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     let n = ingestor.poll_once(10).await.expect("first poll_once");
     assert_eq!(n, 3, "first poll should process all 3 records");
 
-    let tx_count_after_first = store.list_transactions(wallet_id).await.unwrap().len();
+    let tx_count_after_first = store.list_transactions(wallet_id, 100, None).await.unwrap().len();
     assert_eq!(tx_count_after_first, 3);
 
     // Verify cursor was advanced to the last record's paging token.
@@ -194,7 +195,7 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     let n2 = ingestor.poll_once(10).await.expect("second poll_once");
     assert_eq!(n2, 0, "resumed poll must process zero new records");
 
-    let tx_count_after_second = store.list_transactions(wallet_id).await.unwrap().len();
+    let tx_count_after_second = store.list_transactions(wallet_id, 100, None).await.unwrap().len();
     assert_eq!(
         tx_count_after_second, 3,
         "no new deposits must be recorded on cursor-resume"
@@ -238,6 +239,7 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,
@@ -280,7 +282,7 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
     }
 
     // No additional deposits must have been recorded.
-    let tx_count_after_second = store.list_transactions(wallet.id).await.unwrap().len();
+    let tx_count_after_second = store.list_transactions(wallet.id, 100, None).await.unwrap().len();
     assert_eq!(
         tx_count_after_second, 5,
         "out-of-order replay must not create any new deposit rows"
