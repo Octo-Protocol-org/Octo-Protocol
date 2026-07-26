@@ -577,12 +577,21 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn put_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
+/// POST JSON with an Authorization bearer token plus one extra caller-supplied header (e.g.
+/// `Idempotency-Key`), for tests that need to distinguish header-supplied values from body ones.
+fn post_json_auth_with_header(
+    uri: &str,
+    body: &str,
+    token: &str,
+    header_name: &str,
+    header_value: &str,
+) -> Request<Body> {
     Request::builder()
-        .method("PUT")
+        .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
+        .header(header_name, header_value)
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -656,6 +665,241 @@ async fn submit_signed_requires_transaction_xdr() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The route reads the idempotency key from the `Idempotency-Key` header first, falling back to
+/// the body's `idempotency_key` only when the header is absent. Prove the header is what's
+/// actually checked (not the body) by pre-inserting a withdrawal keyed on the header's value
+/// (simulating a prior request, same technique as `withdraw_duplicate_idempotency_key_conflicts_
+/// before_signing` — this avoids a real request needing a live Horizon round trip) and then
+/// sending a request whose header repeats that key while the body carries a *different* key. If
+/// the body were consulted instead of the header, no matching row would exist and the request
+/// would sail past the conflict check into Horizon calls instead of 409ing here.
+#[tokio::test]
+async fn withdraw_header_idempotency_key_takes_precedence_over_body() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    // Simulate a prior request whose *header* key was "A" (and whose body, irrelevant now, might
+    // have carried something else entirely — only the header value ends up persisted).
+    let header_key = format!("key-a-{}", uuid::Uuid::new_v4());
+    state
+        .store()
+        .create_withdrawal(octo_store::NewWithdrawal {
+            wallet_id: wallet_id.parse().unwrap(),
+            idempotency_key: &header_key,
+            destination_account: "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6",
+            asset_code: "native",
+            asset_issuer: None,
+            amount_stroops: 100,
+            memo_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Retry: header repeats key "A" (the one already used), body carries a distinct, never-seen
+    // key "C". If precedence were wrong and the body key were checked, this would NOT conflict.
+    let body_key = format!("key-c-{}", uuid::Uuid::new_v4());
+    let body = format!(
+        r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{body_key}"}}"#
+    );
+    let resp = app
+        .oneshot(post_json_auth_with_header(
+            &uri,
+            &body,
+            &token,
+            "Idempotency-Key",
+            &header_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "header idempotency key must be the one checked, proving header-over-body precedence"
+    );
+}
+
+/// When no `Idempotency-Key` header is sent at all, the body's `idempotency_key` field must still
+/// be honored end-to-end: a request carrying only a body key that collides with an existing
+/// withdrawal must 409 (not 400 "missing key"), proving the fallback path correctly extracts and
+/// uses the body value for the real conflict check.
+#[tokio::test]
+async fn withdraw_body_only_idempotency_key_works() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    let key = format!("key-body-only-{}", uuid::Uuid::new_v4());
+    state
+        .store()
+        .create_withdrawal(octo_store::NewWithdrawal {
+            wallet_id: wallet_id.parse().unwrap(),
+            idempotency_key: &key,
+            destination_account: "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6",
+            asset_code: "native",
+            asset_issuer: None,
+            amount_stroops: 100,
+            memo_id: None,
+        })
+        .await
+        .unwrap();
+
+    // No Idempotency-Key header at all — only the body field.
+    let body = format!(
+        r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}"}}"#
+    );
+    let resp = app
+        .oneshot(post_json_auth(&uri, &body, &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "body-only idempotency key must be used for the conflict check (fallback path works)"
+    );
+}
+
+/// Neither the header nor the body supply an idempotency key → 400 with the exact message the
+/// route returns for a missing key.
+#[tokio::test]
+async fn withdraw_missing_idempotency_key_is_400() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    let body = r#"{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100}"#;
+    let resp = app
+        .oneshot(post_json_auth(&uri, body, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["message"],
+        "idempotency key required (Idempotency-Key header or body)"
+    );
+}
+
+/// An empty-string idempotency key must be treated as if it were absent (per the route's
+/// `.filter(|k| !k.is_empty())`), in every position it can appear:
+///   - empty header, no body key at all
+///   - no header, empty body key
+///   - empty header *with* a valid, non-empty body key present — because `.or()` only falls back
+///     to the body when the header is `None`, an empty (but present) header short-circuits that
+///     fallback and must still 400, even though a perfectly good body key was sent alongside it.
+#[tokio::test]
+async fn withdraw_empty_string_idempotency_key_is_treated_as_absent() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(post_auth("/v1/wallets", &token))
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/wallets/{wallet_id}/withdraw");
+
+    let dest_and_amount = r#""destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100"#;
+
+    // Case 1: empty-string header, no body key.
+    let body = format!(r#"{{{dest_and_amount}}}"#);
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth_with_header(
+            &uri,
+            &body,
+            &token,
+            "Idempotency-Key",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty-string header with no body key must be treated as absent"
+    );
+
+    // Case 2: no header, empty-string body key.
+    let body = format!(r#"{{{dest_and_amount},"idempotency_key":""}}"#);
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&uri, &body, &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty-string body key with no header must be treated as absent"
+    );
+
+    // Case 3: empty-string header *and* a valid, non-empty body key. The empty header must win
+    // (and thus still 400) rather than falling back to the good body key, since `Option::or` only
+    // substitutes on `None`, not on `Some("")`.
+    let body = format!(r#"{{{dest_and_amount},"idempotency_key":"a-perfectly-good-key"}}"#);
+    let resp = app
+        .oneshot(post_json_auth_with_header(
+            &uri,
+            &body,
+            &token,
+            "Idempotency-Key",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "empty-string header must shadow a valid body key, not fall back to it"
+    );
+}
+
+/// Regression coverage for the withdrawal route's use of the shared
+/// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
+/// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
+/// is ever created, not merely fail later at signing.
 #[tokio::test]
 async fn custodial_trustline_is_gone() {
     let Some(state) = test_state().await else {
