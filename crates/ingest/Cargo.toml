@@ -27,6 +27,4 @@ dotenvy = "0.15"
 axum.workspace = true
 octo-webhooks.workspace = true
 proptest.workspace = true
-# Mock Horizon server for the payments / resume-replay tests. Pinned for the same MSRV reason
-# as crates/api: newer 0.6.x needs edition2024 (Rust >= 1.85); toolchain is pinned to 1.84.1.
-wiremock = "=0.6.2"
+sqlx.workspace = true
