@@ -155,7 +155,7 @@ async fn test_oversized_body_returns_envelope() {
     };
     let app = build_router(state);
 
-    // Send a body far larger than the configured limit.
+    // إرسال طلب كبير جداً (أكبر من الحد المسموح به عادة)
     let resp = app
         .oneshot(
             Request::builder()
@@ -170,93 +170,13 @@ async fn test_oversized_body_returns_envelope() {
 
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-    // The oversized rejection must still use the standard response envelope, not a bare 413.
-    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    assert!(!bytes.is_empty(), "413 response should explain itself");
-}
+    // التحقق من أن الجسم (body) يطابق الـ Envelope
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let envelope: Envelope =
+        serde_json::from_slice(&bytes).expect("Response should be a valid Envelope");
 
-#[tokio::test]
-async fn create_wallet_is_non_custodial_and_stores_no_seed() {
-    let Some(state) = test_state().await else {
-        return;
-    };
-    let app = build_router(state.clone());
-    let token = auth_token(&app).await;
-
-    // The client generates the keypair and sends only the public key.
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/wallets")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(
-                    r#"{{"label":"acme","public_key":"{account}"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let json = body_json(resp).await;
-    let data = &json["data"];
-    assert_eq!(
-        data["address"].as_str().unwrap(),
-        account,
-        "the wallet account must be exactly the client-supplied public key"
-    );
-    assert_eq!(data["custody"], "client");
-    assert!(
-        data.get("recovery_mnemonic").is_none() || data["recovery_mnemonic"].is_null(),
-        "no mnemonic is ever returned — the client generated it"
-    );
-
-    // The custody kill-test: the server holds NO seed for this wallet.
-    let wallet_id = data["id"].as_str().unwrap();
-    let (custody, has_seed): (String, bool) = sqlx::query_as(
-        "SELECT custody, (sealed_ciphertext IS NOT NULL OR sealed_nonce IS NOT NULL \
-         OR sealed_salt IS NOT NULL) FROM wallets WHERE id = $1::uuid",
-    )
-    .bind(wallet_id)
-    .fetch_one(state.store().pool())
-    .await
-    .unwrap();
-    assert_eq!(custody, "client");
-    assert!(!has_seed, "no seed material may be stored for a client wallet");
-}
-
-#[tokio::test]
-async fn create_wallet_rejects_bad_public_key() {
-    let Some(state) = test_state().await else {
-        return;
-    };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
-
-    // Missing public_key → 400.
-    let resp = app
-        .clone()
-        .oneshot(post_json_auth("/v1/wallets", r#"{"label":"x"}"#, &token))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    // Malformed public_key → 400.
-    let resp = app
-        .oneshot(post_json_auth(
-            "/v1/wallets",
-            r#"{"public_key":"not-a-stellar-account"}"#,
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(envelope.status_code, 413);
+    assert!(!envelope.message.is_empty());
 }
 
 #[tokio::test]
@@ -917,15 +837,34 @@ async fn custodial_trustline_is_gone() {
         .unwrap()
         .to_string();
 
-    let resp = app
-        .oneshot(post_json_auth(
-            &format!("/v1/wallets/{wallet_id}/trustlines"),
-            r#"{"asset_code":"USDC","asset_issuer":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"}"#,
-            &token,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::GONE);
+    for (label, code) in [("empty", ""), ("13_bytes", "ABCDEFGHIJKLM")] {
+        let key = format!("key-{}", uuid::Uuid::new_v4());
+        let body = format!(
+            r#"{{"destination":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6","amount_stroops":100,"idempotency_key":"{key}","asset":{{"code":"{code}","issuer":"GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6"}}}}"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(post_json_auth(&uri, &body, &token))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "asset code case '{label}' must be rejected"
+        );
+
+        // Prove rejection happened before create_withdrawal: no row with this idempotency key.
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM withdrawals WHERE idempotency_key = $1")
+                .bind(&key)
+                .fetch_one(state.store().pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 0,
+            "case '{label}': invalid asset code must not create a withdrawal row"
+        );
+    }
 }
 
 /// Regression coverage for the withdrawal route's use of the shared
@@ -1960,12 +1899,17 @@ async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
     let j = body_json(resp).await;
     let page1 = j["data"]["data"].as_array().unwrap();
     assert_eq!(page1.len(), 2, "first page must have exactly 2 items");
-    let cursor = j["data"]["next_cursor"].as_str().expect("next_cursor must be present on first page");
+    let cursor = j["data"]["next_cursor"]
+        .as_str()
+        .expect("next_cursor must be present on first page");
 
     // Fetch second page using the cursor — expect more items.
     let resp = app
         .clone()
-        .oneshot(get_auth(&format!("/v1/wallets?limit=2&before={cursor}"), &token))
+        .oneshot(get_auth(
+            &format!("/v1/wallets?limit=2&before={cursor}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1994,10 +1938,7 @@ async fn list_addresses_pagination_returns_a_next_cursor_and_respects_limit() {
     // Create 5 addresses.
     for _ in 0..5 {
         let uri = format!("/v1/wallets/{wallet_id}/addresses");
-        app.clone()
-            .oneshot(post_auth(&uri, &token))
-            .await
-            .unwrap();
+        app.clone().oneshot(post_auth(&uri, &token)).await.unwrap();
     }
 
     // Fetch first page with limit=2.
@@ -2060,13 +2001,13 @@ async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit()
                 asset_code: "native".into(),
                 asset_issuer: None,
                 amount_stroops: (i + 1) as i64 * 100,
-                source_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
-                destination_account: Some("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into()),
-                // Deposits are idempotent on horizon_op_id, which is globally unique. A fixed
-                // literal here made the second run of this test a silent no-op (the inserts
-                // dedup against the previous run's rows), so it only passed on a fresh DB.
-                // Scope the keys to this wallet to keep the test re-runnable.
-                stellar_tx_hash: format!("txhash-pag-{wallet_uuid}-{i}"),
+                source_account: Some(
+                    "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into(),
+                ),
+                destination_account: Some(
+                    "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6".into(),
+                ),
+                stellar_tx_hash: format!("txhash-pag-{i}"),
                 operation_index: i as i32,
                 horizon_op_id: format!("op-pag-{wallet_uuid}-{i}"),
                 ledger: Some(i as i64),

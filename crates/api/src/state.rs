@@ -73,11 +73,9 @@ impl AppState {
     ) -> Self {
         let mut secret = vec![0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-        // `master_key_next` is None here; callers opt into rotation via `with_master_key_next`.
         Self::build(
             store,
             master_key,
-            None,
             network,
             horizon_url,
             friendbot_url,

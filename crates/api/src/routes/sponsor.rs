@@ -122,7 +122,7 @@ pub async fn sponsor(
         max_base_fee_stroops: max_fee,
     };
     let signed = match sign_fee_bump(
-        state.master_key_for_scheme(scheme),
+        state.master_key_for_scheme(wallet.sealed_scheme),
         &sealed,
         state.network(),
         0,

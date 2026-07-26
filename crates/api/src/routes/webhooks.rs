@@ -174,9 +174,10 @@ pub async fn list_deliveries(
         return Err(ApiError::NotFound);
     }
 
+    // Retrieve deliveries (limit to last 50).
     let deliveries = state
         .store()
-        .list_webhook_deliveries(endpoint_id, limit)
+        .list_webhook_deliveries(endpoint_id, 50)
         .await?;
 
     let views: Vec<WebhookDeliveryView> = deliveries
@@ -196,4 +197,3 @@ pub async fn list_deliveries(
 
     Ok(Envelope::ok(views))
 }
-

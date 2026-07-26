@@ -260,7 +260,10 @@ mod tests {
     fn seal_always_produces_scheme_v1() {
         let mk = key();
         let sealed = seal(&mk, b"seed", CTX).unwrap();
-        assert_eq!(sealed.scheme, SCHEME_V1, "seal must always produce scheme v1");
+        assert_eq!(
+            sealed.scheme, SCHEME_V1,
+            "seal must always produce scheme v1"
+        );
     }
 
     #[test]
@@ -483,8 +486,7 @@ mod tests {
                             continue;
                         }
 
-                        let spliced =
-                            SealedSeed::from_parts((*ct).clone(), nonce, salt).unwrap();
+                        let spliced = SealedSeed::from_parts((*ct).clone(), nonce, salt).unwrap();
                         let result = open(&mk, &spliced, ctx);
                         assert!(
                             matches!(result, Err(CryptoError::DecryptionFailed)),

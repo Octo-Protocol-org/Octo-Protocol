@@ -171,17 +171,14 @@ impl WebhookSender {
                     timeout_secs = self.delivery_timeout.as_secs(),
                     "webhook delivery attempt exceeded overall deadline"
                 );
-                let attempts = if attempts_made > 0 { attempts_made as i32 } else { 1 };
+                let attempts = if attempts_made > 0 {
+                    attempts_made as i32
+                } else {
+                    1
+                };
                 let _ = self
                     .store
-                    .log_webhook_delivery(
-                        ep.id,
-                        event_type,
-                        body,
-                        "failed",
-                        attempts,
-                        last_code,
-                    )
+                    .log_webhook_delivery(ep.id, event_type, body, "failed", attempts, last_code)
                     .await;
                 false
             }
@@ -277,30 +274,30 @@ pub fn is_safe_url(url: &str) -> bool {
         }
     }
     // IPv4 100.64.0.0/10 (carrier-grade NAT)
-if host.starts_with("100.") {
-    if let Some(rest) = host.strip_prefix("100.") {
-        if let Some(second) = rest.split('.').next() {
-            if let Ok(n) = second.parse::<u8>() {
-                if (64..=127).contains(&n) {
-                    return false;
+    if host.starts_with("100.") {
+        if let Some(rest) = host.strip_prefix("100.") {
+            if let Some(second) = rest.split('.').next() {
+                if let Ok(n) = second.parse::<u8>() {
+                    if (64..=127).contains(&n) {
+                        return false;
+                    }
                 }
             }
         }
     }
-}
-// IPv6 checks (loopback, link-local, unique-local)
-if host.contains(":") {
-    if host == "::1" || host == "::" {
-        return false;
+    // IPv6 checks (loopback, link-local, unique-local)
+    if host.contains(":") {
+        if host == "::1" || host == "::" {
+            return false;
+        }
+        if host.starts_with("fe80:") {
+            return false;
+        }
+        if host.starts_with("fc") || host.starts_with("fd") {
+            return false;
+        }
     }
-    if host.starts_with("fe80:") {
-        return false;
-    }
-    if host.starts_with("fc") || host.starts_with("fd") {
-        return false;
-    }
-}
-true
+    true
 }
 
 #[cfg(test)]
@@ -341,4 +338,3 @@ mod tests {
         assert!(!is_safe_url("http://100.64.5.5/x"));
     }
 }
-

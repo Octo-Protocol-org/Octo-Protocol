@@ -138,7 +138,11 @@ pub async fn list_addresses(
     if has_more {
         items.truncate(limit as usize);
     }
-    let next_cursor = if has_more { items.last().map(|a| a.id) } else { None };
+    let next_cursor = if has_more {
+        items.last().map(|a| a.id)
+    } else {
+        None
+    };
 
     // One batched query for all rows on this page instead of N — see
     // Store::sum_deposits_for_addresses.

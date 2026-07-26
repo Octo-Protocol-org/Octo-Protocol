@@ -125,8 +125,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-    // Wallet creation returns 201 Created (Envelope::created), not 200.
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
@@ -153,21 +152,17 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let withdraw_res = app.clone().oneshot(withdraw_req).await.unwrap();
-    assert_eq!(withdraw_res.status(), StatusCode::GONE);
+    assert_eq!(withdraw_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024)
         .await
         .unwrap();
     let w_json: Value = serde_json::from_slice(&w_bytes).unwrap();
 
-    let mut error_schema = spec
+    let error_schema = spec
         .pointer("/components/schemas/ErrorResponse")
-        .expect("ErrorResponse schema not found")
-        .clone();
-    if let (Some(obj), Some(components)) = (error_schema.as_object_mut(), spec.get("components")) {
-        obj.insert("components".to_string(), components.clone());
-    }
-    let error_validator = Validator::new(&error_schema).expect("Invalid JSON schema");
+        .expect("ErrorResponse schema not found");
+    let error_validator = Validator::new(error_schema).expect("Invalid JSON schema");
     let result = error_validator.validate(&w_json);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);

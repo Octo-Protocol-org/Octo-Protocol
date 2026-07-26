@@ -57,8 +57,7 @@ async fn payments_after_forwards_cursor_between_pages() {
         .and(path(format!("/accounts/{ACCOUNT}/payments")))
         .and(query_param("cursor", "222-0"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(page(vec![record_json("333", "333-0")])),
+            ResponseTemplate::new(200).set_body_json(page(vec![record_json("333", "333-0")])),
         )
         .mount(&server)
         .await;
