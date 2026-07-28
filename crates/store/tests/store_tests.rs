@@ -98,7 +98,10 @@ async fn allocate_address_increments_atomically() {
     assert_eq!(b.muxed_id, 2);
     assert_ne!(a.muxed_address, b.muxed_address);
 
-    let list = store.list_addresses(wallet_id, 100, None).await.expect("list");
+    let list = store
+        .list_addresses(wallet_id, 100, None)
+        .await
+        .expect("list");
     assert_eq!(list.len(), 2);
 }
 
@@ -134,7 +137,10 @@ async fn record_deposit_is_idempotent() {
         "duplicate deposit must be a no-op (anti double-credit)"
     );
 
-    let txs = store.list_transactions(wallet_id, 100, None).await.expect("list");
+    let txs = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .expect("list");
     assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain op");
 }
 
@@ -166,7 +172,14 @@ async fn different_op_index_same_tx_is_distinct() {
 
     assert!(store.record_deposit(&base).await.expect("op0").is_some());
     assert!(store.record_deposit(&op1).await.expect("op1").is_some());
-    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 2);
+    assert_eq!(
+        store
+            .list_transactions(wallet_id, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]

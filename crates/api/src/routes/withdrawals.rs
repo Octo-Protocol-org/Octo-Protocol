@@ -132,7 +132,10 @@ pub async fn withdraw(
     //      justified for that edge case.
 
     // One Horizon call gets balances, sequence, and reserve inputs for the source account.
-    let source_info = state.horizon().account_info(&wallet.stellar_account_g).await?;
+    let source_info = state
+        .horizon()
+        .account_info(&wallet.stellar_account_g)
+        .await?;
 
     match &asset_issuer {
         None => {
@@ -241,7 +244,13 @@ pub async fn withdraw(
         memo_id: req.memo_id.map(|m| m as u64),
         sequence: seq + 1, // next sequence
     };
-    let signed = sign_payment(state.master_key_for_scheme(wallet.sealed_scheme), &sealed, state.network(), 0, &payment)?;
+    let signed = sign_payment(
+        state.master_key_for_scheme(wallet.sealed_scheme),
+        &sealed,
+        state.network(),
+        0,
+        &payment,
+    )?;
 
     // --- submit to Horizon ---
     let submit = state

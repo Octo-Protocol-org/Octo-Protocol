@@ -154,7 +154,9 @@ pub async fn delete_webhook(
         return Err(ApiError::NotFound);
     }
 
-    state.store().deactivate_webhook_endpoint(endpoint_id).await?;
+    state
+        .store()
+        .deactivate_webhook_endpoint(endpoint_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-

@@ -99,7 +99,9 @@ impl AccountInfo {
     pub fn asset_balance_stroops(&self, code: &str, issuer: &str) -> Option<i64> {
         self.balances
             .iter()
-            .find(|b| b.asset_code.as_deref() == Some(code) && b.asset_issuer.as_deref() == Some(issuer))
+            .find(|b| {
+                b.asset_code.as_deref() == Some(code) && b.asset_issuer.as_deref() == Some(issuer)
+            })
             .and_then(|b| parse_amount_stroops(&b.balance))
     }
 }
@@ -331,9 +333,9 @@ impl Horizon {
         match result {
             Ok(r) => Ok(r),
             Err(ResilienceError::Circuit) => Err(ApiError::Internal),
-            Err(ResilienceError::Exhausted(FetchError::TxRejected)) => {
-                Err(ApiError::BadRequest("transaction rejected by network".into()))
-            }
+            Err(ResilienceError::Exhausted(FetchError::TxRejected)) => Err(ApiError::BadRequest(
+                "transaction rejected by network".into(),
+            )),
             Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
         }
     }
@@ -440,7 +442,12 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn balance(asset_type: &str, code: Option<&str>, issuer: Option<&str>, amount: &str) -> Balance {
+    fn balance(
+        asset_type: &str,
+        code: Option<&str>,
+        issuer: Option<&str>,
+        amount: &str,
+    ) -> Balance {
         Balance {
             asset_type: asset_type.to_string(),
             asset_code: code.map(|c| c.to_string()),

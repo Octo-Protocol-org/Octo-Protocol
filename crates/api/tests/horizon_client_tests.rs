@@ -1,7 +1,7 @@
-use octo_api::ApiError;
 use octo_api::horizon::Horizon;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use octo_api::ApiError;
 use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn horizon_404_maps_to_not_found_for_balances_and_sequence() {

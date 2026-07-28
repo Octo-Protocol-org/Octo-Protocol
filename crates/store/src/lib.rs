@@ -1115,12 +1115,11 @@ impl Store {
 
     /// Return `true` if the token has been revoked (is in the deny-list).
     pub async fn is_token_revoked(&self, token: &str) -> Result<bool, StoreError> {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM token_denylist WHERE token = $1)",
-        )
-        .bind(token)
-        .fetch_one(&self.pool)
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM token_denylist WHERE token = $1)")
+                .bind(token)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(exists)
     }
 

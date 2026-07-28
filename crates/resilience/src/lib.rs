@@ -238,6 +238,18 @@ pub enum CallKind {
     Submit,
 }
 
+/// Whether a failed call should be retried and counted toward opening the circuit.
+///
+/// Permanent errors — a definitive `404`, an unparseable body, a transaction the network rejected
+/// on its merits — return `false`: [`execute`] answers with them immediately, does **not** retry,
+/// and does **not** record a circuit failure. Those outcomes mean the service gave a real answer,
+/// so counting them would spuriously open the breaker (e.g. two sequential lookups of a
+/// non-existent account must not look like an outage). Only genuinely transient errors (transport
+/// failures, 5xx) return `true`.
+pub trait Retriable {
+    fn is_retriable(&self) -> bool;
+}
+
 /// Execute `f` with retry-and-circuit-breaker protection.
 ///
 /// - If `kind == CallKind::Submit`, `f` is attempted at most **once** regardless of the retry
@@ -252,18 +264,6 @@ pub enum CallKind {
 /// - `Ok(T)` — the call succeeded.
 /// - `Err(ResilienceError::Circuit)` — the circuit was open (no network call made).
 /// - `Err(ResilienceError::Exhausted(e))` — all attempts failed; `e` is the last error.
-/// Whether a failed call should be retried and counted toward opening the circuit.
-///
-/// Permanent errors — a definitive `404`, an unparseable body, a transaction the network rejected
-/// on its merits — return `false`: [`execute`] answers with them immediately, does **not** retry,
-/// and does **not** record a circuit failure. Those outcomes mean the service gave a real answer,
-/// so counting them would spuriously open the breaker (e.g. two sequential lookups of a
-/// non-existent account must not look like an outage). Only genuinely transient errors (transport
-/// failures, 5xx) return `true`.
-pub trait Retriable {
-    fn is_retriable(&self) -> bool;
-}
-
 pub async fn execute<Fut, T, E>(
     circuit: &CircuitBreaker,
     policy: &RetryPolicy,
@@ -644,7 +644,10 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // Next call should be allowed through as a probe.
-        let result = execute(&cb, &policy, CallKind::ReadOnly, || async { Ok::<_, &str>(42) }).await;
+        let result = execute(&cb, &policy, CallKind::ReadOnly, || async {
+            Ok::<_, &str>(42)
+        })
+        .await;
         assert_eq!(result.unwrap(), 42);
         assert!(cb.is_closed());
     }

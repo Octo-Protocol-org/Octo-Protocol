@@ -25,10 +25,10 @@ use horizon::{HorizonPayments, PaymentRecord};
 use octo_store::{NewDeposit, Store};
 use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
-use std::time::Duration;
-use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use uuid::Uuid;
 
 /// Shared thread-safe tracker for the last successful poll times of ingestion.
 #[derive(Debug, Clone, Default)]
@@ -51,15 +51,20 @@ impl LastPollTracker {
 
     /// Get the last successful poll timestamp (unix-seconds) for a wallet.
     pub fn last_poll(&self, wallet_id: Uuid) -> Option<i64> {
-        self.last_polls.lock().ok().and_then(|map| map.get(&wallet_id).copied())
+        self.last_polls
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&wallet_id).copied())
     }
 
     /// Get a copy of all tracked poll times.
     pub fn all_last_polls(&self) -> HashMap<Uuid, i64> {
-        self.last_polls.lock().map(|map| map.clone()).unwrap_or_default()
+        self.last_polls
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default()
     }
 }
-
 
 /// Outcome of processing a single payment record.
 #[derive(Debug, PartialEq, Eq)]

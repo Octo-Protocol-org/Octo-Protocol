@@ -39,7 +39,8 @@ async fn setup() -> Option<(Store, Ingestor, Uuid)> {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,            label: None,
+            sealed_scheme: 1,
+            label: None,
             user_id: None,
             description: None,
         })
@@ -163,7 +164,14 @@ async fn duplicate_operation_is_idempotent() {
     // Same Horizon op id again → no double-credit.
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Duplicate);
 
-    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .list_transactions(wallet_id, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -175,7 +183,14 @@ async fn failed_tx_is_skipped() {
     let mut rec = base_record("op-failed-1");
     rec.transaction_successful = false;
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
-    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 0);
+    assert_eq!(
+        store
+            .list_transactions(wallet_id, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -187,7 +202,14 @@ async fn payment_to_other_account_is_skipped() {
     let mut rec = base_record("op-other-1");
     rec.to = Some("GSOMEOTHERACCOUNT".into());
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
-    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 0);
+    assert_eq!(
+        store
+            .list_transactions(wallet_id, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -204,7 +226,14 @@ async fn missing_amount_and_starting_balance_is_skipped() {
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Skipped);
-    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 0);
+    assert_eq!(
+        store
+            .list_transactions(wallet_id, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]

@@ -114,7 +114,9 @@ async fn start_mock_horizon(state: MockState) -> (String, Arc<Mutex<usize>>) {
         .expect("bind mock Horizon");
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("mock Horizon serve");
+        axum::serve(listener, app)
+            .await
+            .expect("mock Horizon serve");
     });
 
     (format!("http://{addr}"), call_count)
@@ -133,19 +135,15 @@ async fn setup_with_horizon(db_url: &str, horizon_url: &str) -> Option<(Store, I
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,            label: None,
+            sealed_scheme: 1,
+            label: None,
             user_id: None,
             description: None,
         })
         .await
         .expect("create wallet");
 
-    let ingestor = Ingestor::new(
-        store.clone(),
-        horizon_url,
-        wallet.id,
-        BASE.to_string(),
-    );
+    let ingestor = Ingestor::new(store.clone(), horizon_url, wallet.id, BASE.to_string());
     Some((store, ingestor, wallet.id))
 }
 
@@ -161,7 +159,9 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     };
 
     // Build a page of 3 records.
-    let records: Vec<PaymentRecord> = (1..=3).map(|i| make_record(&format!("op-resume-{i}"))).collect();
+    let records: Vec<PaymentRecord> = (1..=3)
+        .map(|i| make_record(&format!("op-resume-{i}")))
+        .collect();
     let last_cursor = records.last().unwrap().paging_token.clone();
 
     let mock_state = MockState {
@@ -179,19 +179,31 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     let n = ingestor.poll_once(10).await.expect("first poll_once");
     assert_eq!(n, 3, "first poll should process all 3 records");
 
-    let tx_count_after_first = store.list_transactions(wallet_id, 100, None).await.unwrap().len();
+    let tx_count_after_first = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(tx_count_after_first, 3);
 
     // Verify cursor was advanced to the last record's paging token.
     let cursor = store.get_cursor(wallet_id).await.unwrap();
-    assert_eq!(cursor.as_deref(), Some(last_cursor.as_str()), "cursor must point at last record");
+    assert_eq!(
+        cursor.as_deref(),
+        Some(last_cursor.as_str()),
+        "cursor must point at last record"
+    );
 
     // Second poll: same mock returns empty page (cursor == last_cursor).
     // This simulates resuming after a crash — no records should be re-recorded.
     let n2 = ingestor.poll_once(10).await.expect("second poll_once");
     assert_eq!(n2, 0, "resumed poll must process zero new records");
 
-    let tx_count_after_second = store.list_transactions(wallet_id, 100, None).await.unwrap().len();
+    let tx_count_after_second = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(
         tx_count_after_second, 3,
         "no new deposits must be recorded on cursor-resume"
@@ -235,7 +247,8 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,            label: None,
+            sealed_scheme: 1,
+            label: None,
             user_id: None,
             description: None,
         })
@@ -258,8 +271,15 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
         );
     }
 
-    let tx_count_after_first = store.list_transactions(wallet.id, 100, None).await.unwrap().len();
-    assert_eq!(tx_count_after_first, 5, "all 5 records should be stored after first pass");
+    let tx_count_after_first = store
+        .list_transactions(wallet.id, 100, None)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        tx_count_after_first, 5,
+        "all 5 records should be stored after first pass"
+    );
 
     // Second pass: replay in reversed (out-of-order) sequence.
     let reversed: Vec<&PaymentRecord> = records.iter().rev().collect();
@@ -274,7 +294,11 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
     }
 
     // No additional deposits must have been recorded.
-    let tx_count_after_second = store.list_transactions(wallet.id, 100, None).await.unwrap().len();
+    let tx_count_after_second = store
+        .list_transactions(wallet.id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(
         tx_count_after_second, 5,
         "out-of-order replay must not create any new deposit rows"

@@ -69,7 +69,8 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,            label: Some("testnet-wallet"),
+            sealed_scheme: 1,
+            label: Some("testnet-wallet"),
             user_id: None,
             description: None,
         })
@@ -83,7 +84,8 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,            label: Some("mainnet-wallet"),
+            sealed_scheme: 1,
+            label: Some("mainnet-wallet"),
             user_id: None,
             description: None,
         })
@@ -102,7 +104,9 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
         .expect("bind mock Horizon");
     let mock_addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("mock Horizon serve");
+        axum::serve(listener, app)
+            .await
+            .expect("mock Horizon serve");
     });
 
     let horizon_url = format!("http://{mock_addr}");

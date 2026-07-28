@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         batch_size = cfg.batch_size,
-        same_key   = (cfg.old_key == cfg.new_key),
+        same_key = (cfg.old_key == cfg.new_key),
         "octo-migrate-keys starting"
     );
 
@@ -159,8 +159,7 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let database_url =
-            std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
 
         let old_key = decode_key("MASTER_KEY")?;
 
@@ -191,18 +190,16 @@ impl Config {
 }
 
 fn decode_key(env_var: &str) -> Result<[u8; MASTER_KEY_LEN]> {
-    let b64 = std::env::var(env_var)
-        .with_context(|| format!("{env_var} is required"))?;
+    let b64 = std::env::var(env_var).with_context(|| format!("{env_var} is required"))?;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .with_context(|| format!("{env_var} is not valid base64"))?;
-    master_key_from_slice(&raw)
-        .map_err(|_| anyhow::anyhow!("{env_var} must be exactly 32 bytes"))
+    master_key_from_slice(&raw).map_err(|_| anyhow::anyhow!("{env_var} must be exactly 32 bytes"))
 }
 
 fn init_tracing() {
-    let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "info,octo_migrate_keys=debug".to_string());
+    let filter =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info,octo_migrate_keys=debug".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();
