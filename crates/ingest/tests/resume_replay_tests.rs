@@ -106,7 +106,7 @@ async fn mock_payments_handler(
 async fn start_mock_horizon(state: MockState) -> (String, Arc<Mutex<usize>>) {
     let call_count = state.call_count.clone();
     let app = Router::new()
-        .route("/accounts/{account}/payments", get(mock_payments_handler))
+        .route("/accounts/:account/payments", get(mock_payments_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -135,7 +135,7 @@ async fn setup_with_horizon(db_url: &str, horizon_url: &str) -> Option<(Store, I
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,
@@ -247,7 +247,7 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,

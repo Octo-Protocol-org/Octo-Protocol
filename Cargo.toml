@@ -10,6 +10,7 @@ members = [
     "crates/resilience",
     "bin/server",
     "bin/migrate-keys",
+    "bin/backfill-operation-index",
 ]
 
 [workspace.package]

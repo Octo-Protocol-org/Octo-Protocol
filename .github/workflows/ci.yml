@@ -100,6 +100,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  frontend:
+    name: frontend · typecheck · lint · build · test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        # Pin to v4 major version tag and specify Node.js version explicitly
+        # to decouple action upgrades from runtime version pinning.
+        # Matches the project's @types/node: ^20 dependency.
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm run test -- --run
+
 # No-op trigger: re-run CI on PR #35 to verify whether the failure mode persists across two clean runs.
 # Useful for distinguishing a transient cache issue from a real toolchain-action regression.
 

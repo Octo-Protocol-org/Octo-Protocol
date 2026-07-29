@@ -22,8 +22,8 @@ use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
 use octo_api::{build_router, AppState};
-use octo_store::Store;
-use octo_wallet_core::StellarNetwork;
+use octo_store::{NewWallet, Store};
+use octo_wallet_core::{provision_wallet, StellarNetwork};
 use serde_json::{json, Value};
 use std::sync::Once;
 use tower::ServiceExt;
@@ -59,15 +59,6 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-fn post_auth(uri: &str, token: &str) -> Request<axum::body::Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
-        .body(axum::body::Body::empty())
-        .unwrap()
-}
-
 fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<axum::body::Body> {
     Request::builder()
         .method("POST")
@@ -78,7 +69,10 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<axum::body::Bod
         .unwrap()
 }
 
-async fn auth_token(app: &Router) -> String {
+/// Sign up a fresh user and return both its login JWT and its id. The id is needed because the
+/// withdrawal fixture writes its wallet row directly (see [`create_wallet`]) and has to set
+/// `user_id` itself for the route's ownership check to pass.
+async fn auth_token(app: &Router, state: &AppState) -> (String, Uuid) {
     let email = format!("withdraw-preflight-{}@octo.test", Uuid::new_v4().simple());
     let resp = app
         .clone()
@@ -94,23 +88,45 @@ async fn auth_token(app: &Router) -> String {
         )
         .await
         .unwrap();
-    body_json(resp).await["data"]["token"]
+    let token = body_json(resp).await["data"]["token"]
         .as_str()
         .unwrap()
-        .to_string()
+        .to_string();
+    let user = state
+        .store()
+        .find_user_by_email(&email)
+        .await
+        .expect("lookup user")
+        .expect("signup created the user");
+    (token, user.id)
 }
 
-/// Creates a wallet via the real API (real key derivation) and returns its id.
-async fn create_wallet(app: &Router, token: &str) -> String {
-    let resp = app
-        .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+/// Create a **server-custody** wallet (real key derivation, real sealed seed) and return its id.
+///
+/// This writes the row through the store rather than `POST /v1/wallets`, because since the
+/// non-custodial cutover that route only ever mints `custody = 'client'` rows — which carry no
+/// server-side seed, so `withdraw` refuses them before the pre-flight check ever runs. The
+/// withdrawal path serves legacy `custody = 'server'` rows, so that is what these tests must
+/// exercise. `provision_wallet` seals under the same `[42u8; 32]` master key `test_state` uses,
+/// so the handler can actually open the seed and sign.
+async fn create_wallet(state: &AppState, user_id: Uuid) -> String {
+    let provisioned = provision_wallet(&[42u8; 32], StellarNetwork::Testnet).expect("provision");
+    let wallet = state
+        .store()
+        .create_wallet(NewWallet {
+            network: "testnet",
+            stellar_account_g: &provisioned.account_g,
+            sealed_ciphertext: &provisioned.sealed.ciphertext,
+            sealed_nonce: &provisioned.sealed.nonce,
+            sealed_salt: &provisioned.sealed.salt,
+            sealed_scheme: provisioned.sealed.scheme as i16,
+            label: Some("withdraw-preflight"),
+            user_id: Some(user_id),
+            description: None,
+        })
         .await
-        .unwrap();
-    body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string()
+        .expect("create server-custody wallet");
+    wallet.id.to_string()
 }
 
 /// A local mock Horizon: every `GET /accounts/*` returns the same canned `account_response`
@@ -188,8 +204,8 @@ async fn withdraw_rejects_when_wallet_balance_is_insufficient_without_consuming_
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
-    let wallet_id = create_wallet(&app, &token).await;
+    let (token, user_id) = auth_token(&app, &state).await;
+    let wallet_id = create_wallet(&state, user_id).await;
 
     let key = format!("key-{}", Uuid::new_v4());
     let uri = format!("/v1/wallets/{wallet_id}/withdraw");
@@ -223,8 +239,8 @@ async fn withdraw_rejects_native_withdrawal_that_would_breach_the_minimum_reserv
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
-    let wallet_id = create_wallet(&app, &token).await;
+    let (token, user_id) = auth_token(&app, &state).await;
+    let wallet_id = create_wallet(&state, user_id).await;
 
     let key = format!("key-{}", Uuid::new_v4());
     let uri = format!("/v1/wallets/{wallet_id}/withdraw");
@@ -256,8 +272,8 @@ async fn withdraw_succeeds_when_balance_is_sufficient() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
-    let wallet_id = create_wallet(&app, &token).await;
+    let (token, user_id) = auth_token(&app, &state).await;
+    let wallet_id = create_wallet(&state, user_id).await;
 
     let key = format!("key-{}", Uuid::new_v4());
     let uri = format!("/v1/wallets/{wallet_id}/withdraw");

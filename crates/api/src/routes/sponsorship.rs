@@ -23,6 +23,7 @@ pub struct SponsorshipConfigView {
     pub enabled: bool,
     pub per_tx_fee_cap_stroops: Option<i64>,
     pub daily_budget_stroops: Option<i64>,
+    pub fees_spent_today_stroops: i64,
     pub spent_today_stroops: i64,
 }
 
@@ -46,12 +47,14 @@ pub async fn get_config(
             enabled: c.enabled,
             per_tx_fee_cap_stroops: c.per_tx_fee_cap_stroops,
             daily_budget_stroops: c.daily_budget_stroops,
+            fees_spent_today_stroops: spent_today,
             spent_today_stroops: spent_today,
         },
         None => SponsorshipConfigView {
             enabled: false,
             per_tx_fee_cap_stroops: None,
             daily_budget_stroops: None,
+            fees_spent_today_stroops: spent_today,
             spent_today_stroops: spent_today,
         },
     };
@@ -118,6 +121,7 @@ pub async fn put_config(
         enabled: config.enabled,
         per_tx_fee_cap_stroops: config.per_tx_fee_cap_stroops,
         daily_budget_stroops: config.daily_budget_stroops,
+        fees_spent_today_stroops: spent_today,
         spent_today_stroops: spent_today,
     }))
 }

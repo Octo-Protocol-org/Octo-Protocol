@@ -69,7 +69,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: Some("testnet-wallet"),
             user_id: None,
             description: None,
@@ -84,7 +84,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: Some("mainnet-wallet"),
             user_id: None,
             description: None,
@@ -96,7 +96,7 @@ async fn tick_only_polls_wallets_on_its_configured_network() {
     let queried: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         // Horizon payments URL pattern: /accounts/{account}/payments?...
-        .route("/accounts/{account}/payments", get(mock_payments_handler))
+        .route("/accounts/:account/payments", get(mock_payments_handler))
         .with_state(queried.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

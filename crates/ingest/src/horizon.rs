@@ -31,6 +31,9 @@ pub enum HorizonError {
 }
 
 /// One payment record from Horizon (the fields octo needs).
+///
+/// `Serialize` is derived so tests can round-trip these through a mock Horizon server that
+/// returns Horizon-shaped JSON; production only ever deserializes them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PaymentRecord {
     /// The operation TOID — globally unique; used as the idempotent dedup key.
@@ -68,6 +71,8 @@ pub struct PaymentRecord {
 }
 
 /// The joined transaction fields we use.
+///
+/// `Serialize` is derived for the same test-only reason as [`PaymentRecord`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransactionRecord {
     #[serde(default)]
@@ -193,6 +198,15 @@ enum IngestFetchError {
     Permanent,
 }
 
+impl octo_resilience::Retriable for IngestFetchError {
+    fn is_retriable(&self) -> bool {
+        // Only transport failures are transient. A decode failure or a permanent status will
+        // repeat identically on a retry, and retrying them would also count toward opening the
+        // circuit breaker.
+        matches!(self, IngestFetchError::Transport)
+    }
+}
+
 impl std::fmt::Display for IngestFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -200,13 +214,5 @@ impl std::fmt::Display for IngestFetchError {
             Self::Decode => write!(f, "decode error"),
             Self::Permanent => write!(f, "permanent error"),
         }
-    }
-}
-
-impl octo_resilience::Retriable for IngestFetchError {
-    fn is_retriable(&self) -> bool {
-        // Only transient transport/5xx failures are retried; a permanent error or an unparseable
-        // body is a definitive outcome that retrying wouldn't change.
-        matches!(self, IngestFetchError::Transport)
     }
 }

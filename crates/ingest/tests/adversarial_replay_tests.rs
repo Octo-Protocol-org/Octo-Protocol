@@ -91,7 +91,7 @@ async fn fresh_ingestor(store: &Store) -> (Ingestor, Uuid) {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,

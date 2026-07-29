@@ -238,16 +238,29 @@ pub enum CallKind {
     Submit,
 }
 
-/// Whether a failed call should be retried and counted toward opening the circuit.
+/// Whether a given error is worth retrying.
 ///
-/// Permanent errors — a definitive `404`, an unparseable body, a transaction the network rejected
-/// on its merits — return `false`: [`execute`] answers with them immediately, does **not** retry,
-/// and does **not** record a circuit failure. Those outcomes mean the service gave a real answer,
-/// so counting them would spuriously open the breaker (e.g. two sequential lookups of a
-/// non-existent account must not look like an outage). Only genuinely transient errors (transport
-/// failures, 5xx) return `true`.
+/// Without this, `execute` would retry *every* failure — including permanent ones like a 404.
+/// That both wastes attempts and, worse, lets a handful of legitimate "not found" responses trip
+/// the circuit breaker, so the caller sees `Circuit` instead of the real error.
+///
+/// Error types passed to [`execute`] implement this to say which failures are transient.
 pub trait Retriable {
+    /// `true` if this error is transient and the call may be retried.
     fn is_retriable(&self) -> bool;
+}
+
+// Convenience impls for error types used directly in tests.
+impl Retriable for &str {
+    fn is_retriable(&self) -> bool {
+        true
+    }
+}
+
+impl Retriable for () {
+    fn is_retriable(&self) -> bool {
+        true
+    }
 }
 
 /// Execute `f` with retry-and-circuit-breaker protection.
@@ -255,15 +268,16 @@ pub trait Retriable {
 /// - If `kind == CallKind::Submit`, `f` is attempted at most **once** regardless of the retry
 ///   policy (the circuit breaker still applies).
 /// - If `kind == CallKind::ReadOnly`, `f` is retried up to `policy.max_attempts` times with
-///   exponential backoff.
+///   exponential backoff, stopping early on an error that reports itself non-retriable.
 ///
-/// The closure receives no arguments and must return `Ok(T)` on success or `Err(E)` on a
-/// retriable/circuit-tripping failure.
+/// The closure receives no arguments and must return `Ok(T)` on success or `Err(E)` on failure.
 ///
 /// Returns:
 /// - `Ok(T)` — the call succeeded.
 /// - `Err(ResilienceError::Circuit)` — the circuit was open (no network call made).
 /// - `Err(ResilienceError::Exhausted(e))` — all attempts failed; `e` is the last error.
+// NOTE: no `F` type parameter here — the closure is taken as `impl FnMut() -> Fut`, so a
+// declared-but-unused `F` would be uninferable and every call site would fail with E0282.
 pub async fn execute<Fut, T, E>(
     circuit: &CircuitBreaker,
     policy: &RetryPolicy,
@@ -290,8 +304,9 @@ where
                 return Ok(val);
             }
             Err(e) => {
-                // A permanent error is a real answer, not a fault: return it straight away without
-                // retrying or tripping the breaker.
+                // A permanent error (e.g. Horizon 404) is the *answer*, not a fault: retrying it
+                // wastes attempts and would let a few of them trip the breaker, masking the real
+                // error behind `Circuit`. Return it immediately without counting a failure.
                 if !e.is_retriable() {
                     return Err(ResilienceError::Exhausted(e));
                 }
@@ -415,17 +430,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    // These tests model transient failures, so their ad-hoc error types are always retriable.
-    impl Retriable for &str {
-        fn is_retriable(&self) -> bool {
-            true
-        }
-    }
-    impl Retriable for () {
-        fn is_retriable(&self) -> bool {
-            true
-        }
-    }
+    // NOTE: the `Retriable` impls for `&str` and `()` these tests rely on live at module scope
+    // (next to the trait). Re-declaring them here is a coherence error (E0119).
 
     // --- RetryPolicy ---------------------------------------------------------
 

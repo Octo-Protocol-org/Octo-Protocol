@@ -27,4 +27,7 @@ dotenvy = "0.15"
 axum.workspace = true
 octo-webhooks.workspace = true
 proptest.workspace = true
-wiremock = "0.6"
+sqlx.workspace = true
+# Pinned for the same reason as crates/api: unpinned "0.6" pulls an edition2024 release that
+# rust-toolchain.toml's 1.84.1 cannot build.
+wiremock = "=0.6.2"

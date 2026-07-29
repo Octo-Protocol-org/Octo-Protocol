@@ -110,13 +110,26 @@ pub async fn withdraw(
     let wallet = state.store().get_wallet(wallet_id).await?;
 
     // A key that has already been consumed short-circuits straight to 409 — no point spending a
-    // round trip to Horizon re-validating a request whose key is already spent.
+    // round trip to Horizon re-validating a request whose key is already spent. This precedes the
+    // custody gate deliberately: a spent key is a settled answer whatever the wallet's custody, so
+    // a retry must keep reporting 409 rather than switching to a different rejection.
     if state
         .store()
         .withdrawal_exists(wallet_id, &idempotency_key)
         .await?
     {
         return Err(ApiError::Conflict);
+    }
+
+    // Custody gate, ahead of the Horizon round trip and (critically) of `create_withdrawal`: the
+    // server holds no key for a client-custody wallet, so this request can never succeed here no
+    // matter the balance. Rejecting now keeps it off both Horizon and the idempotency key.
+    if wallet.is_client_custody() {
+        return Err(ApiError::BadRequest(
+            "this wallet is client-custody: sign the payment client-side and POST it to \
+             /v1/wallets/:id/submit-signed"
+                .into(),
+        ));
     }
 
     // --- pre-flight failure-mode checks (all BEFORE the idempotency key is consumed) ---
@@ -225,13 +238,22 @@ pub async fn withdraw(
     let seq = source_info.sequence;
 
     // --- sign inside wallet-core (decrypt -> derive -> sign -> zeroize) ---
-    let sealed = SealedSeed::from_parts_with_scheme(
-        wallet.sealed_ciphertext.clone(),
-        &wallet.sealed_nonce,
-        &wallet.sealed_salt,
-        wallet.sealed_scheme as u8,
-    )
-    .map_err(|_| ApiError::Internal)?;
+    // Client-custody rows were already rejected during pre-flight, so a server-custody row that
+    // still has no sealed seed is a data-integrity fault, not a caller error.
+    let (Some(ciphertext), Some(nonce), Some(salt)) = (
+        wallet.sealed_ciphertext.as_ref(),
+        wallet.sealed_nonce.as_ref(),
+        wallet.sealed_salt.as_ref(),
+    ) else {
+        return Err(ApiError::Internal);
+    };
+    // Keep the versioned-scheme path (PR #158) so master-key rotation keeps working. Rows
+    // written before the scheme tag existed fall back to V1.
+    let scheme = wallet
+        .sealed_scheme
+        .unwrap_or(octo_crypto::SCHEME_V1 as i16);
+    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
+        .map_err(|_| ApiError::Internal)?;
 
     let asset_for_sign = req
         .asset

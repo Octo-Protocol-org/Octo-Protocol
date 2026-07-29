@@ -12,15 +12,17 @@ mod json;
 pub mod routes;
 pub mod sponsor_validation;
 mod state;
+pub mod submit_validation;
 
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
-use axum::extract::Request;
+use axum::body::HttpBody;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -38,6 +40,9 @@ pub fn build_router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only
+    // affect routes added before them, so it covered nothing. It is now applied at the end,
+    // together with the error handler that turns an oversized body into a 413 envelope.
     Router::new()
         .route("/health", get(health))
         .route("/v1/auth/signup", post(auth::signup))
@@ -67,13 +72,15 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/webhooks",
             post(routes::webhooks::create_webhook).get(routes::webhooks::list_webhooks),
         )
+        // NOTE: this deliveries route was registered twice by the merge; axum panics at startup
+        // on a duplicate path, so the second registration was removed.
         .route(
             "/v1/wallets/:id/webhooks/:endpoint_id/deliveries",
             get(routes::webhooks::list_deliveries),
         )
         .route(
             "/v1/wallets/:id/webhooks/:endpoint_id",
-            axum::routing::delete(routes::webhooks::delete_webhook),
+            delete(routes::webhooks::delete_webhook),
         )
         .route(
             "/v1/wallets/:id/api-key",
@@ -81,9 +88,28 @@ pub fn build_router(state: AppState) -> Router {
                 .get(routes::apikeys::get_key)
                 .delete(routes::apikeys::delete_key),
         )
+        // Custodial signing tombstones (410 Gone since the non-custodial cutover).
         .route(
             "/v1/wallets/:id/withdraw",
             post(routes::withdrawals::withdraw),
+        )
+        .route(
+            "/v1/wallets/:id/trustlines",
+            post(routes::trustlines::add_trustline),
+        )
+        // Non-custodial path: clients sign locally and relay through these.
+        .route(
+            "/v1/wallets/:id/submit-signed",
+            post(routes::submit::submit_signed),
+        )
+        .route(
+            "/v1/wallets/:id/signing-info",
+            get(routes::submit::signing_info),
+        )
+        .route("/v1/wallets/:id/backup", get(routes::wallets::get_backup))
+        .route(
+            "/v1/wallets/:id/gas-tank",
+            post(routes::wallets::create_gas_tank),
         )
         .route(
             "/v1/wallets/:id/sponsorship",
@@ -94,9 +120,58 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
         )
-        // Enforce the request-body ceiling ahead of every handler and return the oversize
-        // rejection in the standard envelope (a bare `RequestBodyLimitLayer` would answer with a
-        // plain, un-enveloped 413).
+        .route(
+            "/v1/wallets/:id/whitelist/config",
+            get(routes::whitelist::get_config).put(routes::whitelist::put_config),
+        )
+        .route(
+            "/v1/wallets/:id/whitelist",
+            get(routes::whitelist::list_addresses).post(routes::whitelist::add_address),
+        )
+        .route(
+            "/v1/wallets/:id/whitelist/:entry_id",
+            delete(routes::whitelist::remove_address),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links",
+            post(routes::payment_links::create_payment_link)
+                .get(routes::payment_links::list_payment_links),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id",
+            get(routes::payment_links::get_payment_link)
+                .put(routes::payment_links::set_payment_link_active),
+        )
+        // Public: no auth, reachable by anyone with the link.
+        .route(
+            "/v1/pay/:slug",
+            get(routes::payment_links::get_public_payment_link),
+        )
+        .route(
+            "/v1/pay/:slug/intent",
+            post(routes::payment_links::create_payment_intent),
+        )
+        .route(
+            "/v1/pay/:slug/payments/:payment_id",
+            get(routes::payment_links::get_payment_status),
+        )
+        .route(
+            "/v1/pay/:slug/signing-info",
+            get(routes::payment_links::public_signing_info),
+        )
+        .route(
+            "/v1/pay/:slug/submit-signed",
+            post(routes::payment_links::submit_payment),
+        )
+        // axum's own body limit: it produces a real `LengthLimitError`-backed rejection that the
+        // framework renders as 413, so no fallible tower layer (and no HandleErrorLayer) is
+        // needed. tower_http's RequestBodyLimitLayer would require one and does not compose
+        // cleanly with `Router::layer` here. It is the hard cap for bodies that arrive without a
+        // usable `Content-Length`; the layer below answers the declared-length case in-envelope.
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
+        // Applied after `DefaultBodyLimit`, so it runs *first* and can answer an oversized
+        // request in the standard `{statusCode, message, data}` envelope. `DefaultBodyLimit`
+        // alone renders a bare-text 413, which breaks the uniform error shape clients rely on.
         .layer(middleware::from_fn(enforce_body_limit))
         .layer(cors)
         .with_state(state)
@@ -108,15 +183,24 @@ async fn health() -> &'static str {
 }
 
 /// Reject any request whose declared `Content-Length` exceeds [`REQUEST_BODY_LIMIT`], answering
-/// with a `413` in the standard envelope. Requests without a `Content-Length` fall through to the
-/// handler, where the `Bytes`/`Json` extractor's own body cap still bounds them.
+/// with a `413` in the standard envelope. Requests without a `Content-Length` fall through to
+/// `DefaultBodyLimit`, which still caps them (as a bare-text 413).
+///
+/// NOTE: a `handle_errors` HandleErrorLayer helper lived here for the same purpose. It did not
+/// satisfy `Router::layer`'s `Service` bounds; `middleware::from_fn` composes cleanly and keeps
+/// the enveloped response.
 async fn enforce_body_limit(req: Request, next: Next) -> Response {
-    let over_limit = req
+    let declared = req
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .is_some_and(|len| len > REQUEST_BODY_LIMIT);
+        .and_then(|s| s.parse::<u64>().ok());
+
+    // Fall back to the body's own size hint when no `Content-Length` was sent: an in-memory body
+    // still reports its exact length there, so an oversized request is caught either way rather
+    // than slipping through to `DefaultBodyLimit`'s bare-text 413.
+    let size = declared.or_else(|| req.body().size_hint().exact());
+    let over_limit = size.is_some_and(|len| len > REQUEST_BODY_LIMIT as u64);
 
     if over_limit {
         return error::Envelope::error(

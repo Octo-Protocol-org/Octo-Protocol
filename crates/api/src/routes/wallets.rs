@@ -8,8 +8,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use octo_store::NewWallet;
-use octo_wallet_core::provision_wallet;
+use octo_store::NewClientWallet;
+use octo_wallet_core::is_valid_account;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,9 +23,16 @@ pub struct ListParams {
     pub before: Option<Uuid>,
 }
 
-/// Optional body for wallet creation.
+/// Body for wallet creation. Non-custodial: the client generates the keypair and sends only the
+/// public account — the private key and mnemonic never reach the server.
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateWalletRequest {
+    /// The client-derived Stellar account (`G...`).
+    pub public_key: Option<String>,
+    /// Opaque client-encrypted seed backup (encrypted under a password-derived key in the
+    /// browser/SDK; the server stores it verbatim and cannot decrypt it).
+    #[serde(default)]
+    pub encrypted_backup: Option<String>,
     /// Optional human label / name for the wallet.
     #[serde(default)]
     pub label: Option<String>,
@@ -34,15 +41,14 @@ pub struct CreateWalletRequest {
     pub description: Option<String>,
 }
 
-/// What we return after creating a wallet. The mnemonic is returned **once** here so the operator
-/// can back it up; it is never stored in plaintext and never returned again.
+/// What we return after creating a wallet. No secret material — the key was generated client-side
+/// and the recovery mnemonic was shown there; the server never saw either.
 #[derive(Debug, Serialize)]
 pub struct CreateWalletResponse {
     pub id: Uuid,
     pub network: String,
     pub address: String,
-    /// One-time recovery mnemonic — store this securely; it will not be shown again.
-    pub recovery_mnemonic: String,
+    pub custody: String,
     /// Whether the account was funded on-chain (testnet friendbot). False on mainnet.
     pub funded: bool,
 }
@@ -53,6 +59,7 @@ pub struct WalletView {
     pub id: Uuid,
     pub network: String,
     pub address: String,
+    pub custody: String,
     pub label: Option<String>,
     pub description: Option<String>,
 }
@@ -97,18 +104,23 @@ pub async fn create_wallet(
     let label = req.label;
     let description = req.description;
 
-    // Generate + seal in wallet-core; the raw seed never reaches this layer.
-    let provisioned = provision_wallet(state.master_key(), state.network())?;
+    // Non-custodial: the client did the keygen; we only accept the public account.
+    let public_key = req
+        .public_key
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("public_key is required (G...)".into()))?;
+    if !is_valid_account(&public_key) {
+        return Err(ApiError::BadRequest(
+            "public_key must be a valid Stellar account (G...)".into(),
+        ));
+    }
 
     let wallet = state
         .store()
-        .create_wallet(NewWallet {
+        .create_client_wallet(NewClientWallet {
             network: state.network().as_str(),
-            stellar_account_g: &provisioned.account_g,
-            sealed_ciphertext: &provisioned.sealed.ciphertext,
-            sealed_nonce: &provisioned.sealed.nonce,
-            sealed_salt: &provisioned.sealed.salt,
-            sealed_scheme: i16::from(provisioned.sealed.scheme),
+            stellar_account_g: &public_key,
+            encrypted_backup: req.encrypted_backup.as_deref(),
             label: label.as_deref(),
             user_id: Some(user_id),
             description: description.as_deref(),
@@ -139,11 +151,119 @@ pub async fn create_wallet(
         id: wallet.id,
         network: wallet.network,
         address: wallet.stellar_account_g,
-        recovery_mnemonic: provisioned.mnemonic.to_string(),
+        custody: wallet.custody,
         funded,
     };
     let (status, json) = Envelope::created(resp);
     Ok((status, json))
+}
+
+/// `GET /v1/wallets/{id}/backup` — the opaque client-encrypted seed backup, for new-device
+/// recovery. Login-only: this blob is ciphertext under the user's password; the server cannot
+/// decrypt it and neither can anyone who steals it without the password.
+pub async fn get_backup(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<BackupView>>> {
+    let user_id = crate::auth::require_login(&headers, &state).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Envelope::ok(BackupView {
+        wallet_id: wallet.id,
+        encrypted_backup: wallet.encrypted_backup,
+    }))
+}
+
+/// The stored client-encrypted backup blob (may be absent if the user opted out).
+#[derive(Debug, Serialize)]
+pub struct BackupView {
+    pub wallet_id: Uuid,
+    pub encrypted_backup: Option<String>,
+}
+
+/// `POST /v1/wallets/{id}/gas-tank` — provision the server-held gas-tank fee account that pays
+/// for sponsored transactions. The tank is the ONLY server-held key for a client wallet and only
+/// ever carries fee float, so worst-case exposure is the gas budget — never customer funds.
+/// Idempotent-ish: a second call returns the existing tank.
+pub async fn create_gas_tank(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<Envelope<GasTankView>>)> {
+    let user_id = crate::auth::require_login(&headers, &state).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+
+    if let Some(existing) = wallet.gas_tank_account_g {
+        return Ok((
+            StatusCode::OK,
+            Envelope::ok(GasTankView {
+                wallet_id: wallet.id,
+                gas_tank_address: existing,
+                funded: false,
+            }),
+        ));
+    }
+    if !wallet.is_client_custody() {
+        return Err(ApiError::BadRequest(
+            "legacy server-custody wallets pay fees from their own account; no gas tank needed"
+                .into(),
+        ));
+    }
+
+    // Provision a fresh keypair inside wallet-core. The mnemonic is deliberately dropped: the
+    // tank is a disposable fee account, recoverable only by re-provisioning.
+    let provisioned = octo_wallet_core::provision_wallet(state.master_key(), state.network())?;
+    let wallet = state
+        .store()
+        .set_gas_tank(
+            id,
+            &provisioned.account_g,
+            &provisioned.sealed.ciphertext,
+            &provisioned.sealed.nonce,
+            &provisioned.sealed.salt,
+            i16::from(provisioned.sealed.scheme),
+        )
+        .await?;
+
+    // Best-effort testnet funding so the tank account exists on-chain.
+    let funded = match state.friendbot_url() {
+        Some(fb) => crate::horizon::friendbot_fund(fb, &provisioned.account_g)
+            .await
+            .is_ok(),
+        None => false,
+    };
+
+    crate::audit::record(
+        &state,
+        user_id,
+        "provisioned a gas tank",
+        crate::audit::category::WALLET,
+        Some(&provisioned.account_g),
+        &headers,
+    )
+    .await;
+
+    let resp = GasTankView {
+        wallet_id: wallet.id,
+        gas_tank_address: provisioned.account_g,
+        funded,
+    };
+    let (status, json) = Envelope::created(resp);
+    Ok((status, json))
+}
+
+/// The gas tank attached to a wallet. Fund `gas_tank_address` with XLM to cover sponsored fees.
+#[derive(Debug, Serialize)]
+pub struct GasTankView {
+    pub wallet_id: Uuid,
+    pub gas_tank_address: String,
+    pub funded: bool,
 }
 
 /// `GET /v1/wallets/{id}/balances` — live on-chain balances from Horizon.
@@ -197,6 +317,7 @@ fn to_view(w: octo_store::Wallet) -> WalletView {
         id: w.id,
         network: w.network,
         address: w.stellar_account_g,
+        custody: w.custody,
         label: w.label,
         description: w.description,
     }

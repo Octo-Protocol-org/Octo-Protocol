@@ -1,0 +1,26 @@
+[package]
+name = "backfill-operation-index"
+description = "Backfill tool to update operation_index for existing deposit rows from their horizon_op_id (TOID)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "backfill-operation-index"
+path = "src/main.rs"
+
+[dependencies]
+octo-store.workspace = true
+octo-ingest.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy = "0.15"
+# `env` is required by the `#[arg(long, env = "DATABASE_URL")]` attribute in main.rs.
+clap = { version = "4.0", features = ["derive", "env"] }
+sqlx.workspace = true
+uuid.workspace = true

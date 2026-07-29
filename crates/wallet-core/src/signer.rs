@@ -10,18 +10,33 @@
 //! - The decrypted seed and the derived keypair live only for the duration of `sign_payment` and
 //!   are zeroized on drop.
 
-use crate::address::is_valid_account;
-use crate::asset::is_valid_asset_code;
 use crate::derive::WalletSeed;
 use crate::error::WalletError;
 use octo_crypto::{open, SealedSeed, MASTER_KEY_LEN};
-use stellar_base::amount::Stroops;
-use stellar_base::asset::Asset;
-use stellar_base::crypto::{DalekKeyPair, MuxedEd25519PublicKey, PublicKey};
-use stellar_base::memo::Memo;
+use stellar_base::crypto::DalekKeyPair;
 use stellar_base::network::Network;
+// `sign_fee_bump` is NOT feature-gated and enforces the protocol fee floor, so this constant has
+// to be in scope in a plain (fixture-free) build too.
+use stellar_base::transaction::MIN_BASE_FEE;
+
+// Used only by the feature-gated custodial signing fixtures below.
+#[cfg(any(test, feature = "test-fixtures"))]
+use crate::address::is_valid_account;
+#[cfg(any(test, feature = "test-fixtures"))]
+use crate::asset::is_valid_asset_code;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::amount::Stroops;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::asset::Asset;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::crypto::{MuxedEd25519PublicKey, PublicKey};
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::memo::Memo;
+#[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::operations::Operation;
-use stellar_base::transaction::{Transaction, MIN_BASE_FEE};
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::transaction::Transaction;
+#[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::xdr::XDRSerialize;
 
 /// Which Stellar network a signature targets.
@@ -31,6 +46,12 @@ pub enum StellarNetwork {
     Public,
     /// Test network.
     Testnet,
+    /// Local standalone network (Stellar quickstart default).
+    ///
+    /// Uses the well-known quickstart passphrase `"Standalone Network ; February 2017"` so that
+    /// contributors can run integration tests against a local Stellar node without depending on
+    /// public testnet availability or friendbot rate limits.
+    Standalone,
 }
 
 impl StellarNetwork {
@@ -38,36 +59,59 @@ impl StellarNetwork {
         match self {
             StellarNetwork::Public => Network::new_public(),
             StellarNetwork::Testnet => Network::new_test(),
+            StellarNetwork::Standalone => {
+                Network::new("Standalone Network ; February 2017".to_string())
+            }
         }
     }
 
-    /// The crypto context string bound into seed encryption for this network.
+    /// The canonical network passphrase (what clients must sign against).
+    pub fn passphrase(self) -> &'static str {
+        match self {
+            StellarNetwork::Public => "Public Global Stellar Network ; September 2015",
+            StellarNetwork::Testnet => "Test SDF Network ; September 2015",
+            // Must stay byte-identical to the passphrase `network()` builds for this variant,
+            // or a locally-signed envelope verifies against a different network id.
+            StellarNetwork::Standalone => "Standalone Network ; February 2017",
+        }
+    }
+
     pub fn crypto_context(self) -> &'static [u8] {
         match self {
             StellarNetwork::Public => b"octo:mainnet",
             StellarNetwork::Testnet => b"octo:testnet",
+            StellarNetwork::Standalone => b"octo:standalone",
         }
     }
 
-    /// The canonical lowercase name (`"mainnet"` / `"testnet"`) used in the DB and API.
+    /// The canonical lowercase name (`"mainnet"` / `"testnet"` / `"standalone"`) used in the DB
+    /// and API.
     pub fn as_str(self) -> &'static str {
         match self {
             StellarNetwork::Public => "mainnet",
             StellarNetwork::Testnet => "testnet",
+            StellarNetwork::Standalone => "standalone",
         }
     }
 
-    /// Parse from the canonical name. Accepts `mainnet`/`public` and `testnet`/`test`.
+    /// Parse from the canonical name. Accepts `mainnet`/`public`, `testnet`/`test`, and
+    /// `standalone`.
     pub fn parse(s: &str) -> Option<StellarNetwork> {
         match s {
             "mainnet" | "public" => Some(StellarNetwork::Public),
             "testnet" | "test" => Some(StellarNetwork::Testnet),
+            "standalone" => Some(StellarNetwork::Standalone),
             _ => None,
         }
     }
 }
 
 /// A single payment to build and sign from the master account.
+///
+/// **Test fixture only** since the non-custodial cutover: production code has no server-held
+/// user seed to sign with. Kept (feature-gated) so validation tests can fabricate real signed
+/// envelopes.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub struct PaymentRequest<'a> {
     /// Destination account (`G...`) or muxed (`M...`) address.
     pub destination: &'a str,
@@ -120,6 +164,9 @@ pub fn account_id_from_sealed(
 ///
 /// Only a Payment operation is ever constructed — no other operation type can be produced by this
 /// function, which is the core anti-"signing-oracle" guarantee.
+///
+/// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn sign_payment(
     master_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
@@ -186,6 +233,85 @@ pub fn sign_payment(
     })
 }
 
+/// A trustline (ChangeTrust) to build and sign from the master account.
+///
+/// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub struct ChangeTrustRequest<'a> {
+    /// Asset code to trust (e.g. `"USDC"`). 1–12 ASCII chars.
+    pub asset_code: &'a str,
+    /// The asset issuer account (`G...`).
+    pub asset_issuer: &'a str,
+    /// Trust limit in **stroops**. `None` => the protocol maximum (unlimited).
+    /// `Some(0)` removes the trustline (only allowed when the balance is zero).
+    pub limit_stroops: Option<i64>,
+    /// The master account's current sequence number (fetched from Horizon by the caller).
+    pub sequence: i64,
+}
+
+/// Build and sign a ChangeTrust (trustline) operation from the master account.
+///
+/// This only ever constructs Octo's own operation — here a single ChangeTrust — so it cannot be
+/// used as a "sign anything" oracle.
+///
+/// **Test fixture only** since the non-custodial cutover (see [`PaymentRequest`]).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn sign_change_trust(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    network: StellarNetwork,
+    account_index: u32,
+    req: &ChangeTrustRequest<'_>,
+) -> Result<SignedPayment, WalletError> {
+    if let Some(limit) = req.limit_stroops {
+        if limit < 0 {
+            return Err(WalletError::InvalidAmount);
+        }
+    }
+    if !is_valid_account(req.asset_issuer) {
+        return Err(WalletError::InvalidAddress);
+    }
+
+    let keypair = keypair_from_sealed(master_key, sealed, network, account_index)?;
+    let source = keypair.public_key();
+    let source_account = source.account_id();
+
+    let issuer_pk =
+        PublicKey::from_account_id(req.asset_issuer).map_err(|_| WalletError::InvalidAddress)?;
+    // `with_asset` takes a ChangeTrustAsset; a credit `Asset` converts via `From<Asset>`.
+    let asset: Asset =
+        Asset::new_credit(req.asset_code, issuer_pk).map_err(|_| WalletError::InvalidAddress)?;
+
+    // Stellar encodes a *missing* limit as 0, which means "remove the trustline" — not
+    // "unlimited". So map "no limit requested" to the protocol maximum (i64::MAX) to establish
+    // an unlimited trustline. An explicit 0 is preserved (caller intends to remove).
+    let limit = req.limit_stroops.unwrap_or(i64::MAX);
+    let change_trust = Operation::new_change_trust()
+        .with_asset(asset.into())
+        .with_limit(Some(Stroops::new(limit)))
+        .map_err(|_| WalletError::InvalidAmount)?
+        .build()
+        .map_err(|_| WalletError::Signing)?;
+
+    let mut tx = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
+        .add_operation(change_trust)
+        .into_transaction()
+        .map_err(|_| WalletError::Signing)?;
+
+    tx.sign(keypair.as_ref(), &network.to_base())
+        .map_err(|_| WalletError::Signing)?;
+
+    let envelope_xdr = tx
+        .into_envelope()
+        .xdr_base64()
+        .map_err(|_| WalletError::Signing)?;
+
+    Ok(SignedPayment {
+        envelope_xdr,
+        source_account,
+    })
+}
+
 /// Request parameters for wrapping a user's signed transaction in a FeeBumpTransaction.
 pub struct FeeBumpRequest<'a> {
     /// Base64-encoded signed `TransactionEnvelope` from the user. Must be a v1 (`Tx`) envelope.
@@ -220,16 +346,18 @@ pub fn sign_fee_bump(
         BytesM, DecoratedSignature, FeeBumpTransaction as XdrFeeBump, FeeBumpTransactionEnvelope,
         FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash, MuxedAccount, Signature,
         SignatureHint, TransactionEnvelope, TransactionSignaturePayload,
-        TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRDeserialize, XDRSerialize,
+        TransactionSignaturePayloadTaggedTransaction, Uint256, VecM, XDRSerialize,
     };
 
+    // Reject fees below the Stellar network minimum before touching key material.
+    // A sub-minimum fee would be rejected by Horizon at submit time, wasting a budget
+    // reservation (try_reserve_sponsored_transaction) and a full sign cycle.
+    if req.max_base_fee_stroops < MIN_BASE_FEE.to_i64() {
+        return Err(WalletError::InvalidAmount);
+    }
+
     // Parse and validate the inner XDR — must be a v1 TransactionEnvelope.
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(req.inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    let inner_v1 = match inner_env {
-        TransactionEnvelope::Tx(v1) => v1,
-        _ => return Err(WalletError::InvalidXdr),
-    };
+    let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
     let seed_bytes = open(master_key, sealed, network.crypto_context())?;
@@ -306,16 +434,11 @@ pub fn compute_inner_tx_hash(
 ) -> Result<[u8; 32], WalletError> {
     use sha2::{Digest, Sha256};
     use stellar_base::xdr::{
-        Hash, TransactionEnvelope, TransactionSignaturePayload,
-        TransactionSignaturePayloadTaggedTransaction, XDRDeserialize, XDRSerialize,
+        Hash, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+        XDRSerialize,
     };
 
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    let inner_tx = match inner_env {
-        TransactionEnvelope::Tx(v1) => v1.tx,
-        _ => return Err(WalletError::InvalidXdr),
-    };
+    let inner_tx = parse_inner_v1(inner_xdr)?.tx;
 
     let network_id_bytes = network.to_base().network_id();
     let network_hash: [u8; 32] = network_id_bytes
@@ -351,7 +474,25 @@ pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
     }
 }
 
+/// Parse a base64 XDR string and require it to be a v1 `TransactionEnvelope` (`Tx` variant).
+///
+/// Both `sign_fee_bump` and `compute_inner_tx_hash` need this same guard: the envelope must be
+/// a v1 Tx, not a fee-bump or the legacy v0 form. Centralising the check here ensures the two
+/// call sites cannot silently drift apart as the fee-bump path grows.
+fn parse_inner_v1(
+    inner_xdr: &str,
+) -> Result<stellar_base::xdr::TransactionV1Envelope, WalletError> {
+    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
+    let env =
+        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
+    match env {
+        TransactionEnvelope::Tx(v1) => Ok(v1),
+        _ => Err(WalletError::InvalidXdr),
+    }
+}
+
 /// Parse a destination that may be a `G...` account or an `M...` muxed address.
+#[cfg(any(test, feature = "test-fixtures"))]
 fn parse_destination(dest: &str) -> Result<stellar_base::crypto::MuxedAccount, WalletError> {
     if let Ok(mux) = MuxedEd25519PublicKey::from_account_id(dest) {
         return Ok(mux.into());
@@ -414,6 +555,47 @@ mod tests {
             }
             _ => panic!("unexpected envelope variant"),
         }
+    }
+
+    #[test]
+    fn signs_change_trust_and_produces_valid_envelope() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let req = ChangeTrustRequest {
+            asset_code: "USDC",
+            asset_issuer: DEST,
+            limit_stroops: None, // unlimited
+            sequence: 1,
+        };
+        let signed = sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        assert_eq!(signed.source_account, MASTER_ACCOUNT_0);
+        let env = stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr)
+            .expect("signed envelope must be valid XDR");
+        match env {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                assert_eq!(e.signatures.len(), 1, "must be signed once");
+                // A `None` limit must serialize as i64::MAX (unlimited), NOT 0 —
+                // 0 means "remove trustline" and yields op_invalid_limit on-chain.
+                match &e.tx.operations[0].body {
+                    stellar_base::xdr::OperationBody::ChangeTrust(op) => {
+                        assert_eq!(op.limit, i64::MAX, "unlimited trustline limit");
+                    }
+                    _ => panic!("expected a ChangeTrust op"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn change_trust_rejects_bad_issuer() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let req = ChangeTrustRequest {
+            asset_code: "USDC",
+            asset_issuer: "not-an-account",
+            limit_stroops: None,
+            sequence: 1,
+        };
+        assert!(sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req).is_err());
     }
 
     #[test]
@@ -701,6 +883,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_credit_asset_with_invalid_code() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        // Empty string and a 13-char code are both outside the 1-12 byte range that
+        // Asset::new_credit accepts. Since the shared `is_valid_asset_code` primitive landed,
+        // these are rejected up front as InvalidAssetCode (previously the generic
+        // InvalidAddress, which conflated a bad code with a bad issuer).
+        for bad_code in ["", "TOOLONGASSET1X"] {
+            let req = PaymentRequest {
+                destination: DEST,
+                stroops: 1,
+                asset: Some((bad_code, DEST)),
+                memo_id: None,
+                sequence: 1,
+            };
+            assert!(
+                matches!(
+                    sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+                    Err(WalletError::InvalidAssetCode)
+                ),
+                "code {:?} should be rejected",
+                bad_code
+            );
+        }
+    }
+
     // ── Helper: build a signed inner payment envelope XDR ────────────────────
 
     fn make_inner_xdr(source_index: u32, seq: i64) -> String {
@@ -873,7 +1081,7 @@ mod tests {
                 0,
                 &FeeBumpRequest {
                     inner_xdr: &fee_bump_xdr,
-                    max_base_fee_stroops: 200,
+                    max_base_fee_stroops: 200
                 },
             ),
             Err(WalletError::InvalidXdr)
@@ -894,7 +1102,7 @@ mod tests {
                 0,
                 &FeeBumpRequest {
                     inner_xdr: &inner_xdr,
-                    max_base_fee_stroops: 200,
+                    max_base_fee_stroops: 200
                 },
             ),
             Err(WalletError::SeedDecryption)

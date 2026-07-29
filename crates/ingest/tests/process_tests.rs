@@ -39,7 +39,7 @@ async fn setup() -> Option<(Store, Ingestor, Uuid)> {
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
-            sealed_scheme: 1,
+            sealed_scheme: 1, // octo_crypto::SCHEME_V1
             label: None,
             user_id: None,
             description: None,
@@ -52,6 +52,12 @@ async fn setup() -> Option<(Store, Ingestor, Uuid)> {
 }
 
 fn base_record(id: &str) -> PaymentRecord {
+    // Deposits dedup on the Horizon operation id, which is globally unique and persists in the
+    // DB. A fixed literal here made every one of these tests a `Duplicate` on the second run
+    // against the same database, so they only passed on a fresh DB. Suffix a per-run uuid to
+    // keep them re-runnable while preserving the readable prefix.
+    let id = format!("{id}-{}", Uuid::new_v4().simple());
+    let id = id.as_str();
     PaymentRecord {
         id: id.into(),
         paging_token: id.into(),

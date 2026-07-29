@@ -161,10 +161,13 @@ impl AppState {
     /// - Rows not yet migrated use `master_key` (the old key).
     ///
     /// When no next key is configured, always returns `master_key`.
-    pub fn master_key_for_scheme(&self, sealed_scheme: i16) -> &[u8; MASTER_KEY_LEN] {
+    /// `sealed_scheme` is `Option` because client-custody rows carry no sealed seed at all
+    /// (`0012_client_custody.sql`). A row with no tag predates the versioned-scheme change, so it
+    /// falls back to the original key — same branch as any non-V1 tag.
+    pub fn master_key_for_scheme(&self, sealed_scheme: Option<i16>) -> &[u8; MASTER_KEY_LEN] {
         use octo_crypto::SCHEME_V1;
         match &self.inner.master_key_next {
-            Some(next_key) if sealed_scheme == SCHEME_V1 as i16 => next_key,
+            Some(next_key) if sealed_scheme == Some(SCHEME_V1 as i16) => next_key,
             _ => &self.inner.master_key,
         }
     }
