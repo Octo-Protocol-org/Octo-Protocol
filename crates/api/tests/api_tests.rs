@@ -1856,6 +1856,149 @@ async fn list_sponsored_transactions_requires_auth() {
 }
 
 // ---------------------------------------------------------------------------
+// Sponsored-transaction pagination limit boundaries
+//
+// `list_sponsored_transactions` rejects `limit > 200` and `limit < 1`, and constrains `status` to
+// pending|confirmed|failed. The tests above only ever send in-range values, so the rejection paths
+// and the exact accept/reject boundary were never exercised. These assert the precise message the
+// handler returns, not just the status code, so a wording regression fails too.
+//
+// Note the handler validates ownership *before* the query string, so every case needs a real
+// wallet owned by the caller — otherwise a 404 would mask the 400 under test.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sponsored_tx_limit_zero_and_negative_are_rejected() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    // `limit` is an `Option<i64>`, so a negative value deserializes cleanly and reaches the
+    // handler's own `< 1` check rather than being rejected earlier as a malformed query.
+    for limit in ["0", "-1"] {
+        let uri = format!("/v1/wallets/{wallet_id}/sponsored-transactions?limit={limit}");
+        let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "limit={limit} must be rejected"
+        );
+        let j = body_json(resp).await;
+        assert_eq!(
+            j["message"], "limit must be at least 1",
+            "limit={limit} must report the lower-bound violation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sponsored_tx_limit_201_is_rejected() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/sponsored-transactions?limit=201");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(j["message"], "limit must not exceed 200");
+}
+
+#[tokio::test]
+async fn sponsored_tx_limit_boundaries_1_and_200_succeed() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    // Three rows: enough that `limit=1` has to truncate (proving the limit is applied, not
+    // merely accepted) while `limit=200` still returns everything in one page.
+    for i in 0..3 {
+        insert_sponsored_tx(state.store().pool(), &wallet_id, "confirmed", (i + 1) * 100).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Lower boundary: accepted, and honoured.
+    let uri = format!("/v1/wallets/{wallet_id}/sponsored-transactions?limit=1");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "limit=1 is in range and must be accepted"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["data"]["data"].as_array().unwrap().len(),
+        1,
+        "limit=1 must return exactly one row"
+    );
+    assert!(
+        j["data"]["next_cursor"].is_string(),
+        "two rows remain, so limit=1 must page"
+    );
+
+    // Upper boundary: 200 is the largest accepted value (201 is rejected above).
+    let uri = format!("/v1/wallets/{wallet_id}/sponsored-transactions?limit=200");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "limit=200 is the inclusive maximum and must be accepted"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["data"]["data"].as_array().unwrap().len(),
+        3,
+        "limit=200 must return all three rows"
+    );
+    assert!(
+        j["data"]["next_cursor"].is_null(),
+        "no rows remain, so there must be no cursor"
+    );
+}
+
+#[tokio::test]
+async fn sponsored_tx_invalid_status_filter_is_rejected() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/sponsored-transactions?status=bogus");
+    let resp = app.clone().oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["message"],
+        "status must be one of: pending, confirmed, failed"
+    );
+
+    // An empty `status` is *not* an invalid one: the handler filters it out and treats the request
+    // as unfiltered. Pinning this keeps the `.filter(|s| !s.is_empty())` from being dropped.
+    let uri = format!("/v1/wallets/{wallet_id}/sponsored-transactions?status=");
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an empty status must be ignored, not rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Pagination tests
 // ---------------------------------------------------------------------------
 
