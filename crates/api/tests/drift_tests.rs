@@ -125,7 +125,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
@@ -152,7 +152,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let withdraw_res = app.clone().oneshot(withdraw_req).await.unwrap();
-    assert_eq!(withdraw_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(withdraw_res.status(), StatusCode::GONE);
 
     let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024)
         .await

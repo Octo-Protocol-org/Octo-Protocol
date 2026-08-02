@@ -94,11 +94,24 @@ async fn auth_token(app: &axum::Router) -> String {
         .to_string()
 }
 
-/// Create a wallet for `token`'s user and return its id.
+/// Create a wallet for `token`'s user and return its id. Non-custodial: the caller generates the
+/// keypair and sends only the public account (mirrors `api_tests.rs::create_wallet_req`).
 async fn create_wallet(app: &axum::Router, token: &str) -> String {
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
     let resp = app
         .clone()
-        .oneshot(post_auth("/v1/wallets", token))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);

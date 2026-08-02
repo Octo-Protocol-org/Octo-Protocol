@@ -13,12 +13,16 @@
 use crate::derive::WalletSeed;
 use crate::error::WalletError;
 use octo_crypto::{open, SealedSeed, MASTER_KEY_LEN};
-use stellar_base::crypto::{DalekKeyPair, MuxedEd25519PublicKey, PublicKey};
+use stellar_base::crypto::DalekKeyPair;
 use stellar_base::network::Network;
+// sign_fee_bump (production, not test-gated) rejects sub-minimum fees against this constant.
+use stellar_base::transaction::MIN_BASE_FEE;
 
 // Used only by the feature-gated custodial signing fixtures below.
 #[cfg(any(test, feature = "test-fixtures"))]
 use crate::address::is_valid_account;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::crypto::{MuxedEd25519PublicKey, PublicKey};
 #[cfg(any(test, feature = "test-fixtures"))]
 use crate::asset::is_valid_asset_code;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -30,7 +34,7 @@ use stellar_base::memo::Memo;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::operations::Operation;
 #[cfg(any(test, feature = "test-fixtures"))]
-use stellar_base::transaction::{Transaction, MIN_BASE_FEE};
+use stellar_base::transaction::Transaction;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::xdr::XDRSerialize;
 
@@ -60,12 +64,12 @@ impl StellarNetwork {
         }
     }
 
-    /// The crypto context string bound into seed encryption for this network.
     /// The canonical network passphrase (what clients must sign against).
     pub fn passphrase(self) -> &'static str {
         match self {
             StellarNetwork::Public => "Public Global Stellar Network ; September 2015",
             StellarNetwork::Testnet => "Test SDF Network ; September 2015",
+            StellarNetwork::Standalone => "Standalone Network ; February 2017",
         }
     }
 
@@ -457,12 +461,20 @@ pub fn compute_inner_tx_hash(
 /// zero-op envelope parses and returns `Ok(0)`; Stellar itself rejects zero-op transactions, so
 /// this helper reports the count, it does not validate the transaction.
 pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
-    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
+    Ok(parse_inner_v1(inner_xdr)?.tx.operations.len())
+}
 
-    let inner_env =
+/// Parse `inner_xdr` as a `TransactionEnvelope` and require that it decodes to specifically
+/// a v1 Tx, not a fee-bump or the legacy v0 form. Centralising the check here ensures the two
+/// call sites cannot silently drift apart as the fee-bump path grows.
+fn parse_inner_v1(
+    inner_xdr: &str,
+) -> Result<stellar_base::xdr::TransactionV1Envelope, WalletError> {
+    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
+    let env =
         TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    match inner_env {
-        TransactionEnvelope::Tx(v1) => Ok(v1.tx.operations.len()),
+    match env {
+        TransactionEnvelope::Tx(v1) => Ok(v1),
         _ => Err(WalletError::InvalidXdr),
     }
 }

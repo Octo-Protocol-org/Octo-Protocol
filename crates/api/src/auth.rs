@@ -345,6 +345,7 @@ fn issue_token(secret: &[u8], user_id: Uuid) -> Result<String, ApiError> {
     let claims = Claims {
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
+        jti: Uuid::new_v4().to_string(),
     };
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
     let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -529,7 +530,11 @@ mod tests {
     /// token exactly the way `issue_token` does (same header, same `sign_hs256` call) so this
     /// only varies `exp` — it does not exercise a different code path than production tokens.
     fn issue_token_with_exp(secret: &[u8], user_id: Uuid, exp: i64) -> String {
-        let claims = Claims { sub: user_id.to_string(), exp };
+        let claims = Claims {
+            sub: user_id.to_string(),
+            exp,
+            jti: Uuid::new_v4().to_string(),
+        };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
         let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
         let sig = sign_hs256(secret, signing_input.as_bytes());

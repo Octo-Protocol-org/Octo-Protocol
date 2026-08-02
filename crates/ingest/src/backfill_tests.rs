@@ -3,9 +3,6 @@
 //! These tests verify that the backfill tool correctly identifies and updates
 //! rows that need their operation_index fixed, while handling edge cases safely.
 
-use std::collections::HashMap;
-use uuid::Uuid;
-
 // Re-export the function from the main module for testing
 pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
     let parts: Vec<&str> = toid.split('-').collect();
@@ -69,12 +66,14 @@ mod tests {
 
     #[test]
     fn test_operation_index_from_toid_edge_cases() {
-        // Negative numbers (technically valid i32)
-        assert_eq!(operation_index_from_toid("12345-1--1"), Some(-1));
-        
+        // A real Horizon TOID's operation index is never negative, and a literal negative
+        // segment always contains an extra hyphen — splitting it into 4 parts, not 3 — so these
+        // are correctly rejected by the same "exactly 3 parts" check as any other malformed TOID.
+        assert_eq!(operation_index_from_toid("12345-1--1"), None);
+
         // Numbers outside i32 range should fail
         assert_eq!(operation_index_from_toid("12345-1-2147483648"), None); // i32::MAX + 1
-        assert_eq!(operation_index_from_toid("12345-1--2147483649"), None); // i32::MIN - 1
+        assert_eq!(operation_index_from_toid("12345-1--2147483649"), None); // extra hyphen too
     }
 
     #[test]
@@ -147,7 +146,7 @@ mod tests {
         for (tx_hash, op_idx) in after_backfill {
             let key = (tx_hash, op_idx);
             assert!(
-                constraint_check.insert(key.clone()),
+                constraint_check.insert(key),
                 "Duplicate key detected: {:?} - this would violate uq_tx_onchain!",
                 key
             );

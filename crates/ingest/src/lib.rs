@@ -712,9 +712,11 @@ mod tests {
 
     #[test]
     fn operation_index_from_toid_handles_edge_cases() {
-        // Negative numbers (invalid for operation index but should parse)
-        assert_eq!(operation_index_from_toid("12345-1--1"), Some(-1));
-        
+        // A real Horizon TOID's operation index is never negative, and a literal "-1" segment
+        // splits the string into 4 hyphen-delimited parts (not 3), so this is correctly rejected
+        // by the same "exactly 3 parts" check that rejects any other malformed TOID shape.
+        assert_eq!(operation_index_from_toid("12345-1--1"), None);
+
         // Large numbers within i32 range
         assert_eq!(operation_index_from_toid("12345-1-2147483647"), Some(i32::MAX));
         

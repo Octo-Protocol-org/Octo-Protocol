@@ -20,6 +20,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy = "0.15"
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive", "env"] }
 sqlx.workspace = true
 uuid.workspace = true

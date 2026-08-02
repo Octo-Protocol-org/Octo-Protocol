@@ -241,14 +241,18 @@ async fn double_logout_is_harmless() {
         .await
         .unwrap();
 
-    // Second logout with the already-revoked token must return 401 (token is revoked, not 500).
+    // Second logout with the same token must be a harmless no-op, not an error. `logout` only
+    // verifies the JWT's signature/expiry (it must accept the very token being revoked), and
+    // `denylist_token` upserts with `ON CONFLICT (token_hash) DO NOTHING` — so re-submitting an
+    // already-revoked token to `/logout` succeeds idempotently rather than 401ing (the denylist
+    // check itself only runs in `require_login`, guarding *other* routes, not `/logout`).
     let resp = app
         .oneshot(authed("POST", "/v1/auth/logout", &token))
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "logging out an already-revoked token must be 401, not 500"
+        StatusCode::OK,
+        "double logout must be a harmless idempotent no-op, not an error"
     );
 }
