@@ -1,5 +1,6 @@
 [package]
 name = "octo-server"
+default-run = "octo-server"
 description = "octo service: composes the REST API and the deposit ingest worker into one binary."
 version.workspace = true
 edition.workspace = true
