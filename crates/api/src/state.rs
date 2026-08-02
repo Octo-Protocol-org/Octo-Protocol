@@ -76,6 +76,7 @@ impl AppState {
         Self::build(
             store,
             master_key,
+            None,
             network,
             horizon_url,
             friendbot_url,

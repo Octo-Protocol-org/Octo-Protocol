@@ -23,7 +23,6 @@ pub use models::{
     WithdrawalAllowlistConfig,
 };
 
-use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 

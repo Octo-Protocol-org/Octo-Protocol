@@ -28,3 +28,6 @@ axum.workspace = true
 octo-webhooks.workspace = true
 proptest.workspace = true
 sqlx.workspace = true
+# Pinned: newer 0.6.x requires edition2024 (Rust >= 1.85), but rust-toolchain.toml pins 1.84.1,
+# so an unpinned "0.6" resolves to a version this project's own toolchain cannot build.
+wiremock = "=0.6.2"
