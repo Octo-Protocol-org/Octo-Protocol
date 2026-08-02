@@ -3,6 +3,8 @@
 //! These drive the real axum router with in-process requests, exercising
 //! crypto + wallet-core + store together. Skipped (with a message) if no DATABASE_URL.
 
+mod common;
+
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use axum::routing::post as post_route;
@@ -80,18 +82,16 @@ fn post_auth(uri: &str, token: &str) -> Request<Body> {
 }
 
 /// `POST /v1/wallets` under the non-custodial contract: the "client" (this test) generates the
-/// keypair and sends only the public key.
-fn create_wallet_req(token: &str) -> Request<Body> {
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+/// keypair, proves ownership by signing the server challenge, and sends only public material.
+async fn create_wallet_req(app: &axum::Router, token: &str) -> Request<Body> {
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let body = common::wallet_body(app, token, &kp).await;
     Request::builder()
         .method("POST")
         .uri("/v1/wallets")
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -172,6 +172,96 @@ async fn test_oversized_body_returns_413() {
     // ever reaches a handler — there is deliberately no `HandleErrorLayer` wrapping it in our
     // JSON envelope (see the NOTE in `lib.rs`), so the body here is axum's own text, not JSON.
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The oversized rejection must still use the standard response envelope, not a bare 413.
+    let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert!(!bytes.is_empty(), "413 response should explain itself");
+}
+
+#[tokio::test]
+async fn create_wallet_is_non_custodial_and_stores_no_seed() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app).await;
+
+    // The client generates the keypair, proves ownership, and sends only public material.
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account = kp.public_key().account_id();
+    let (challenge, signature) = common::signed_challenge(&app, &token, &kp).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(format!(
+                    r#"{{"label":"acme","public_key":"{account}","challenge":"{challenge}","signature":"{signature}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    let data = &json["data"];
+    assert_eq!(
+        data["address"].as_str().unwrap(),
+        account,
+        "the wallet account must be exactly the client-supplied public key"
+    );
+    assert_eq!(data["custody"], "client");
+    assert!(
+        data.get("recovery_mnemonic").is_none() || data["recovery_mnemonic"].is_null(),
+        "no mnemonic is ever returned — the client generated it"
+    );
+
+    // The custody kill-test: the server holds NO seed for this wallet.
+    let wallet_id = data["id"].as_str().unwrap();
+    let (custody, has_seed): (String, bool) = sqlx::query_as(
+        "SELECT custody, (sealed_ciphertext IS NOT NULL OR sealed_nonce IS NOT NULL \
+         OR sealed_salt IS NOT NULL) FROM wallets WHERE id = $1::uuid",
+    )
+    .bind(wallet_id)
+    .fetch_one(state.store().pool())
+    .await
+    .unwrap();
+    assert_eq!(custody, "client");
+    assert!(
+        !has_seed,
+        "no seed material may be stored for a client wallet"
+    );
+}
+
+#[tokio::test]
+async fn create_wallet_rejects_bad_public_key() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // Missing public_key → 400.
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth("/v1/wallets", r#"{"label":"x"}"#, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Malformed public_key → 400.
+    let resp = app
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            r#"{"public_key":"not-a-stellar-account"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -185,7 +275,7 @@ async fn addresses_return_both_forms_and_share_base() {
     // Create a wallet (empty body is allowed).
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet = body_json(resp).await;
@@ -229,7 +319,7 @@ async fn transactions_endpoint_returns_list() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -372,11 +462,12 @@ async fn backup_round_trips_the_opaque_blob_verbatim() {
     // The blob is ciphertext the CLIENT produced; the server must store and return it byte-for
     // byte without interpreting it.
     let blob = "v1.YmFzZTY0LWNpcGhlcnRleHQ=.bm9uY2U=.c2FsdA==";
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
-    let body = format!(r#"{{"public_key":"{account}","encrypted_backup":"{blob}"}}"#);
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account = kp.public_key().account_id();
+    let (challenge, signature) = common::signed_challenge(&app, &token, &kp).await;
+    let body = format!(
+        r#"{{"public_key":"{account}","encrypted_backup":"{blob}","challenge":"{challenge}","signature":"{signature}"}}"#
+    );
     let resp = app
         .clone()
         .oneshot(post_json_auth("/v1/wallets", &body, &token))
@@ -514,7 +605,7 @@ async fn custodial_withdraw_is_gone() {
     let token = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -545,7 +636,7 @@ async fn submit_signed_requires_transaction_xdr() {
     let token = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -574,6 +665,34 @@ async fn submit_signed_requires_transaction_xdr() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn custodial_trustline_is_gone() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(&app, &token).await)
+        .await
+        .unwrap();
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/trustlines"),
+            r#"{"asset_code":"USDC","asset_issuer":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
+}
+
 /// Regression coverage for the withdrawal route's use of the shared
 /// `octo_wallet_core::is_valid_asset_code` (see `crates/wallet-core/src/asset.rs`): an
 /// out-of-bounds asset code (0 or 13+ bytes) must be rejected with 400 *before* a withdrawal row
@@ -595,7 +714,7 @@ async fn api_key_generate_and_get() {
     // Create a wallet owned by this user.
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -665,7 +784,7 @@ async fn api_key_requires_ownership() {
     let token_a = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token_a))
+        .oneshot(create_wallet_req(&app, &token_a).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -709,7 +828,7 @@ async fn regenerating_api_key_invalidates_the_previous_one() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id_str = body_json(resp).await["data"]["id"]
@@ -845,7 +964,7 @@ async fn api_key_bearer_calling_generate_key_behavior_is_documented() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -896,7 +1015,7 @@ async fn api_key_can_create_address_on_its_wallet() {
     // Create a wallet + its API key.
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -937,7 +1056,7 @@ async fn api_key_cannot_touch_another_wallet() {
     // Two wallets owned by the same user; key for wallet A.
     let a = body_json(
         app.clone()
-            .oneshot(create_wallet_req(&token))
+            .oneshot(create_wallet_req(&app, &token).await)
             .await
             .unwrap(),
     )
@@ -947,7 +1066,7 @@ async fn api_key_cannot_touch_another_wallet() {
         .to_string();
     let b = body_json(
         app.clone()
-            .oneshot(create_wallet_req(&token))
+            .oneshot(create_wallet_req(&app, &token).await)
             .await
             .unwrap(),
     )
@@ -976,7 +1095,7 @@ async fn delete_api_key_revokes_it_and_subsequent_calls_using_it_are_401() {
     // Create a wallet and generate an API key.
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1044,7 +1163,7 @@ async fn delete_api_key_requires_wallet_ownership() {
     let token_a = auth_token(&app).await;
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token_a))
+        .oneshot(create_wallet_req(&app, &token_a).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1077,7 +1196,7 @@ async fn delete_api_key_on_a_wallet_with_no_key_is_ok() {
     // Create a wallet without generating a key.
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1107,7 +1226,7 @@ async fn delete_api_key_rejects_api_key_auth() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1138,7 +1257,7 @@ async fn api_key_cannot_provision_gas_tank() {
 
     let wallet_id = body_json(
         app.clone()
-            .oneshot(create_wallet_req(&token))
+            .oneshot(create_wallet_req(&app, &token).await)
             .await
             .unwrap(),
     )
@@ -1189,7 +1308,7 @@ async fn audit_logs_record_and_list() {
 
     // Create a wallet → records "created master wallet".
     app.clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
 
@@ -1243,14 +1362,15 @@ async fn audit_logs_are_strictly_scoped_to_the_authenticated_user() {
     let token_a = data_a["data"]["token"].as_str().unwrap().to_string();
     let user_id_a = data_a["data"]["user"]["id"].as_str().unwrap().to_string();
 
-    let account_a = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    let kp_a = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account_a = kp_a.public_key().account_id();
+    let (challenge_a, signature_a) = common::signed_challenge(&app, &token_a, &kp_a).await;
     app.clone()
         .oneshot(post_json_auth(
             "/v1/wallets",
-            &format!(r#"{{"public_key":"{account_a}","label":"USER-A-ONLY-MARKER"}}"#),
+            &format!(
+                r#"{{"public_key":"{account_a}","label":"USER-A-ONLY-MARKER","challenge":"{challenge_a}","signature":"{signature_a}"}}"#
+            ),
             &token_a,
         ))
         .await
@@ -1270,14 +1390,15 @@ async fn audit_logs_are_strictly_scoped_to_the_authenticated_user() {
     let token_b = data_b["data"]["token"].as_str().unwrap().to_string();
     let user_id_b = data_b["data"]["user"]["id"].as_str().unwrap().to_string();
 
-    let account_b = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    let kp_b = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account_b = kp_b.public_key().account_id();
+    let (challenge_b, signature_b) = common::signed_challenge(&app, &token_b, &kp_b).await;
     app.clone()
         .oneshot(post_json_auth(
             "/v1/wallets",
-            &format!(r#"{{"public_key":"{account_b}","label":"USER-B-ONLY-MARKER"}}"#),
+            &format!(
+                r#"{{"public_key":"{account_b}","label":"USER-B-ONLY-MARKER","challenge":"{challenge_b}","signature":"{signature_b}"}}"#
+            ),
             &token_b,
         ))
         .await
@@ -1362,7 +1483,7 @@ async fn audit_logs_category_all_behaves_like_no_filter() {
 
     // Create a wallet → records "created master wallet", so there's more than one row/category.
     app.clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
 
@@ -1441,7 +1562,7 @@ async fn list_sponsored_transactions_returns_empty_for_new_wallet() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1467,7 +1588,7 @@ async fn list_sponsored_transactions_pagination() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1529,7 +1650,7 @@ async fn list_sponsored_transactions_status_filter() {
 
     let resp = app
         .clone()
-        .oneshot(create_wallet_req(&token))
+        .oneshot(create_wallet_req(&app, &token).await)
         .await
         .unwrap();
     let wallet_id = body_json(resp).await["data"]["id"]
@@ -1576,7 +1697,11 @@ async fn list_sponsored_transactions_requires_auth() {
 
 /// Helper: create a wallet and return its id string.
 async fn create_wallet_for(app: &axum::Router, token: &str) -> String {
-    let resp = app.clone().oneshot(create_wallet_req(token)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(app, token).await)
+        .await
+        .unwrap();
     body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
@@ -1595,7 +1720,7 @@ async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
     // Create 5 wallets for this user.
     for _ in 0..5 {
         app.clone()
-            .oneshot(create_wallet_req(&token))
+            .oneshot(create_wallet_req(&app, &token).await)
             .await
             .unwrap();
     }
@@ -1971,4 +2096,552 @@ async fn payment_link_intent_rejects_flexible_amount_without_one() {
     let intent = body_json(resp).await;
     assert_eq!(intent["data"]["amount_usdc_stroops"], 5_000_000);
     assert!(intent["data"]["payment_id"].as_str().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Wallet registration ownership challenge
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_wallet_without_challenge_is_rejected() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // A valid public key but no ownership proof — must be rejected, or anyone could register a
+    // stranger's account and watch its deposit history.
+    let account = stellar_base::crypto::DalekKeyPair::random()
+        .unwrap()
+        .public_key()
+        .account_id();
+    let resp = app
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            &format!(r#"{{"public_key":"{account}"}}"#),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_wallet_rejects_signature_from_a_different_key() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+
+    // The challenge is signed by key B, but the registration claims key A's account.
+    let kp_a = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let kp_b = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account_a = kp_a.public_key().account_id();
+    let (challenge, signature_by_b) = common::signed_challenge(&app, &token, &kp_b).await;
+    let resp = app
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            &format!(
+                r#"{{"public_key":"{account_a}","challenge":"{challenge}","signature":"{signature_by_b}"}}"#
+            ),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a signature from a different key must not prove ownership of account A"
+    );
+}
+
+#[tokio::test]
+async fn create_wallet_rejects_another_users_challenge() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let user_a = auth_token(&app).await;
+    let user_b = auth_token(&app).await;
+
+    // Challenge issued to user A, redeemed by user B: the HMAC user-binding must reject it,
+    // otherwise a captured (challenge, signature) pair could be replayed cross-account.
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account = kp.public_key().account_id();
+    let (challenge_for_a, signature) = common::signed_challenge(&app, &user_a, &kp).await;
+    let resp = app
+        .oneshot(post_json_auth(
+            "/v1/wallets",
+            &format!(
+                r#"{{"public_key":"{account}","challenge":"{challenge_for_a}","signature":"{signature}"}}"#
+            ),
+            &user_b,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+/// Signup with an explicit `X-Forwarded-For` so the limiter buckets by a known IP.
+fn signup_from_ip(email: &str, ip: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/auth/signup")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", ip)
+        .body(Body::from(format!(
+            r#"{{"email":"{email}","password":"supersecret"}}"#
+        )))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn signup_is_rate_limited_per_ip() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let ip = format!("203.0.113.{}", rand_octet());
+
+    // The limit is 10/min/IP; the 11th attempt from the same IP must be refused.
+    for i in 0..10 {
+        let email = format!("rl-{}-{i}@octo.test", uuid::Uuid::new_v4().simple());
+        let resp = app
+            .clone()
+            .oneshot(signup_from_ip(&email, &ip))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "signup {i} within the limit should succeed"
+        );
+    }
+    let email = format!("rl-over-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let resp = app
+        .clone()
+        .oneshot(signup_from_ip(&email, &ip))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A different IP has its own bucket and is unaffected.
+    let other_ip = format!("198.51.100.{}", rand_octet());
+    let email = format!("rl-other-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let resp = app
+        .oneshot(signup_from_ip(&email, &other_ip))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// A random last octet so parallel test runs don't share a limiter bucket.
+fn rand_octet() -> u8 {
+    (uuid::Uuid::new_v4().as_bytes()[0] % 200) + 10
+}
+
+#[tokio::test]
+async fn payment_intent_creation_is_rate_limited_per_ip() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            r#"{"name":"Rate limit test"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let slug = body_json(resp).await["data"]["slug"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ip = format!("192.0.2.{}", rand_octet());
+    let intent_req = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/pay/{slug}/intent"))
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", ip.clone())
+            .body(Body::from(r#"{"amount_usdc_stroops":1000000}"#))
+            .unwrap()
+    };
+
+    // Intent creation is 5/min/IP — each one allocates an address and inserts a row, so it is
+    // deliberately much tighter than the read endpoints.
+    for i in 0..5 {
+        let resp = app.clone().oneshot(intent_req()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "intent {i} should succeed"
+        );
+    }
+    let resp = app.oneshot(intent_req()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn concurrent_payment_intents_get_distinct_deposit_addresses() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            r#"{"name":"Concurrent payers"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let slug = body_json(resp).await["data"]["slug"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Two payers start paying the same link. Each must get its OWN deposit address, otherwise
+    // ingest can only guess which intent a landing deposit belongs to (oldest-pending), and
+    // payer B's money could confirm payer A's intent.
+    let mut addresses = Vec::new();
+    let mut payment_ids = Vec::new();
+    for (i, name) in ["Ada", "Grace"].iter().enumerate() {
+        let ip = format!("198.18.0.{}", 20 + i);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/pay/{slug}/intent"))
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", ip)
+                    .body(Body::from(format!(
+                        r#"{{"payer_name":"{name}","amount_usdc_stroops":7000000}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let data = body_json(resp).await;
+        addresses.push(
+            data["data"]["deposit_address"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        payment_ids.push(data["data"]["payment_id"].as_str().unwrap().to_string());
+    }
+
+    assert_ne!(
+        addresses[0], addresses[1],
+        "each payment intent must get its own muxed deposit address"
+    );
+    assert_ne!(payment_ids[0], payment_ids[1]);
+    for addr in &addresses {
+        assert!(
+            addr.starts_with('M'),
+            "expected a muxed address, got {addr}"
+        );
+    }
+
+    // Both start out pending and independent.
+    for payment_id in &payment_ids {
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/v1/pay/{slug}/payments/{payment_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["data"]["status"], "pending");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Payment link payments + image uploads
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn payment_link_payments_list_requires_ownership_and_returns_payers() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let owner = auth_token(&app).await;
+    let other = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &owner).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            r#"{"name":"Payer list test","amount_usdc_stroops":4000000}"#,
+            &owner,
+        ))
+        .await
+        .unwrap();
+    let created = body_json(resp).await;
+    let slug = created["data"]["slug"].as_str().unwrap().to_string();
+    let link_id = created["data"]["id"].as_str().unwrap().to_string();
+
+    // A payer starts a payment; their name/email are captured on the intent.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/pay/{slug}/intent"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", format!("203.0.113.{}", rand_octet()))
+                .body(Body::from(
+                    r#"{"payer_name":"Ada Lovelace","payer_email":"ada@example.com"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let uri = format!("/v1/wallets/{wallet_id}/payment-links/{link_id}/payments");
+
+    // Payer email is personal data — another user must not be able to read it.
+    let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unauthenticated is rejected too (this is not a public pay-page route).
+    let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The owner sees the payer details.
+    let resp = app.oneshot(get_auth(&uri, &owner)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let rows = body["data"]["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the one intent should be listed: {body}");
+    assert_eq!(rows[0]["payer_name"], "Ada Lovelace");
+    assert_eq!(rows[0]["payer_email"], "ada@example.com");
+    assert_eq!(rows[0]["amount_usdc_stroops"], 4_000_000);
+    assert_eq!(
+        rows[0]["status"], "pending",
+        "an intent with no deposit yet is pending"
+    );
+}
+
+#[tokio::test]
+async fn upload_signature_requires_auth() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+
+    // No credential: must be 401 rather than handing out signed upload params.
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/uploads/signature"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Authenticated: 200 with params when Cloudinary is configured, or a clear 400 when it
+    // isn't. Either way it must not be a 401/500 — the test env usually has no credentials.
+    let token = auth_token(&app).await;
+    let resp = app
+        .oneshot(get_auth("/v1/uploads/signature", &token))
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
+        "expected signed params or a clear not-configured error, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn submit_payment_validates_against_the_intents_own_address() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            r#"{"name":"Intent address test","amount_usdc_stroops":2000000}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let created = body_json(resp).await;
+    let slug = created["data"]["slug"].as_str().unwrap().to_string();
+
+    // The link's own address, as advertised on the public page.
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/v1/pay/{slug}")))
+        .await
+        .unwrap();
+    let link_address = body_json(resp).await["data"]["deposit_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // An intent gets its OWN address, distinct from the link's.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/pay/{slug}/intent"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", format!("198.51.100.{}", rand_octet()))
+                .body(Body::from(r#"{"payer_name":"Ada"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let intent = body_json(resp).await;
+    let intent_address = intent["data"]["deposit_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payment_id = intent["data"]["payment_id"].as_str().unwrap().to_string();
+
+    assert_ne!(
+        link_address, intent_address,
+        "each intent must get its own address — this is what the relay validates against"
+    );
+
+    // A transaction paying the LINK's address (not this intent's) must be rejected: before the
+    // fix the relay compared against the link address, so every real Freighter payment — which
+    // correctly targets the intent address — was refused.
+    let payer = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let decoded = stellar_strkey::ed25519::MuxedAccount::from_string(&link_address).unwrap();
+    let wrong_dest = stellar_base::crypto::MuxedEd25519PublicKey::new(
+        stellar_base::crypto::PublicKey::from_slice(&decoded.ed25519).unwrap(),
+        decoded.id,
+    );
+    let usdc = stellar_base::asset::Asset::new_credit(
+        "USDC",
+        stellar_base::crypto::PublicKey::from_account_id(
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let op = stellar_base::operations::Operation::new_payment()
+        .with_destination(wrong_dest)
+        .with_amount(stellar_base::amount::Stroops::new(2_000_000))
+        .unwrap()
+        .with_asset(usdc)
+        .build()
+        .unwrap();
+    let mut tx = stellar_base::transaction::Transaction::builder(
+        payer.public_key(),
+        1,
+        stellar_base::transaction::MIN_BASE_FEE,
+    )
+    .add_operation(op)
+    .into_transaction()
+    .unwrap();
+    tx.sign(payer.as_ref(), &stellar_base::network::Network::new_test())
+        .unwrap();
+    let signed_xdr = {
+        use stellar_base::xdr::XDRSerialize;
+        tx.into_envelope().xdr_base64().unwrap()
+    };
+
+    let app_clone = app.clone();
+    let resp = app
+        .oneshot(post_json(
+            &format!("/v1/pay/{slug}/submit-signed"),
+            &format!(r#"{{"transaction_xdr":"{signed_xdr}","payment_id":"{payment_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a payment to the link's address rather than this intent's must be rejected"
+    );
+
+    // The same transaction aimed at the INTENT's address passes validation. It still fails at
+    // Horizon (the payer is unfunded), but the response is a 201 envelope with status "failed"
+    // rather than the 400 that means "we refused to relay this" — proving the destination and
+    // asset checks accepted it, which is the path a real Freighter payment takes.
+    let decoded = stellar_strkey::ed25519::MuxedAccount::from_string(&intent_address).unwrap();
+    let right_dest = stellar_base::crypto::MuxedEd25519PublicKey::new(
+        stellar_base::crypto::PublicKey::from_slice(&decoded.ed25519).unwrap(),
+        decoded.id,
+    );
+    let usdc = stellar_base::asset::Asset::new_credit(
+        "USDC",
+        stellar_base::crypto::PublicKey::from_account_id(
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let op = stellar_base::operations::Operation::new_payment()
+        .with_destination(right_dest)
+        .with_amount(stellar_base::amount::Stroops::new(2_000_000))
+        .unwrap()
+        .with_asset(usdc)
+        .build()
+        .unwrap();
+    let mut tx = stellar_base::transaction::Transaction::builder(
+        payer.public_key(),
+        1,
+        stellar_base::transaction::MIN_BASE_FEE,
+    )
+    .add_operation(op)
+    .into_transaction()
+    .unwrap();
+    tx.sign(payer.as_ref(), &stellar_base::network::Network::new_test())
+        .unwrap();
+    let good_xdr = {
+        use stellar_base::xdr::XDRSerialize;
+        tx.into_envelope().xdr_base64().unwrap()
+    };
+
+    let resp = app_clone
+        .oneshot(post_json(
+            &format!("/v1/pay/{slug}/submit-signed"),
+            &format!(r#"{{"transaction_xdr":"{good_xdr}","payment_id":"{payment_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a USDC payment to this intent's own address must pass validation and be relayed"
+    );
 }

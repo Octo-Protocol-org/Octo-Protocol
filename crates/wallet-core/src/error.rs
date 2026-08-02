@@ -45,6 +45,10 @@ pub enum WalletError {
     /// variant this crate does not accept here (e.g. a fee-bump used as an inner transaction).
     #[error("invalid transaction XDR")]
     InvalidXdr,
+
+    /// An ed25519 signature failed to parse or did not verify against the claimed account.
+    #[error("invalid signature")]
+    InvalidSignature,
 }
 
 impl From<octo_crypto::CryptoError> for WalletError {

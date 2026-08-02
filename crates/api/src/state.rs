@@ -34,6 +34,37 @@ struct Inner {
     jwt_secret: Vec<u8>,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
     webhooks: WebhookSender,
+    /// Per-IP rate limiting for auth + public endpoints.
+    rate_limiter: crate::rate_limit::RateLimiter,
+    /// Cloudinary credentials for signed image uploads; `None` when unconfigured, in which case
+    /// the upload endpoint reports that the feature is off rather than failing obscurely.
+    cloudinary: Option<CloudinaryConfig>,
+}
+
+/// Cloudinary credentials, read from the environment at startup.
+#[derive(Clone)]
+pub struct CloudinaryConfig {
+    pub cloud_name: String,
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+impl CloudinaryConfig {
+    /// Read from `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET`.
+    /// All three must be present, or image uploads stay disabled.
+    fn from_env() -> Option<Self> {
+        let cloud_name = std::env::var("CLOUDINARY_CLOUD_NAME").ok()?;
+        let api_key = std::env::var("CLOUDINARY_API_KEY").ok()?;
+        let api_secret = std::env::var("CLOUDINARY_API_SECRET").ok()?;
+        if cloud_name.is_empty() || api_key.is_empty() || api_secret.is_empty() {
+            return None;
+        }
+        Some(Self {
+            cloud_name,
+            api_key,
+            api_secret,
+        })
+    }
 }
 
 impl AppState {
@@ -119,6 +150,8 @@ impl AppState {
         let webhooks = WebhookSender::new(store.clone());
         Self {
             inner: Arc::new(Inner {
+                rate_limiter: crate::rate_limit::RateLimiter::default(),
+                cloudinary: CloudinaryConfig::from_env(),
                 store,
                 master_key: Zeroizing::new(master_key),
                 master_key_next: master_key_next.map(Zeroizing::new),
@@ -143,6 +176,15 @@ impl AppState {
 
     pub fn store(&self) -> &Store {
         &self.inner.store
+    }
+
+    pub fn rate_limiter(&self) -> &crate::rate_limit::RateLimiter {
+        &self.inner.rate_limiter
+    }
+
+    /// Cloudinary credentials, or `None` when image uploads are not configured.
+    pub fn cloudinary(&self) -> Option<CloudinaryConfig> {
+        self.inner.cloudinary.clone()
     }
 
     pub fn master_key(&self) -> &[u8; MASTER_KEY_LEN] {

@@ -91,7 +91,14 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.bind_addr))?;
     tracing::info!(addr = %cfg.bind_addr, "API listening");
-    axum::serve(listener, app).await.context("serve API")?;
+    // `into_make_service_with_connect_info` is what makes the peer address available to the
+    // rate limiter's `ConnectInfo` extractor; without it every caller looks like one client.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("serve API")?;
     Ok(())
 }
 

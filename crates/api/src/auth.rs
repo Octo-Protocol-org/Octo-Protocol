@@ -91,12 +91,36 @@ pub struct Claims {
 // Route handlers
 // ---------------------------------------------------------------------------
 
+/// Rate-limit an auth attempt by client IP: 10 per minute per IP.
+///
+/// Blunts credential stuffing and signup spam. Deliberately per-IP rather than per-email — an
+/// attacker rotates emails freely, but not source addresses.
+fn check_auth_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), ApiError> {
+    let ip = crate::rate_limit::client_ip(headers, peer);
+    if state
+        .rate_limiter()
+        .check(&ip, "auth", 10, std::time::Duration::from_secs(60))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::TooManyRequests(
+            "too many attempts — wait a minute and try again".into(),
+        ))
+    }
+}
+
 /// `POST /v1/auth/signup`
 pub async fn signup(
     State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<AuthResponse>>)> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
 
@@ -136,9 +160,11 @@ pub async fn signup(
 /// `POST /v1/auth/login`
 pub async fn login(
     State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
 
@@ -373,13 +399,13 @@ pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
     Some(claims)
 }
 
-fn sign_hs256(secret: &[u8], input: &[u8]) -> String {
+pub(crate) fn sign_hs256(secret: &[u8], input: &[u8]) -> String {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(input);
     b64(&mac.finalize().into_bytes())
 }
 
-fn verify_hs256(secret: &[u8], input: &[u8], signature_b64: &str) -> bool {
+pub(crate) fn verify_hs256(secret: &[u8], input: &[u8], signature_b64: &str) -> bool {
     let Some(sig) = b64_decode(signature_b64) else {
         return false;
     };
@@ -388,7 +414,7 @@ fn verify_hs256(secret: &[u8], input: &[u8], signature_b64: &str) -> bool {
     mac.verify_slice(&sig).is_ok()
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

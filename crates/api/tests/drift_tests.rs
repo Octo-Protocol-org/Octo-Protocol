@@ -1,3 +1,5 @@
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jsonschema::Validator;
@@ -106,12 +108,13 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     //
     // Non-custodial contract: the client generates the keypair and sends only the public key.
     // `public_key` is required — a body with just label/description is now a 400.
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account = kp.public_key().account_id();
+    let (challenge, signature) = common::signed_challenge(&app, &token, &kp).await;
     let req_body = serde_json::json!({
         "public_key": account,
+        "challenge": challenge,
+        "signature": signature,
         "label": "drift-test-wallet",
         "description": "testing schema drift"
     });
