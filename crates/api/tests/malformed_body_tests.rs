@@ -9,6 +9,8 @@
 //! Require Postgres via `DATABASE_URL` (loaded from `.env`), same as `api_tests.rs`. Skipped
 //! (with an early return) if no `DATABASE_URL` is configured.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use octo_api::{build_router, AppState};
@@ -176,11 +178,10 @@ async fn fixture() -> Option<Fixture> {
     let state = test_state().await?;
     let app = build_router(state);
     let token = auth_token(&app).await;
-    // Non-custodial contract: `public_key` is required, so an empty body now 400s.
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    // Non-custodial contract: `public_key` plus a signed ownership challenge is required, so an
+    // empty body now 400s.
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let body = common::wallet_body(&app, &token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -189,7 +190,7 @@ async fn fixture() -> Option<Fixture> {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await

@@ -268,16 +268,49 @@ impl Ingestor {
         let Some(address_id) = tx.address_id else {
             return;
         };
-        let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await else {
-            return;
+
+        // Preferred path: the deposit landed on an intent's OWN address, so it maps to exactly
+        // one payment even with several payers on the same link concurrently.
+        let exact = self.store.pending_payment_by_address(address_id).await;
+        let (link, payment) = match exact {
+            Ok(Some(payment)) => {
+                let Ok(link) = self
+                    .store
+                    .get_payment_link(self.wallet_id, payment.payment_link_id)
+                    .await
+                else {
+                    return;
+                };
+                (link, payment)
+            }
+            _ => {
+                // Fallback for intents created before per-intent addresses (migration 0015):
+                // the deposit landed on the link's shared address.
+                let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await
+                else {
+                    return;
+                };
+                let Ok(Some(payment)) = self
+                    .store
+                    .oldest_pending_payment_link_payment(link.id)
+                    .await
+                else {
+                    return;
+                };
+                (link, payment)
+            }
         };
-        let Ok(Some(payment)) = self
-            .store
-            .oldest_pending_payment_link_payment(link.id)
-            .await
-        else {
+
+        // Never confirm for less than the payer committed to — an underpayment stays pending.
+        if tx.amount_stroops < payment.amount_usdc_stroops {
+            tracing::warn!(
+                payment_id = %payment.id,
+                expected = payment.amount_usdc_stroops,
+                received = tx.amount_stroops,
+                "payment-link deposit is short of the intended amount; leaving pending"
+            );
             return;
-        };
+        }
         if self
             .store
             .confirm_payment_link_payment(payment.id, tx.id)
@@ -471,15 +504,25 @@ impl Supervisor {
     /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
     /// request volume sane regardless of how many wallets exist.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
-        let wallets = self.store.list_wallets().await?;
+        // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
+        // wallets that never transact again, and polling them every cycle starves the active ones
+        // of the shared concurrency budget.
+        let wallets = self
+            .store
+            .wallets_due_for_poll(
+                self.network,
+                Self::ACTIVE_AFTER_SECS,
+                Self::IDLE_INTERVAL_SECS,
+                Self::DORMANT_AFTER_SECS,
+                Self::DORMANT_INTERVAL_SECS,
+            )
+            .await?;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
         let mut tasks = tokio::task::JoinSet::new();
 
         for w in wallets {
-            if w.network != self.network {
-                continue;
-            }
             let store = self.store.clone();
+            let store_for_mark = self.store.clone();
             let horizon_url = self.horizon_url.clone();
             let webhooks = self.webhooks.clone();
             let tracker = self.tracker.clone();
@@ -500,7 +543,11 @@ impl Supervisor {
                 )
                 .with_webhooks(webhooks)
                 .with_tracker(tracker);
-                (w.id, ingestor.poll_once(page_limit).await)
+                let result = ingestor.poll_once(page_limit).await;
+                // Record the attempt regardless of outcome, so a wallet whose polls keep failing
+                // still backs off instead of being retried at full rate forever.
+                let _ = store_for_mark.mark_polled(w.id).await;
+                (w.id, result)
             });
         }
 
@@ -519,6 +566,14 @@ impl Supervisor {
 
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;
+
+    /// Activity-based backoff tiers. A wallet that saw a deposit within `ACTIVE_AFTER_SECS` is
+    /// polled every tick; quieter wallets are polled progressively less often. Deposit latency for
+    /// an actively-used wallet is unchanged — only dead accounts are slowed down.
+    const ACTIVE_AFTER_SECS: i64 = 60 * 60; // active if activity in the last hour
+    const IDLE_INTERVAL_SECS: i64 = 120; // idle wallets: at most every 2 minutes
+    const DORMANT_AFTER_SECS: i64 = 24 * 60 * 60; // dormant after a day of silence
+    const DORMANT_INTERVAL_SECS: i64 = 600; // dormant wallets: at most every 10 minutes
 
     /// Get a clone of the `LastPollTracker` to inspect poll lag.
     ///

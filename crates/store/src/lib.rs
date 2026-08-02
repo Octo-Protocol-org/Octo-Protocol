@@ -393,6 +393,81 @@ impl Store {
         Ok(rows)
     }
 
+    /// Wallets on `network` that are due for an ingest poll, given activity-based backoff.
+    ///
+    /// A dev/production database accumulates wallets that never see another deposit. Polling all
+    /// of them on the same short cycle spends the concurrency budget on dead accounts and delays
+    /// the ones that are actually transacting. Idleness is measured by `ingest_cursor.updated_at`,
+    /// which is only bumped when a record is actually processed:
+    ///
+    /// - active (last activity < `active_after_secs`): every tick
+    /// - idle: at most once per `idle_interval_secs`
+    /// - dormant (last activity older than `dormant_after_secs`): at most once per
+    ///   `dormant_interval_secs`
+    ///
+    /// A wallet with no cursor row has never been polled, so it is always due.
+    pub async fn wallets_due_for_poll(
+        &self,
+        network: &str,
+        active_after_secs: i64,
+        idle_interval_secs: i64,
+        dormant_after_secs: i64,
+        dormant_interval_secs: i64,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT w.* FROM wallets w
+            LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
+            WHERE w.network = $1
+              -- Never polled, or never saw activity => always due.
+              AND (
+                c.last_polled_at IS NULL
+                OR c.updated_at IS NULL
+                OR c.last_polled_at < now() - make_interval(secs =>
+                     CASE
+                       -- Active: no extra wait, poll every tick.
+                       WHEN c.updated_at > now() - make_interval(secs => $2) THEN 0
+                       -- Dormant: longest wait between polls.
+                       WHEN c.updated_at <= now() - make_interval(secs => $4) THEN $5
+                       -- Idle: in between.
+                       ELSE $3
+                     END)
+              )
+            ORDER BY w.created_at
+            "#,
+        )
+        .bind(network)
+        .bind(active_after_secs as f64)
+        .bind(idle_interval_secs as f64)
+        .bind(dormant_after_secs as f64)
+        .bind(dormant_interval_secs as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Record that a wallet was polled (whether or not anything new arrived).
+    ///
+    /// Distinct from [`Store::set_cursor`], which only advances on real activity — the backoff
+    /// tiers need both "when did we last see money" and "when did we last look".
+    pub async fn mark_polled(&self, wallet_id: Uuid) -> Result<(), StoreError> {
+        // `updated_at` is deliberately backdated to the epoch on INSERT: it means "last time this
+        // wallet saw activity", and merely looking at a wallet is not activity. Letting it take
+        // its `DEFAULT now()` would mark every never-used wallet as freshly active and the
+        // backoff tiers would never engage. `set_cursor` is the only writer that advances it.
+        sqlx::query(
+            r#"
+            INSERT INTO ingest_cursor (wallet_id, last_polled_at, updated_at)
+            VALUES ($1, now(), 'epoch')
+            ON CONFLICT (wallet_id) DO UPDATE SET last_polled_at = now()
+            "#,
+        )
+        .bind(wallet_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Fetch a wallet by id.
     pub async fn get_wallet(&self, id: Uuid) -> Result<Wallet, StoreError> {
         sqlx::query_as::<_, Wallet>("SELECT * FROM wallets WHERE id = $1")
@@ -1171,12 +1246,13 @@ impl Store {
         payer_name: Option<&str>,
         payer_email: Option<&str>,
         amount_usdc_stroops: i64,
+        address_id: Option<Uuid>,
     ) -> Result<PaymentLinkPayment, StoreError> {
         let row = sqlx::query_as::<_, PaymentLinkPayment>(
             r#"
             INSERT INTO payment_link_payments
-                (payment_link_id, payer_name, payer_email, amount_usdc_stroops)
-            VALUES ($1, $2, $3, $4)
+                (payment_link_id, payer_name, payer_email, amount_usdc_stroops, address_id)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING *
             "#,
         )
@@ -1184,7 +1260,27 @@ impl Store {
         .bind(payer_name)
         .bind(payer_email)
         .bind(amount_usdc_stroops)
+        .bind(address_id)
         .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// The pending intent owning `address_id`, if any — ingest's exact deposit match.
+    pub async fn pending_payment_by_address(
+        &self,
+        address_id: Uuid,
+    ) -> Result<Option<PaymentLinkPayment>, StoreError> {
+        let row = sqlx::query_as::<_, PaymentLinkPayment>(
+            r#"
+            SELECT * FROM payment_link_payments
+            WHERE address_id = $1 AND status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(address_id)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
@@ -1240,6 +1336,35 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Payments recorded against a link (newest first), with cursor pagination.
+    ///
+    /// Includes pending intents, not just confirmed ones — a merchant wants to see that someone
+    /// started paying, and pending rows are how an abandoned checkout shows up.
+    pub async fn list_payment_link_payments(
+        &self,
+        payment_link_id: Uuid,
+        limit: i64,
+        before_id: Option<Uuid>,
+    ) -> Result<Vec<PaymentLinkPayment>, StoreError> {
+        let rows = sqlx::query_as::<_, PaymentLinkPayment>(
+            r#"
+            SELECT * FROM payment_link_payments
+            WHERE payment_link_id = $1
+              AND ($2::uuid IS NULL OR (created_at, id) < (
+                  SELECT created_at, id FROM payment_link_payments WHERE id = $2
+              ))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(payment_link_id)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Lifetime total (in USDC stroops) confirmed on a payment link.

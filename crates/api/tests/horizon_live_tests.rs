@@ -4,6 +4,8 @@
 //!   `DATABASE_URL=...` (Postgres) and `OCTO_LIVE_TESTS=1`
 //! e.g. `OCTO_LIVE_TESTS=1 cargo test -p octo-api --test horizon_live_tests`.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use octo_api::{build_router, AppState};
@@ -102,7 +104,8 @@ async fn create_wallet_funds_and_has_balance() {
     let token = auth_token(&app).await;
 
     // Client generates the key; server friendbot-funds the supplied account on testnet.
-    let account = DalekKeyPair::random().unwrap().public_key().account_id();
+    let kp = DalekKeyPair::random().unwrap();
+    let wallet_reg_body = common::wallet_body(&app, &token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -111,7 +114,7 @@ async fn create_wallet_funds_and_has_balance() {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(wallet_reg_body))
                 .unwrap(),
         )
         .await
@@ -154,7 +157,7 @@ async fn create_wallet_funds_and_has_balance() {
 async fn create_funded_wallet(app: &axum::Router) -> (String, String, DalekKeyPair, String) {
     let token = auth_token(app).await;
     let kp = DalekKeyPair::random().unwrap();
-    let account = kp.public_key().account_id();
+    let body = common::wallet_body(app, &token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -163,7 +166,7 @@ async fn create_funded_wallet(app: &axum::Router) -> (String, String, DalekKeyPa
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -456,7 +459,8 @@ async fn sponsored_webhook_fires_on_confirmation() {
 
     // One user owns both the wallet and its webhook registration throughout.
     let token = auth_token(&app).await;
-    let account = DalekKeyPair::random().unwrap().public_key().account_id();
+    let kp = DalekKeyPair::random().unwrap();
+    let wallet_reg_body = common::wallet_body(&app, &token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -465,7 +469,7 @@ async fn sponsored_webhook_fires_on_confirmation() {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(wallet_reg_body))
                 .unwrap(),
         )
         .await

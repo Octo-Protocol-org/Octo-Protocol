@@ -283,6 +283,9 @@ pub struct PaymentLinkPayment {
     pub id: Uuid,
     pub payment_link_id: Uuid,
     pub transaction_id: Option<Uuid>,
+    /// Dedicated muxed deposit address for this intent — how ingest matches a landing deposit to
+    /// exactly one payment. `None` on rows created before migration 0015.
+    pub address_id: Option<Uuid>,
     pub payer_name: Option<String>,
     pub payer_email: Option<String>,
     pub amount_usdc_stroops: i64,

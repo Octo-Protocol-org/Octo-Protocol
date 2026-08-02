@@ -9,6 +9,7 @@ pub mod auth;
 mod error;
 pub mod horizon;
 mod json;
+pub mod rate_limit;
 pub mod routes;
 pub mod sponsor_validation;
 mod state;
@@ -48,8 +49,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/audit-logs", get(routes::audit::list_audit_logs))
         .route(
+            "/v1/uploads/signature",
+            get(routes::uploads::upload_signature),
+        )
+        .route(
             "/v1/wallets",
             post(routes::wallets::create_wallet).get(routes::wallets::list_wallets),
+        )
+        // Static segment takes priority over the :id capture below (matchit routing).
+        .route(
+            "/v1/wallets/challenge",
+            get(routes::wallets::wallet_challenge),
         )
         .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
         .route(
@@ -137,6 +147,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/payment-links/:link_id",
             get(routes::payment_links::get_payment_link)
                 .put(routes::payment_links::set_payment_link_active),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id/payments",
+            get(routes::payment_links::list_payment_link_payments),
         )
         // Public: no auth, reachable by anyone with the link.
         .route(

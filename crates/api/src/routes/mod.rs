@@ -8,6 +8,7 @@ pub mod sponsor;
 pub mod sponsorship;
 pub mod submit;
 pub mod trustlines;
+pub mod uploads;
 pub mod wallets;
 pub mod webhooks;
 pub mod whitelist;

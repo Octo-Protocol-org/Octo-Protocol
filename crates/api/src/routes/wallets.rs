@@ -39,6 +39,83 @@ pub struct CreateWalletRequest {
     /// Optional longer description.
     #[serde(default)]
     pub description: Option<String>,
+    /// Server-issued ownership challenge (from `GET /v1/wallets/challenge`).
+    #[serde(default)]
+    pub challenge: Option<String>,
+    /// Base64 ed25519 signature over the challenge bytes, made with `public_key`'s secret key.
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// How long an issued ownership challenge stays redeemable.
+const CHALLENGE_TTL_SECS: i64 = 600;
+
+fn challenge_hmac_input(user_id: Uuid, ts: i64, nonce: &str) -> String {
+    format!("wallet-challenge:{user_id}:{ts}:{nonce}")
+}
+
+/// `GET /v1/wallets/challenge` — issue a short-lived ownership challenge for wallet creation.
+///
+/// The client must sign the returned string with the keypair it intends to register, proving it
+/// controls the private key. The challenge is HMAC-bound to the requesting user, so a captured
+/// (challenge, signature) pair cannot be replayed by a different account.
+pub async fn wallet_challenge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<ChallengeResponse>>> {
+    let user_id = authenticate(&headers, &state).await?;
+    let ts = crate::auth::now_secs();
+    let nonce = Uuid::new_v4().simple().to_string();
+    let mac = crate::auth::sign_hs256(
+        state.jwt_secret(),
+        challenge_hmac_input(user_id, ts, &nonce).as_bytes(),
+    );
+    Ok(Envelope::ok(ChallengeResponse {
+        challenge: format!("{ts}.{nonce}.{mac}"),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChallengeResponse {
+    pub challenge: String,
+}
+
+/// Verify a challenge + signature pair for `public_key`, bound to `user_id`.
+fn verify_ownership(
+    state: &AppState,
+    user_id: Uuid,
+    public_key: &str,
+    challenge: &str,
+    signature: &str,
+) -> Result<(), ApiError> {
+    let bad = || ApiError::BadRequest("invalid or expired ownership challenge".into());
+
+    let mut parts = challenge.splitn(3, '.');
+    let ts: i64 = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
+    let nonce = parts.next().ok_or_else(bad)?;
+    let mac = parts.next().ok_or_else(bad)?;
+
+    let age = crate::auth::now_secs() - ts;
+    if !(0..=CHALLENGE_TTL_SECS).contains(&age) {
+        return Err(bad());
+    }
+    if !crate::auth::verify_hs256(
+        state.jwt_secret(),
+        challenge_hmac_input(user_id, ts, nonce).as_bytes(),
+        mac,
+    ) {
+        return Err(bad());
+    }
+
+    octo_wallet_core::verify_account_signature(public_key, challenge.as_bytes(), signature).map_err(
+        |_| {
+            ApiError::BadRequest(
+                "signature does not prove ownership of public_key — sign the challenge with the \
+                 account's own secret key"
+                    .into(),
+            )
+        },
+    )
 }
 
 /// What we return after creating a wallet. No secret material — the key was generated client-side
@@ -114,6 +191,17 @@ pub async fn create_wallet(
             "public_key must be a valid Stellar account (G...)".into(),
         ));
     }
+
+    // Ownership proof: without this, anyone could register a stranger's public account and watch
+    // its deposit history through the dashboard. The challenge comes from GET /v1/wallets/challenge.
+    let challenge = req.challenge.filter(|c| !c.is_empty()).ok_or_else(|| {
+        ApiError::BadRequest("challenge is required (GET /v1/wallets/challenge first)".into())
+    })?;
+    let signature = req
+        .signature
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("signature over the challenge is required".into()))?;
+    verify_ownership(&state, user_id, &public_key, &challenge, &signature)?;
 
     let wallet = state
         .store()

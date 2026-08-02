@@ -357,7 +357,13 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
     );
 
     let intent = store
-        .record_payment_link_intent(link.id, Some("Ada"), Some("ada@example.com"), 10_000_000)
+        .record_payment_link_intent(
+            link.id,
+            Some("Ada"),
+            Some("ada@example.com"),
+            10_000_000,
+            Some(addr.id),
+        )
         .await
         .expect("record intent");
     assert_eq!(intent.status, "pending");
@@ -368,6 +374,15 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
         .expect("oldest pending")
         .expect("one pending row");
     assert_eq!(oldest.id, intent.id);
+
+    // Exact-address lookup is how ingest matches a deposit to one specific intent.
+    let by_address = store
+        .pending_payment_by_address(addr.id)
+        .await
+        .expect("by address")
+        .expect("pending intent on this address");
+    assert_eq!(by_address.id, intent.id);
+    assert_eq!(by_address.address_id, Some(addr.id));
 
     let tx_hash = Uuid::new_v4().to_string();
     let dep = store
@@ -672,7 +687,7 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0014.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0016.
     //
     // NOTE: this version number is a repeat offender — five migrations have now landed with a
     // colliding 0008 at one point or another (scheme_version, token_denylist,
@@ -682,8 +697,8 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     // every version explicitly rather than just checking a count.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
-        "expected exactly the fourteen known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "expected exactly the sixteen known migrations to be recorded as applied"
     );
 }
 
@@ -861,4 +876,169 @@ async fn list_audit_logs_filters_by_category_and_search_correctly() {
         .expect("list all");
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].action, "rotated api key");
+}
+
+#[tokio::test]
+async fn wallets_due_for_poll_applies_activity_backoff() {
+    let Some(store) = store().await else { return };
+
+    // `network` is CHECK-constrained to mainnet/testnet, so this test can't invent its own. It
+    // uses mainnet (a handful of inert rows) and filters results down to the ids it created.
+    let network = "mainnet";
+    let mut ids = Vec::new();
+    for label in ["never-polled", "active", "idle", "dormant"] {
+        let acct = format!("G{}", Uuid::new_v4().simple());
+        let w = store
+            .create_wallet(NewWallet {
+                network,
+                stellar_account_g: &acct,
+                sealed_ciphertext: b"ct",
+                sealed_nonce: b"nonce",
+                sealed_salt: b"salt",
+                sealed_scheme: 1,
+                label: Some(label),
+                user_id: None,
+                description: None,
+            })
+            .await
+            .expect("create wallet");
+        ids.push(w.id);
+    }
+    let (never, active, idle, dormant) = (ids[0], ids[1], ids[2], ids[3]);
+
+    // Tiers for this test: active < 60s, idle polled at most every 100s, dormant (> 300s since
+    // activity) polled at most every 100_000s.
+    let mine = ids.clone();
+    let due = |store: &Store| {
+        let store = store.clone();
+        let mine = mine.clone();
+        async move {
+            store
+                .wallets_due_for_poll(network, 60, 100, 300, 100_000)
+                .await
+                .expect("due query")
+                .into_iter()
+                .map(|w| w.id)
+                // Other mainnet rows may exist in a shared dev DB; only assert on our own.
+                .filter(|id| mine.contains(id))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Nothing has a cursor row yet: every wallet is due.
+    let ids_due = due(&store).await;
+    assert_eq!(
+        ids_due.len(),
+        4,
+        "wallets with no cursor row are always due"
+    );
+
+    // Give each wallet a cursor row with a distinct activity/poll profile. All were *just*
+    // polled, so only the active one should come back as due again immediately.
+    for (id, activity_secs) in [(active, 10i64), (idle, 200), (dormant, 100_000)] {
+        sqlx::query(
+            "INSERT INTO ingest_cursor (wallet_id, paging_token, updated_at, last_polled_at)
+             VALUES ($1, 'tok', now() - make_interval(secs => $2), now())",
+        )
+        .bind(id)
+        .bind(activity_secs as f64)
+        .execute(store.pool())
+        .await
+        .expect("seed cursor");
+    }
+
+    let ids_due = due(&store).await;
+    assert!(
+        ids_due.contains(&active),
+        "an actively-transacting wallet must be polled every tick"
+    );
+    assert!(
+        !ids_due.contains(&idle),
+        "an idle wallet polled just now must wait for its interval"
+    );
+    assert!(
+        !ids_due.contains(&dormant),
+        "a dormant wallet polled just now must wait for its (longer) interval"
+    );
+    assert!(
+        ids_due.contains(&never),
+        "a wallet that has never been polled is still due"
+    );
+
+    // Move the idle wallet's last poll past its 100s interval — it becomes due, while the
+    // dormant one (100_000s interval) is still not.
+    sqlx::query("UPDATE ingest_cursor SET last_polled_at = now() - make_interval(secs => 150) WHERE wallet_id = $1")
+        .bind(idle)
+        .execute(store.pool())
+        .await
+        .expect("age idle poll");
+    sqlx::query("UPDATE ingest_cursor SET last_polled_at = now() - make_interval(secs => 150) WHERE wallet_id = $1")
+        .bind(dormant)
+        .execute(store.pool())
+        .await
+        .expect("age dormant poll");
+
+    let ids_due = due(&store).await;
+    assert!(
+        ids_due.contains(&idle),
+        "idle wallet is due once its interval elapses"
+    );
+    assert!(
+        !ids_due.contains(&dormant),
+        "dormant wallet needs much longer than the idle interval before it is due"
+    );
+}
+
+#[tokio::test]
+async fn mark_polled_creates_and_updates_the_cursor_row() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // No cursor row yet — mark_polled must create one rather than silently no-op.
+    store.mark_polled(wallet_id).await.expect("first mark");
+    let first: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM ingest_cursor WHERE wallet_id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read cursor");
+    let first = first.expect("last_polled_at set");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    store.mark_polled(wallet_id).await.expect("second mark");
+    let second: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_polled_at FROM ingest_cursor WHERE wallet_id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read cursor again");
+    assert!(
+        second.expect("still set") > first,
+        "repeat polls advance the timestamp"
+    );
+
+    // Marking a poll must NOT look like activity. If it did, every never-used wallet would count
+    // as freshly active and the backoff tiers would never engage at all.
+    let activity: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM ingest_cursor WHERE wallet_id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read updated_at");
+    assert!(
+        activity < chrono::Utc::now() - chrono::Duration::days(365),
+        "mark_polled must not advance updated_at (last-activity); got {activity}"
+    );
+
+    // Marking a poll must not invent a paging token — that only advances on real activity.
+    let token: Option<String> =
+        sqlx::query_scalar("SELECT paging_token FROM ingest_cursor WHERE wallet_id = $1")
+            .bind(wallet_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read token");
+    assert!(
+        token.is_none(),
+        "mark_polled must not fabricate a cursor position"
+    );
 }

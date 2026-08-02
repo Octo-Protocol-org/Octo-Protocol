@@ -16,6 +16,8 @@
 //! Every `authorize_wallet`-guarded handler calls it *before* parsing the request body, so an
 //! empty body is sufficient to exercise the authorization check on POST/PUT routes too.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use octo_api::{build_router, AppState};
@@ -95,12 +97,11 @@ async fn auth_token(app: &axum::Router) -> String {
 }
 
 /// Create a wallet for `token`'s user and return its id. Non-custodial: the caller generates the
-/// keypair and sends only the public account (mirrors `api_tests.rs::create_wallet_req`).
+/// keypair, proves ownership via a signed challenge, and sends only the public account (mirrors
+/// `api_tests.rs::create_wallet_req`).
 async fn create_wallet(app: &axum::Router, token: &str) -> String {
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let body = common::wallet_body(app, token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -109,7 +110,7 @@ async fn create_wallet(app: &axum::Router, token: &str) -> String {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await

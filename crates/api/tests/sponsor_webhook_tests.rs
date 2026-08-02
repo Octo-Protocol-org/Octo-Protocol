@@ -12,6 +12,8 @@
 //! The Horizon submission itself still reaches the real testnet network (there is no mock), but
 //! only to observe a fast rejection — no funding or confirmation polling is involved.
 
+mod common;
+
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
@@ -103,7 +105,8 @@ async fn auth_token(app: &Router) -> String {
 /// Create a non-custodial wallet (client-generated key) via the API and provision its gas tank
 /// (the server-held fee account sponsorship signs with). Returns `(wallet_id, master_account_g)`.
 async fn create_wallet(app: &Router, token: &str) -> (String, String) {
-    let account = DalekKeyPair::random().unwrap().public_key().account_id();
+    let kp = DalekKeyPair::random().unwrap();
+    let reg_body = common::wallet_body(app, token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -112,7 +115,7 @@ async fn create_wallet(app: &Router, token: &str) -> (String, String) {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(reg_body))
                 .unwrap(),
         )
         .await

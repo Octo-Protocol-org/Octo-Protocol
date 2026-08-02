@@ -9,6 +9,7 @@ The only server-held key is a per-wallet **gas tank**: a separate account that h
 only, used to sponsor fees via fee-bump. Its worst-case exposure is the gas budget, never
 customer balances.
 
+
 - Client key handling / signing: `src/lib/sdk/` (frontend)
 - Submit + validation: `crates/api/src/routes/submit.rs`, `crates/api/src/submit_validation.rs`
 - Wallet creation / backup / gas tank: `crates/api/src/routes/wallets.rs`
