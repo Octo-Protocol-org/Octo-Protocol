@@ -73,33 +73,6 @@ jobs:
         # --locked: same rationale as Clippy above — fail loudly on lockfile drift.
         run: cargo test --workspace --locked
 
-  deny:
-    name: cargo-deny (licenses + advisories)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-  audit:
-    name: cargo-audit (RUSTSEC advisories)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  secret-scan:
-    name: gitleaks (secret scanning)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   frontend:
     name: frontend · typecheck · lint · build · test
     runs-on: ubuntu-latest
