@@ -62,9 +62,7 @@ async fn tick_polls_wallets_concurrently_not_sequentially() {
 
     let run_id = Uuid::new_v4().simple().to_string();
     for i in 0..WALLET_COUNT {
-        let acct = format!(
-            "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6-{run_id}-{i}"
-        );
+        let acct = format!("GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6-{run_id}-{i}");
         store
             .create_wallet(NewWallet {
                 network: "testnet",
@@ -84,7 +82,10 @@ async fn tick_polls_wallets_concurrently_not_sequentially() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
-        .route("/accounts/:account/payments", get(slow_mock_payments_handler))
+        .route(
+            "/accounts/:account/payments",
+            get(slow_mock_payments_handler),
+        )
         .with_state((in_flight.clone(), max_seen.clone()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -92,7 +93,9 @@ async fn tick_polls_wallets_concurrently_not_sequentially() {
         .expect("bind mock Horizon");
     let mock_addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("mock Horizon serve");
+        axum::serve(listener, app)
+            .await
+            .expect("mock Horizon serve");
     });
 
     let horizon_url = format!("http://{mock_addr}");

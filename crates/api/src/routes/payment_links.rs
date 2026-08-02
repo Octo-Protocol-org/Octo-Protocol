@@ -115,7 +115,11 @@ pub async fn list_payment_links(
     if has_more {
         items.truncate(limit as usize);
     }
-    let next_cursor = if has_more { items.last().map(|l| l.id) } else { None };
+    let next_cursor = if has_more {
+        items.last().map(|l| l.id)
+    } else {
+        None
+    };
 
     let ids: Vec<Uuid> = items.iter().map(|l| l.id).collect();
     let totals: std::collections::HashMap<Uuid, i64> = state
@@ -228,7 +232,11 @@ pub async fn get_public_payment_link(
     if !link.active {
         return Err(ApiError::NotFound);
     }
-    let address = state.store().get_address(link.address_id).await?.ok_or(ApiError::NotFound)?;
+    let address = state
+        .store()
+        .get_address(link.address_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     Ok(Envelope::ok(PublicPaymentLinkView {
         name: link.name,
         description: link.description,
@@ -283,7 +291,11 @@ pub async fn create_payment_intent(
             amount,
         )
         .await?;
-    let address = state.store().get_address(link.address_id).await?.ok_or(ApiError::NotFound)?;
+    let address = state
+        .store()
+        .get_address(link.address_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
 
     let (code, json) = Envelope::created(PaymentIntentView {
         payment_id: payment.id,
@@ -337,7 +349,13 @@ pub async fn public_signing_info(
 
     let account = match params.account {
         Some(a) => a,
-        None => state.store().get_wallet(link.wallet_id).await?.stellar_account_g,
+        None => {
+            state
+                .store()
+                .get_wallet(link.wallet_id)
+                .await?
+                .stellar_account_g
+        }
     };
     let sequence = state.horizon().account_sequence(&account).await?;
     Ok(Envelope::ok(crate::routes::submit::SigningInfo {

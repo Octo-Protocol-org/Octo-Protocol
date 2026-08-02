@@ -117,9 +117,9 @@ mod tests {
         InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
         ManageDataOp, ManageSellOfferOp, Memo, MuxedAccount, Operation, OperationBody,
         PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, Preconditions,
-        RestoreFootprintOp, RevokeSponsorshipOp, SequenceNumber, SetOptionsOp,
-        SetTrustLineFlagsOp, Transaction, TransactionEnvelope, TransactionExt,
-        TransactionV1Envelope, Uint256, XDRSerialize,
+        RestoreFootprintOp, RevokeSponsorshipOp, SequenceNumber, SetOptionsOp, SetTrustLineFlagsOp,
+        Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256,
+        XDRSerialize,
     };
 
     const VECTOR_MK: [u8; 32] = [7u8; 32];

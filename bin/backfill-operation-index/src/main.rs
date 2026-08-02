@@ -13,10 +13,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use octo_store::Store;
 use octo_ingest::operation_index_from_toid;
+use octo_store::Store;
 use sqlx::Row;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "backfill-operation-index")]
@@ -66,7 +66,10 @@ impl BackfillStats {
         info!("  Total examined: {}", self.total_examined);
         info!("  Needs update: {}", self.needs_update);
         info!("  Updated: {}", self.updated);
-        info!("  Skipped (already correct): {}", self.skipped_already_correct);
+        info!(
+            "  Skipped (already correct): {}",
+            self.skipped_already_correct
+        );
         info!("  Skipped (invalid TOID): {}", self.skipped_invalid_toid);
         info!("  Errors: {}", self.errors);
     }
@@ -95,13 +98,13 @@ async fn find_candidates_batch(
         .context("Failed to fetch candidate rows")?;
 
     let mut candidates = Vec::new();
-    
+
     for row in rows {
         let id: uuid::Uuid = row.get("id");
         let horizon_op_id: String = row.get("horizon_op_id");
         let current_operation_index: i32 = row.get("operation_index");
         let stellar_tx_hash: Option<String> = row.get("stellar_tx_hash");
-        
+
         if let Some(new_operation_index) = operation_index_from_toid(&horizon_op_id) {
             if new_operation_index != current_operation_index {
                 candidates.push(UpdateCandidate {
@@ -114,7 +117,7 @@ async fn find_candidates_batch(
             }
         }
     }
-    
+
     Ok(candidates)
 }
 
@@ -126,7 +129,7 @@ async fn update_batch(
     if candidates.is_empty() {
         return Ok(0);
     }
-    
+
     if dry_run {
         for candidate in candidates {
             info!(
@@ -142,19 +145,21 @@ async fn update_batch(
     }
 
     let mut updated = 0;
-    
+
     // Use a transaction to ensure consistency
     let pool = store.pool();
-    let mut tx = pool.begin().await
+    let mut tx = pool
+        .begin()
+        .await
         .context("Failed to begin database transaction")?;
-    
+
     for candidate in candidates {
         // Double-check the current value hasn't changed since we selected it
         // and update atomically
         let result = sqlx::query(
             "UPDATE transactions 
              SET operation_index = $1, updated_at = now()
-             WHERE id = $2 AND operation_index = $3 AND horizon_op_id = $4"
+             WHERE id = $2 AND operation_index = $3 AND horizon_op_id = $4",
         )
         .bind(candidate.new_operation_index)
         .bind(candidate.id)
@@ -163,7 +168,7 @@ async fn update_batch(
         .execute(&mut *tx)
         .await
         .context("Failed to update transaction")?;
-        
+
         if result.rows_affected() == 1 {
             updated += 1;
             info!(
@@ -180,21 +185,33 @@ async fn update_batch(
             );
         }
     }
-    
-    tx.commit().await
+
+    tx.commit()
+        .await
         .context("Failed to commit database transaction")?;
-    
+
     Ok(updated)
 }
 
 async fn run_backfill(args: Args) -> Result<()> {
     info!("Starting operation_index backfill");
-    info!("Database URL: {}", args.database_url.chars().take(20).collect::<String>() + "...");
+    info!(
+        "Database URL: {}",
+        args.database_url.chars().take(20).collect::<String>() + "..."
+    );
     info!("Batch size: {}", args.batch_size);
     info!("Dry run: {}", args.dry_run);
-    info!("Limit: {}", if args.limit == 0 { "unlimited".to_string() } else { args.limit.to_string() });
+    info!(
+        "Limit: {}",
+        if args.limit == 0 {
+            "unlimited".to_string()
+        } else {
+            args.limit.to_string()
+        }
+    );
 
-    let store = Store::connect(&args.database_url).await
+    let store = Store::connect(&args.database_url)
+        .await
         .context("Failed to connect to database")?;
 
     let mut stats = BackfillStats::default();
@@ -208,15 +225,19 @@ async fn run_backfill(args: Args) -> Result<()> {
         } else {
             args.batch_size
         };
-        
+
         if current_batch_size == 0 {
             info!("Reached the specified limit of {} records", args.limit);
             break;
         }
 
-        info!("Processing batch starting at offset {} (batch size: {})", offset, current_batch_size);
+        info!(
+            "Processing batch starting at offset {} (batch size: {})",
+            offset, current_batch_size
+        );
 
-        let candidates = find_candidates_batch(&store, current_batch_size, offset).await
+        let candidates = find_candidates_batch(&store, current_batch_size, offset)
+            .await
             .context("Failed to find candidate records")?;
 
         if candidates.is_empty() {
@@ -229,7 +250,10 @@ async fn run_backfill(args: Args) -> Result<()> {
 
         // Log some examples of what we're about to update
         if !candidates.is_empty() {
-            info!("Found {} records needing updates in this batch:", candidates.len());
+            info!(
+                "Found {} records needing updates in this batch:",
+                candidates.len()
+            );
             for (i, candidate) in candidates.iter().take(3).enumerate() {
                 info!(
                     "  {}: {} -> {} (tx_hash: {}, toid: {})",
@@ -248,7 +272,10 @@ async fn run_backfill(args: Args) -> Result<()> {
         match update_batch(&store, &candidates, args.dry_run).await {
             Ok(updated_count) => {
                 stats.updated += updated_count;
-                info!("Successfully processed {} records in this batch", updated_count);
+                info!(
+                    "Successfully processed {} records in this batch",
+                    updated_count
+                );
             }
             Err(e) => {
                 error!("Error updating batch: {}", e);
@@ -330,7 +357,10 @@ mod tests {
         // splits the string into 4 hyphen-delimited parts (not 3), so this is correctly rejected
         // by the same "exactly 3 parts" check that rejects any other malformed TOID shape.
         assert_eq!(operation_index_from_toid("12345-1--1"), None);
-        assert_eq!(operation_index_from_toid("12345-1-2147483647"), Some(i32::MAX));
+        assert_eq!(
+            operation_index_from_toid("12345-1-2147483647"),
+            Some(i32::MAX)
+        );
         assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
     }
 }

@@ -300,7 +300,10 @@ fn signing_info_serializes_sequence_as_a_string() {
     // A value past MAX_SAFE_INTEGER that is NOT representable as an f64 — round-tripping it
     // through a double loses the final digit, which is exactly the production failure.
     let seq: i64 = 15_942_562_120_466_433;
-    assert!(seq > 9_007_199_254_740_991, "test value must be unsafe in JS");
+    assert!(
+        seq > 9_007_199_254_740_991,
+        "test value must be unsafe in JS"
+    );
     assert_ne!(
         seq as f64 as i64, seq,
         "test value must actually lose precision as a double"
@@ -1573,11 +1576,7 @@ async fn list_sponsored_transactions_requires_auth() {
 
 /// Helper: create a wallet and return its id string.
 async fn create_wallet_for(app: &axum::Router, token: &str) -> String {
-    let resp = app
-        .clone()
-        .oneshot(create_wallet_req(token))
-        .await
-        .unwrap();
+    let resp = app.clone().oneshot(create_wallet_req(token)).await.unwrap();
     body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
@@ -1893,31 +1892,39 @@ async fn payment_link_management_requires_wallet_ownership() {
     assert_eq!(resp.status(), StatusCode::OK);
     let public = body_json(resp).await;
     assert_eq!(public["data"]["name"], "Support");
-    assert!(public["data"]["deposit_address"].as_str().unwrap().starts_with('M'));
+    assert!(public["data"]["deposit_address"]
+        .as_str()
+        .unwrap()
+        .starts_with('M'));
 
     // Deactivating requires ownership too.
     let link_id = created["data"]["id"].as_str().unwrap();
     let deactivate_uri = format!("/v1/wallets/{wallet_id}/payment-links/{link_id}");
     let resp = app
         .clone()
-        .oneshot(put_json_auth(&deactivate_uri, r#"{"active":false}"#, &other))
+        .oneshot(put_json_auth(
+            &deactivate_uri,
+            r#"{"active":false}"#,
+            &other,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let resp = app
         .clone()
-        .oneshot(put_json_auth(&deactivate_uri, r#"{"active":false}"#, &owner))
+        .oneshot(put_json_auth(
+            &deactivate_uri,
+            r#"{"active":false}"#,
+            &owner,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["data"]["active"], false);
 
     // An inactive link's public page must 404, not leak its (now-off) details.
-    let resp = app
-        .oneshot(get(&format!("/v1/pay/{slug}")))
-        .await
-        .unwrap();
+    let resp = app.oneshot(get(&format!("/v1/pay/{slug}"))).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 

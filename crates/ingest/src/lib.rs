@@ -265,11 +265,16 @@ impl Ingestor {
         if tx.asset_code != "USDC" || tx.asset_issuer.as_deref() != Some(USDC_TESTNET_ISSUER) {
             return;
         }
-        let Some(address_id) = tx.address_id else { return };
+        let Some(address_id) = tx.address_id else {
+            return;
+        };
         let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await else {
             return;
         };
-        let Ok(Some(payment)) = self.store.oldest_pending_payment_link_payment(link.id).await
+        let Ok(Some(payment)) = self
+            .store
+            .oldest_pending_payment_link_payment(link.id)
+            .await
         else {
             return;
         };
@@ -365,12 +370,12 @@ impl Ingestor {
 }
 
 /// Extract the operation index from a Horizon TOID (Transaction Operation ID).
-/// 
+///
 /// A TOID has the format: `{ledger}-{tx_index}-{op_index}`, where:
 /// - `ledger` is the ledger sequence number
 /// - `tx_index` is the transaction's index within that ledger
 /// - `op_index` is the operation's index within that transaction
-/// 
+///
 /// Returns `None` if the TOID format is invalid or parsing fails.
 pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
     // Split on hyphens and take the third component (operation index)
@@ -378,7 +383,7 @@ pub fn operation_index_from_toid(toid: &str) -> Option<i32> {
     if parts.len() != 3 {
         return None;
     }
-    
+
     parts[2].parse::<i32>().ok()
 }
 
@@ -701,10 +706,10 @@ mod tests {
         assert_eq!(operation_index_from_toid("12345-1"), None);
         assert_eq!(operation_index_from_toid("12345"), None);
         assert_eq!(operation_index_from_toid(""), None);
-        
+
         // Too many parts
         assert_eq!(operation_index_from_toid("12345-1-0-extra"), None);
-        
+
         // Non-numeric operation index
         assert_eq!(operation_index_from_toid("12345-1-abc"), None);
         assert_eq!(operation_index_from_toid("12345-1-"), None);
@@ -718,8 +723,11 @@ mod tests {
         assert_eq!(operation_index_from_toid("12345-1--1"), None);
 
         // Large numbers within i32 range
-        assert_eq!(operation_index_from_toid("12345-1-2147483647"), Some(i32::MAX));
-        
+        assert_eq!(
+            operation_index_from_toid("12345-1-2147483647"),
+            Some(i32::MAX)
+        );
+
         // Numbers outside i32 range should fail
         assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
     }

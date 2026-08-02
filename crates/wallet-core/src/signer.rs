@@ -22,13 +22,13 @@ use stellar_base::transaction::MIN_BASE_FEE;
 #[cfg(any(test, feature = "test-fixtures"))]
 use crate::address::is_valid_account;
 #[cfg(any(test, feature = "test-fixtures"))]
-use stellar_base::crypto::{MuxedEd25519PublicKey, PublicKey};
-#[cfg(any(test, feature = "test-fixtures"))]
 use crate::asset::is_valid_asset_code;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::amount::Stroops;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::asset::Asset;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::crypto::{MuxedEd25519PublicKey, PublicKey};
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::memo::Memo;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -554,8 +554,7 @@ mod tests {
             limit_stroops: None, // unlimited
             sequence: 1,
         };
-        let signed =
-            sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
+        let signed = sign_change_trust(&mk, &sealed, StellarNetwork::Testnet, 0, &req).unwrap();
         assert_eq!(signed.source_account, MASTER_ACCOUNT_0);
         let env = stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr)
             .expect("signed envelope must be valid XDR");
@@ -1071,7 +1070,6 @@ mod tests {
                 &FeeBumpRequest {
                     inner_xdr: &fee_bump_xdr,
                     max_base_fee_stroops: 200
-                    
                 },
             ),
             Err(WalletError::InvalidXdr)
@@ -1093,7 +1091,6 @@ mod tests {
                 &FeeBumpRequest {
                     inner_xdr: &inner_xdr,
                     max_base_fee_stroops: 200
-                    
                 },
             ),
             Err(WalletError::SeedDecryption)

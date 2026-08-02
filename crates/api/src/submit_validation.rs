@@ -7,9 +7,7 @@
 //! no I/O — so it can be unit-tested independently of the database or Horizon.
 
 use crate::error::ApiError;
-use stellar_base::xdr::{
-    Asset, MuxedAccount, OperationBody, TransactionEnvelope, XDRDeserialize,
-};
+use stellar_base::xdr::{Asset, MuxedAccount, OperationBody, TransactionEnvelope, XDRDeserialize};
 use stellar_strkey::ed25519::PublicKey as StrkeyPK;
 
 /// Operation types a client-signed submission may contain.
@@ -135,11 +133,21 @@ pub(crate) fn asset_parts(asset: &Asset) -> (String, Option<String>) {
         Asset::Native => ("native".to_string(), None),
         Asset::CreditAlphanum4(a) => (
             trimmed_code(&a.asset_code.0),
-            Some(StrkeyPK(account_bytes(&a.issuer)).to_string().as_str().to_owned()),
+            Some(
+                StrkeyPK(account_bytes(&a.issuer))
+                    .to_string()
+                    .as_str()
+                    .to_owned(),
+            ),
         ),
         Asset::CreditAlphanum12(a) => (
             trimmed_code(&a.asset_code.0),
-            Some(StrkeyPK(account_bytes(&a.issuer)).to_string().as_str().to_owned()),
+            Some(
+                StrkeyPK(account_bytes(&a.issuer))
+                    .to_string()
+                    .as_str()
+                    .to_owned(),
+            ),
         ),
     }
 }

@@ -979,13 +979,12 @@ impl Store {
         wallet_id: Uuid,
         entry_id: Uuid,
     ) -> Result<(), StoreError> {
-        let result = sqlx::query(
-            "DELETE FROM whitelisted_addresses WHERE id = $1 AND wallet_id = $2",
-        )
-        .bind(entry_id)
-        .bind(wallet_id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM whitelisted_addresses WHERE id = $1 AND wallet_id = $2")
+                .bind(entry_id)
+                .bind(wallet_id)
+                .execute(&self.pool)
+                .await?;
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound);
         }
@@ -1111,12 +1110,11 @@ impl Store {
         &self,
         address_id: Uuid,
     ) -> Result<Option<PaymentLink>, StoreError> {
-        let row = sqlx::query_as::<_, PaymentLink>(
-            "SELECT * FROM payment_links WHERE address_id = $1",
-        )
-        .bind(address_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, PaymentLink>("SELECT * FROM payment_links WHERE address_id = $1")
+                .bind(address_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row)
     }
 
@@ -1245,7 +1243,10 @@ impl Store {
     }
 
     /// Lifetime total (in USDC stroops) confirmed on a payment link.
-    pub async fn sum_payment_link_collected(&self, payment_link_id: Uuid) -> Result<i64, StoreError> {
+    pub async fn sum_payment_link_collected(
+        &self,
+        payment_link_id: Uuid,
+    ) -> Result<i64, StoreError> {
         let total: Option<i64> = sqlx::query_scalar(
             r#"
             SELECT COALESCE(SUM(amount_usdc_stroops), 0)::bigint

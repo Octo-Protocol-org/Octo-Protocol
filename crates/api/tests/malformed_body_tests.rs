@@ -100,13 +100,41 @@ struct RouteCase {
 /// Also excludes `POST /v1/wallets/:id/withdraw`: it's a `410 Gone` tombstone (see
 /// `custodial_withdraw_is_gone` in `api_tests.rs`) that never reaches `parse_optional`.
 const MUTATING_ROUTES: &[RouteCase] = &[
-    RouteCase { method: "POST", path_template: "/v1/auth/signup", needs_auth: false },
-    RouteCase { method: "POST", path_template: "/v1/auth/login", needs_auth: false },
-    RouteCase { method: "POST", path_template: "/v1/wallets", needs_auth: true },
-    RouteCase { method: "POST", path_template: "/v1/wallets/{wallet}/addresses", needs_auth: true },
-    RouteCase { method: "POST", path_template: "/v1/wallets/{wallet}/webhooks", needs_auth: true },
-    RouteCase { method: "PUT", path_template: "/v1/wallets/{wallet}/sponsorship", needs_auth: true },
-    RouteCase { method: "POST", path_template: "/v1/wallets/{wallet}/sponsor", needs_auth: true },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/auth/signup",
+        needs_auth: false,
+    },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/auth/login",
+        needs_auth: false,
+    },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/wallets",
+        needs_auth: true,
+    },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/wallets/{wallet}/addresses",
+        needs_auth: true,
+    },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/wallets/{wallet}/webhooks",
+        needs_auth: true,
+    },
+    RouteCase {
+        method: "PUT",
+        path_template: "/v1/wallets/{wallet}/sponsorship",
+        needs_auth: true,
+    },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/wallets/{wallet}/sponsor",
+        needs_auth: true,
+    },
 ];
 
 fn resolve_path(template: &str, wallet_id: &str) -> String {
@@ -166,17 +194,30 @@ async fn fixture() -> Option<Fixture> {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED, "fixture wallet creation failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "fixture wallet creation failed"
+    );
     let wallet_id = body_json(resp).await["data"]["id"]
         .as_str()
         .unwrap()
         .to_string();
-    Some(Fixture { app, token, wallet_id })
+    Some(Fixture {
+        app,
+        token,
+        wallet_id,
+    })
 }
 
 #[tokio::test]
 async fn truncated_json_body_returns_400_across_all_mutating_routes() {
-    let Some(Fixture { app, token, wallet_id }) = fixture().await else {
+    let Some(Fixture {
+        app,
+        token,
+        wallet_id,
+    }) = fixture().await
+    else {
         return;
     };
 
@@ -203,7 +244,12 @@ async fn truncated_json_body_returns_400_across_all_mutating_routes() {
 
 #[tokio::test]
 async fn wrong_top_level_json_shape_returns_400_across_all_mutating_routes() {
-    let Some(Fixture { app, token, wallet_id }) = fixture().await else {
+    let Some(Fixture {
+        app,
+        token,
+        wallet_id,
+    }) = fixture().await
+    else {
         return;
     };
 
@@ -233,7 +279,12 @@ async fn wrong_top_level_json_shape_returns_400_across_all_mutating_routes() {
 
 #[tokio::test]
 async fn moderately_large_nested_json_does_not_panic() {
-    let Some(Fixture { app, token, wallet_id }) = fixture().await else {
+    let Some(Fixture {
+        app,
+        token,
+        wallet_id,
+    }) = fixture().await
+    else {
         return;
     };
 

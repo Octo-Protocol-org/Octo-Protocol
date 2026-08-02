@@ -183,7 +183,11 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     let n = ingestor.poll_once(10).await.expect("first poll_once");
     assert_eq!(n, 3, "first poll should process all 3 records");
 
-    let tx_count_after_first = store.list_transactions(wallet_id, 100, None).await.unwrap().len();
+    let tx_count_after_first = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(tx_count_after_first, 3);
 
     // Verify cursor was advanced to the last record's paging token.
@@ -199,7 +203,11 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     let n2 = ingestor.poll_once(10).await.expect("second poll_once");
     assert_eq!(n2, 0, "resumed poll must process zero new records");
 
-    let tx_count_after_second = store.list_transactions(wallet_id, 100, None).await.unwrap().len();
+    let tx_count_after_second = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(
         tx_count_after_second, 3,
         "no new deposits must be recorded on cursor-resume"
@@ -267,7 +275,11 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
         );
     }
 
-    let tx_count_after_first = store.list_transactions(wallet.id, 100, None).await.unwrap().len();
+    let tx_count_after_first = store
+        .list_transactions(wallet.id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(
         tx_count_after_first, 5,
         "all 5 records should be stored after first pass"
@@ -286,7 +298,11 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
     }
 
     // No additional deposits must have been recorded.
-    let tx_count_after_second = store.list_transactions(wallet.id, 100, None).await.unwrap().len();
+    let tx_count_after_second = store
+        .list_transactions(wallet.id, 100, None)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(
         tx_count_after_second, 5,
         "out-of-order replay must not create any new deposit rows"
