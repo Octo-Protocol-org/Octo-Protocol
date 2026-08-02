@@ -115,10 +115,7 @@ async fn auth_token(app: &Router) -> String {
 /// Create a non-custodial wallet (client-generated key) and provision its gas tank so the
 /// sponsorship path has a server-held fee account to sign fee-bumps with.
 async fn create_wallet(app: &Router, token: &str) -> (String, String) {
-    let account = DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    let account = DalekKeyPair::random().unwrap().public_key().account_id();
     let resp = app
         .clone()
         .oneshot(

@@ -192,7 +192,12 @@ fn guarded_routes() -> Vec<GuardedRoute> {
             method: "GET",
             // authorize_wallet runs before the endpoint lookup, so an arbitrary endpoint id is
             // fine here — cross-wallet rejection must happen before we'd even check it exists.
-            path: |id| format!("/v1/wallets/{id}/webhooks/{}/deliveries", uuid::Uuid::new_v4()),
+            path: |id| {
+                format!(
+                    "/v1/wallets/{id}/webhooks/{}/deliveries",
+                    uuid::Uuid::new_v4()
+                )
+            },
         },
         GuardedRoute {
             name: "GET /v1/wallets/:id/sponsorship",

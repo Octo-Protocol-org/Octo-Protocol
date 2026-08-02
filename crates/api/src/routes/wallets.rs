@@ -218,8 +218,7 @@ pub async fn create_gas_tank(
 
     // Provision a fresh keypair inside wallet-core. The mnemonic is deliberately dropped: the
     // tank is a disposable fee account, recoverable only by re-provisioning.
-    let provisioned =
-        octo_wallet_core::provision_wallet(state.master_key(), state.network())?;
+    let provisioned = octo_wallet_core::provision_wallet(state.master_key(), state.network())?;
     let wallet = state
         .store()
         .set_gas_tank(

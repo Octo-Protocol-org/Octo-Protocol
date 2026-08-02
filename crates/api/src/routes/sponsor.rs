@@ -114,7 +114,9 @@ pub async fn sponsor(
     };
     // Keep the versioned-scheme path (PR #158) so master-key rotation keeps working. Rows
     // written before the scheme tag existed fall back to V1.
-    let scheme = wallet.sealed_scheme.unwrap_or(octo_crypto::SCHEME_V1 as i16);
+    let scheme = wallet
+        .sealed_scheme
+        .unwrap_or(octo_crypto::SCHEME_V1 as i16);
     let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
         .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {

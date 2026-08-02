@@ -167,7 +167,10 @@ async fn assert_exactly_distinct_recorded(
     sequence: &[usize],
 ) {
     let distinct: BTreeSet<usize> = sequence.iter().copied().collect();
-    let txs = store.list_transactions(wallet_id, 100, None).await.expect("list");
+    let txs = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .expect("list");
     assert_eq!(
         txs.len(),
         distinct.len(),

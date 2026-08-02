@@ -485,7 +485,10 @@ async fn sponsored_webhook_fires_on_confirmation() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let tank = body_json(resp).await;
-    let master_g = tank["data"]["gas_tank_address"].as_str().unwrap().to_string();
+    let master_g = tank["data"]["gas_tank_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
         tank["data"]["funded"], true,
         "the gas tank must be friendbot-funded to pay the fee-bump fee"

@@ -100,7 +100,10 @@ async fn allocate_address_increments_atomically() {
     assert_eq!(b.muxed_id, 2);
     assert_ne!(a.muxed_address, b.muxed_address);
 
-    let list = store.list_addresses(wallet_id, 100, None).await.expect("list");
+    let list = store
+        .list_addresses(wallet_id, 100, None)
+        .await
+        .expect("list");
     assert_eq!(list.len(), 2);
 }
 
@@ -136,7 +139,10 @@ async fn record_deposit_is_idempotent() {
         "duplicate deposit must be a no-op (anti double-credit)"
     );
 
-    let txs = store.list_transactions(wallet_id, 100, None).await.expect("list");
+    let txs = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .expect("list");
     assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain op");
 }
 
@@ -168,7 +174,14 @@ async fn different_op_index_same_tx_is_distinct() {
 
     assert!(store.record_deposit(&base).await.expect("op0").is_some());
     assert!(store.record_deposit(&op1).await.expect("op1").is_some());
-    assert_eq!(store.list_transactions(wallet_id, 100, None).await.unwrap().len(), 2);
+    assert_eq!(
+        store
+            .list_transactions(wallet_id, 100, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -178,11 +191,21 @@ async fn sum_deposits_for_address_totals_only_that_addresss_confirmed_deposits()
     let wid = wallet_id.simple();
 
     let addr_a = store
-        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-a-{id}")), Some("a"), serde_json::json!({}))
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-a-{id}")),
+            Some("a"),
+            serde_json::json!({}),
+        )
         .await
         .expect("alloc a");
     let addr_b = store
-        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-b-{id}")), Some("b"), serde_json::json!({}))
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-b-{id}")),
+            Some("b"),
+            serde_json::json!({}),
+        )
         .await
         .expect("alloc b");
 
@@ -227,21 +250,38 @@ async fn sum_deposits_for_address_totals_only_that_addresss_confirmed_deposits()
         .expect("record deposit to b");
 
     assert_eq!(
-        store.sum_deposits_for_address(addr_a.id).await.expect("sum a"),
+        store
+            .sum_deposits_for_address(addr_a.id)
+            .await
+            .expect("sum a"),
         12_500_000,
         "A's total must be the sum of its own two deposits, unaffected by B's"
     );
     assert_eq!(
-        store.sum_deposits_for_address(addr_b.id).await.expect("sum b"),
+        store
+            .sum_deposits_for_address(addr_b.id)
+            .await
+            .expect("sum b"),
         999_000_000
     );
 
     // A brand-new address with no deposits sums to 0, not an error.
     let addr_c = store
-        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-c-{id}")), Some("c"), serde_json::json!({}))
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-c-{id}")),
+            Some("c"),
+            serde_json::json!({}),
+        )
         .await
         .expect("alloc c");
-    assert_eq!(store.sum_deposits_for_address(addr_c.id).await.expect("sum c"), 0);
+    assert_eq!(
+        store
+            .sum_deposits_for_address(addr_c.id)
+            .await
+            .expect("sum c"),
+        0
+    );
 
     // The batched form must agree with the per-address form, and only return entries that
     // actually have deposits (address C has none, so it's absent rather than a zero row).
@@ -260,7 +300,10 @@ async fn sum_deposits_for_address_totals_only_that_addresss_confirmed_deposits()
 
     // Empty id list must short-circuit to an empty result, not error or scan the whole table.
     assert_eq!(
-        store.sum_deposits_for_addresses(&[]).await.expect("empty batch"),
+        store
+            .sum_deposits_for_addresses(&[])
+            .await
+            .expect("empty batch"),
         Vec::new()
     );
 }
@@ -272,7 +315,12 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
     let wid = wallet_id.simple();
 
     let addr = store
-        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-{id}")), None, serde_json::json!({}))
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-{id}")),
+            None,
+            serde_json::json!({}),
+        )
         .await
         .expect("alloc address");
 
@@ -293,11 +341,20 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
     assert!(link.active);
 
     // Public lookup by slug must work with no wallet_id in hand.
-    let by_slug = store.get_payment_link_by_slug(&slug).await.expect("by slug");
+    let by_slug = store
+        .get_payment_link_by_slug(&slug)
+        .await
+        .expect("by slug");
     assert_eq!(by_slug.id, link.id);
 
     // A fresh link has nothing collected yet.
-    assert_eq!(store.sum_payment_link_collected(link.id).await.expect("sum"), 0);
+    assert_eq!(
+        store
+            .sum_payment_link_collected(link.id)
+            .await
+            .expect("sum"),
+        0
+    );
 
     let intent = store
         .record_payment_link_intent(link.id, Some("Ada"), Some("ada@example.com"), 10_000_000)
@@ -352,7 +409,10 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
         .is_none());
 
     assert_eq!(
-        store.sum_payment_link_collected(link.id).await.expect("sum after confirm"),
+        store
+            .sum_payment_link_collected(link.id)
+            .await
+            .expect("sum after confirm"),
         10_000_000
     );
 
