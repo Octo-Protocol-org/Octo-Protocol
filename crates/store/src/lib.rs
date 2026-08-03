@@ -773,6 +773,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Fetch a single transaction by id.
+    pub async fn get_transaction(&self, id: Uuid) -> Result<Option<Transaction>, StoreError> {
+        let row = sqlx::query_as::<_, Transaction>("SELECT * FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
     // --- withdrawals ------------------------------------------------------
 
     /// Cheap existence check on `(wallet_id, idempotency_key)`, used to short-circuit a retried
@@ -1181,6 +1190,19 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Unscoped lookup by id — for internal (non-owner-facing) callers that already know which
+    /// row they want, e.g. the expiry sweep resolving a payment's link to build its webhook.
+    pub async fn get_payment_link_by_id(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PaymentLink>, StoreError> {
+        let row = sqlx::query_as::<_, PaymentLink>("SELECT * FROM payment_links WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
     /// The payment link whose dedicated deposit address is `address_id`, if any.
     pub async fn get_payment_link_by_address(
         &self,
@@ -1337,6 +1359,49 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a deposit that landed on this payment's address but for the wrong amount.
+    /// `status` must be `"underpaid"` or `"overpaid"` — the transaction is still linked (so the
+    /// merchant/payer can see what actually arrived) but the payment is deliberately NOT marked
+    /// `confirmed`.
+    pub async fn mark_payment_link_payment_mismatched(
+        &self,
+        id: Uuid,
+        transaction_id: Uuid,
+        status: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            UPDATE payment_link_payments
+            SET status = $1, transaction_id = $2
+            WHERE id = $3
+            "#,
+        )
+        .bind(status)
+        .bind(transaction_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark payments still `pending` past a 1-hour deadline as `expired`, returning the rows that
+    /// were flipped so the caller can fire one webhook per expiry without a second query.
+    pub async fn expire_stale_payment_link_payments(
+        &self,
+    ) -> Result<Vec<PaymentLinkPayment>, StoreError> {
+        let rows = sqlx::query_as::<_, PaymentLinkPayment>(
+            r#"
+            UPDATE payment_link_payments
+            SET status = 'expired'
+            WHERE status = 'pending' AND created_at < now() - interval '1 hour'
+            RETURNING *
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Payments recorded against a link (newest first), with cursor pagination.
