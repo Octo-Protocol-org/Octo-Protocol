@@ -5,10 +5,13 @@
 
 use octo_ingest::horizon::{PaymentRecord, TransactionRecord};
 use octo_ingest::{Ingestor, Processed};
-use octo_store::{NewWallet, Store};
+use octo_store::{NewPaymentLink, NewWallet, Store};
 use octo_wallet_core::encode_muxed;
 use std::sync::Once;
 use uuid::Uuid;
+
+/// Same testnet USDC issuer the ingest crate matches payment-link deposits against.
+const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 static LOAD_ENV: Once = Once::new();
 
@@ -280,4 +283,110 @@ async fn missing_transaction_field_yields_no_memo_and_no_panic() {
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0].memo_id, None);
     assert_eq!(txs[0].ledger, None);
+}
+
+async fn make_usdc_payment_link(
+    store: &Store,
+    wallet_id: Uuid,
+    amount_usdc_stroops: i64,
+) -> (String, Uuid, Uuid) {
+    let addr = store
+        .allocate_address(
+            wallet_id,
+            |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let link = store
+        .create_payment_link(NewPaymentLink {
+            wallet_id,
+            address_id: addr.id,
+            slug: &format!("link-{}", Uuid::new_v4().simple()),
+            name: "Test link",
+            description: None,
+            image_url: None,
+            redirect_url: None,
+            amount_usdc_stroops: Some(amount_usdc_stroops),
+        })
+        .await
+        .unwrap();
+    let intent = store
+        .record_payment_link_intent(link.id, None, None, amount_usdc_stroops, Some(addr.id))
+        .await
+        .unwrap();
+    (addr.muxed_address, link.id, intent.id)
+}
+
+fn usdc_record(id: &str, to_muxed: String, amount: &str) -> PaymentRecord {
+    let mut rec = base_record(id);
+    rec.to_muxed = Some(to_muxed);
+    rec.asset_type = Some("credit_alphanum4".into());
+    rec.asset_code = Some("USDC".into());
+    rec.asset_issuer = Some(USDC_TESTNET_ISSUER.into());
+    rec.amount = Some(amount.into());
+    rec
+}
+
+#[tokio::test]
+async fn underpaid_payment_link_deposit_is_recorded_but_left_unconfirmed() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
+    let rec = usdc_record("op-underpaid-1", muxed, "5.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "underpaid");
+    assert!(
+        payment.transaction_id.is_some(),
+        "the short deposit must still be linked so the merchant can see what arrived"
+    );
+}
+
+#[tokio::test]
+async fn overpaid_payment_link_deposit_is_recorded_but_left_unconfirmed() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
+    let rec = usdc_record("op-overpaid-1", muxed, "15.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "overpaid");
+    assert!(payment.transaction_id.is_some());
+}
+
+#[tokio::test]
+async fn exact_payment_link_deposit_confirms() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
+    let rec = usdc_record("op-exact-1", muxed, "10.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "confirmed");
 }

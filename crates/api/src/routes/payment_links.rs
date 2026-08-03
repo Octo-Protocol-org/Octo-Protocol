@@ -444,8 +444,15 @@ pub async fn create_payment_intent(
 
 #[derive(Debug, Serialize)]
 pub struct PaymentStatusView {
+    /// "pending" | "confirmed" | "expired" | "underpaid" | "overpaid".
     pub status: String,
     pub transaction_id: Option<Uuid>,
+    /// The amount this intent expects. Always present, so the frontend can render a mismatch
+    /// banner ("you sent X, expected Y") without a second request.
+    pub expected_usdc_stroops: i64,
+    /// What actually landed on-chain, once a deposit has been matched (confirmed/underpaid/
+    /// overpaid). `None` while still pending or expired unpaid.
+    pub received_usdc_stroops: Option<i64>,
 }
 
 /// `GET /v1/pay/:slug/payments/:payment_id` — public, no auth.
@@ -462,9 +469,19 @@ pub async fn get_payment_status(
         .store()
         .get_payment_link_payment(link.id, payment_id)
         .await?;
+    let received_usdc_stroops = match payment.transaction_id {
+        Some(tx_id) => state
+            .store()
+            .get_transaction(tx_id)
+            .await?
+            .map(|tx| tx.amount_stroops),
+        None => None,
+    };
     Ok(Envelope::ok(PaymentStatusView {
         status: payment.status,
         transaction_id: payment.transaction_id,
+        expected_usdc_stroops: payment.amount_usdc_stroops,
+        received_usdc_stroops,
     }))
 }
 

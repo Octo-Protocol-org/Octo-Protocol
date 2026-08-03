@@ -447,6 +447,168 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
 }
 
 #[tokio::test]
+async fn payment_link_mismatched_deposit_records_the_transaction_but_does_not_confirm() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let addr = store
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-{id}")),
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("alloc address");
+
+    let link = store
+        .create_payment_link(NewPaymentLink {
+            wallet_id,
+            address_id: addr.id,
+            slug: &format!("link-mismatch-{wid}"),
+            name: "Underpaid test",
+            description: None,
+            image_url: None,
+            redirect_url: None,
+            amount_usdc_stroops: Some(10_000_000),
+        })
+        .await
+        .expect("create link");
+
+    let intent = store
+        .record_payment_link_intent(link.id, None, None, 10_000_000, Some(addr.id))
+        .await
+        .expect("record intent");
+
+    let tx_hash = Uuid::new_v4().to_string();
+    let dep = store
+        .record_deposit(&NewDeposit {
+            wallet_id,
+            address_id: Some(addr.id),
+            asset_code: "USDC".into(),
+            asset_issuer: Some("GISSUER".into()),
+            amount_stroops: 5_000_000, // half of what was expected
+            source_account: Some("Gpayer".into()),
+            destination_account: Some("Gmaster".into()),
+            stellar_tx_hash: tx_hash.clone(),
+            operation_index: 0,
+            horizon_op_id: format!("{tx_hash}-0"),
+            ledger: Some(1),
+            memo_id: None,
+        })
+        .await
+        .expect("record deposit")
+        .expect("first insert");
+
+    store
+        .mark_payment_link_payment_mismatched(intent.id, dep.id, "underpaid")
+        .await
+        .expect("mark mismatched");
+
+    let mismatched = store
+        .get_payment_link_payment(link.id, intent.id)
+        .await
+        .expect("get payment");
+    assert_eq!(mismatched.status, "underpaid");
+    assert_eq!(
+        mismatched.transaction_id,
+        Some(dep.id),
+        "the short deposit must still be linked, so the merchant can see what actually arrived"
+    );
+
+    // A mismatched payment is not "pending" any more, so it must not still be matchable — ingest
+    // must not later confuse a second, correct deposit with this already-resolved intent.
+    assert!(store
+        .pending_payment_by_address(addr.id)
+        .await
+        .expect("by address")
+        .is_none());
+}
+
+#[tokio::test]
+async fn expire_stale_payment_link_payments_only_sweeps_old_pending_rows() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let addr = store
+        .allocate_address(
+            wallet_id,
+            |id| Ok(format!("M{wid}-{id}")),
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("alloc address");
+
+    let link = store
+        .create_payment_link(NewPaymentLink {
+            wallet_id,
+            address_id: addr.id,
+            slug: &format!("link-expiry-{wid}"),
+            name: "Expiry test",
+            description: None,
+            image_url: None,
+            redirect_url: None,
+            amount_usdc_stroops: Some(10_000_000),
+        })
+        .await
+        .expect("create link");
+
+    let stale = store
+        .record_payment_link_intent(link.id, None, None, 10_000_000, Some(addr.id))
+        .await
+        .expect("record stale intent");
+    // Backdate it past the 1-hour deadline directly — this test can't wait an hour.
+    sqlx::query(
+        "UPDATE payment_link_payments SET created_at = now() - interval '2 hours' WHERE id = $1",
+    )
+    .bind(stale.id)
+    .execute(store.pool())
+    .await
+    .expect("backdate");
+
+    let fresh = store
+        .record_payment_link_intent(link.id, None, None, 10_000_000, Some(addr.id))
+        .await
+        .expect("record fresh intent");
+
+    let expired = store
+        .expire_stale_payment_link_payments()
+        .await
+        .expect("sweep");
+    let expired_ids: Vec<Uuid> = expired.iter().map(|p| p.id).collect();
+    assert!(
+        expired_ids.contains(&stale.id),
+        "the >1hr-old pending row must be swept"
+    );
+    assert!(
+        !expired_ids.contains(&fresh.id),
+        "a freshly-created pending row must not be swept"
+    );
+
+    let stale_after = store
+        .get_payment_link_payment(link.id, stale.id)
+        .await
+        .expect("get stale");
+    assert_eq!(stale_after.status, "expired");
+
+    let fresh_after = store
+        .get_payment_link_payment(link.id, fresh.id)
+        .await
+        .expect("get fresh");
+    assert_eq!(fresh_after.status, "pending");
+
+    // Running the sweep again must be a no-op for already-expired rows (idempotent).
+    let expired_again = store
+        .expire_stale_payment_link_payments()
+        .await
+        .expect("sweep again");
+    assert!(!expired_again.iter().any(|p| p.id == stale.id));
+}
+
+#[tokio::test]
 async fn withdrawal_idempotency_key_blocks_double_spend() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
@@ -688,7 +850,7 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0017.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0018.
     //
     // NOTE: this version number is a repeat offender — five migrations have now landed with a
     // colliding 0008 at one point or another (scheme_version, token_denylist,
@@ -698,8 +860,8 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     // every version explicitly rather than just checking a count.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
-        "expected exactly the seventeen known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        "expected exactly the eighteen known migrations to be recorded as applied"
     );
 }
 

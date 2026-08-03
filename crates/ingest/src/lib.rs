@@ -301,16 +301,49 @@ impl Ingestor {
             }
         };
 
-        // Never confirm for less than the payer committed to — an underpayment stays pending.
-        if tx.amount_stroops < payment.amount_usdc_stroops {
+        // Exact match confirms; anything else is a mismatch the merchant/payer must be told
+        // about — never silently absorbed as if it were correct, and never confirmed either.
+        if tx.amount_stroops != payment.amount_usdc_stroops {
+            let status = if tx.amount_stroops < payment.amount_usdc_stroops {
+                "underpaid"
+            } else {
+                "overpaid"
+            };
             tracing::warn!(
                 payment_id = %payment.id,
                 expected = payment.amount_usdc_stroops,
                 received = tx.amount_stroops,
-                "payment-link deposit is short of the intended amount; leaving pending"
+                status,
+                "payment-link deposit does not match the intended amount"
             );
+            if self
+                .store
+                .mark_payment_link_payment_mismatched(payment.id, tx.id, status)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Some(sender) = &self.webhooks {
+                let event = Event {
+                    event_type: "payment_link.mismatched".to_string(),
+                    data: serde_json::json!({
+                        "payment_link_id": link.id,
+                        "payment_id": payment.id,
+                        "slug": link.slug,
+                        "payer_name": payment.payer_name,
+                        "payer_email": payment.payer_email,
+                        "status": status,
+                        "expected_usdc_stroops": payment.amount_usdc_stroops,
+                        "received_usdc_stroops": tx.amount_stroops,
+                        "stellar_tx_hash": tx.stellar_tx_hash,
+                    }),
+                };
+                sender.dispatch(self.wallet_id, &event).await;
+            }
             return;
         }
+
         if self
             .store
             .confirm_payment_link_payment(payment.id, tx.id)
@@ -485,6 +518,41 @@ impl Supervisor {
         }
     }
 
+    /// Mark stale pending payment-link intents as `expired` and fire one `payment_link.expired`
+    /// webhook per row. Runs every tick — a single indexed `UPDATE ... WHERE` is cheap even when
+    /// it matches nothing, so no separate timer is needed. Best-effort: a DB error here must
+    /// never abort the poll loop.
+    async fn expire_stale_payment_link_payments(&self) {
+        let expired = match self.store.expire_stale_payment_link_payments().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to sweep stale payment-link payments");
+                return;
+            }
+        };
+        for payment in expired {
+            let Ok(Some(link)) = self
+                .store
+                .get_payment_link_by_id(payment.payment_link_id)
+                .await
+            else {
+                continue;
+            };
+            let event = Event {
+                event_type: "payment_link.expired".to_string(),
+                data: serde_json::json!({
+                    "payment_link_id": link.id,
+                    "payment_id": payment.id,
+                    "slug": link.slug,
+                    "payer_name": payment.payer_name,
+                    "payer_email": payment.payer_email,
+                    "amount_usdc_stroops": payment.amount_usdc_stroops,
+                }),
+            };
+            self.webhooks.dispatch(link.wallet_id, &event).await;
+        }
+    }
+
     /// Run forever: every `interval`, poll all wallets on this network once.
     pub async fn run(self, interval: Duration, page_limit: u32) {
         loop {
@@ -504,6 +572,8 @@ impl Supervisor {
     /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
     /// request volume sane regardless of how many wallets exist.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
+        self.expire_stale_payment_link_payments().await;
+
         // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
         // wallets that never transact again, and polling them every cycle starves the active ones
         // of the shared concurrency budget.
