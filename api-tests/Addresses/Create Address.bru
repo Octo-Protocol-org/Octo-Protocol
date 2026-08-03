@@ -1,0 +1,33 @@
+meta {
+  name: Create Address
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/addresses
+  body: json
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "customer_ref": "test-customer-1",
+    "metadata": { "plan": "pro" }
+  }
+}
+
+script:post-response {
+  if (res.body?.data?.id) {
+    bru.setVar("address_id", res.body.data.id);
+  }
+}
+
+docs {
+  Generates a dedicated deposit address (muxed M... plus a G...+memo fallback) instantly,
+  off-chain. Both forms credit the same master wallet — there's nothing to sweep.
+}

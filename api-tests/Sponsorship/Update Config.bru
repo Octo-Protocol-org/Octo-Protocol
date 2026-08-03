@@ -1,0 +1,29 @@
+meta {
+  name: Update Config
+  type: http
+  seq: 2
+}
+
+put {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/sponsorship
+  body: json
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "enabled": true,
+    "per_tx_fee_cap_stroops": 1000000,
+    "daily_budget_stroops": 50000000
+  }
+}
+
+docs {
+  Sponsoring lets your users transact on Stellar without holding XLM for fees — this wallet's
+  gas tank pays the fee-bump instead. Requires the gas tank to be provisioned first
+  (POST /v1/wallets/:id/gas-tank).
+}

@@ -1,0 +1,15 @@
+meta {
+  name: Public - Get Link
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{base_url}}/v1/pay/{{link_slug}}
+  auth: none
+}
+
+docs {
+  No auth — this is what the hosted checkout page calls first. Returns the link's public
+  details plus the deposit address to send USDC to.
+}

@@ -1,0 +1,14 @@
+meta {
+  name: List Addresses
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/whitelist
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
