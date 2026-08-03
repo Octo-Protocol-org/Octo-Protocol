@@ -2054,6 +2054,62 @@ async fn payment_link_management_requires_wallet_ownership() {
 }
 
 #[tokio::test]
+async fn payment_link_response_includes_checkout_url_and_redirect_url() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state);
+    let token = auth_token(&app).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/payment-links");
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(
+            &uri,
+            r#"{"name":"Support","redirect_url":"https://merchant.example/thank-you"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let slug = created["data"]["slug"].as_str().unwrap().to_string();
+    let url = created["data"]["url"].as_str().unwrap();
+    assert!(
+        url.ends_with(&format!("/pay/{slug}")),
+        "url must be a real hosted checkout link ending in /pay/<slug>, got {url}"
+    );
+    assert_eq!(
+        created["data"]["redirect_url"],
+        "https://merchant.example/thank-you"
+    );
+
+    // GET and the public route must echo the same fields.
+    let link_id = created["data"]["id"].as_str().unwrap();
+    let get_uri = format!("/v1/wallets/{wallet_id}/payment-links/{link_id}");
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&get_uri, &token))
+        .await
+        .unwrap();
+    let fetched = body_json(resp).await;
+    assert_eq!(fetched["data"]["url"], url);
+    assert_eq!(
+        fetched["data"]["redirect_url"],
+        "https://merchant.example/thank-you"
+    );
+
+    let resp = app.oneshot(get(&format!("/v1/pay/{slug}"))).await.unwrap();
+    let public = body_json(resp).await;
+    assert_eq!(
+        public["data"]["redirect_url"],
+        "https://merchant.example/thank-you"
+    );
+}
+
+#[tokio::test]
 async fn payment_link_intent_rejects_flexible_amount_without_one() {
     let Some(state) = test_state().await else {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
