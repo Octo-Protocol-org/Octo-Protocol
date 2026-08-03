@@ -30,6 +30,9 @@ struct Inner {
     horizon: Horizon,
     horizon_url: String,
     friendbot_url: Option<String>,
+    /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
+    /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
+    public_app_url: String,
     /// HMAC secret for signing dashboard auth JWTs.
     jwt_secret: Vec<u8>,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
@@ -86,6 +89,7 @@ impl AppState {
             network,
             horizon_url,
             friendbot_url,
+            "http://localhost:3000".to_string(),
             secret,
             octo_resilience::RetryPolicy::default(),
             octo_resilience::CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
@@ -93,12 +97,14 @@ impl AppState {
     }
 
     /// Build state with explicit resilience configuration (used by `bin/server`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_resilience(
         store: Store,
         master_key: [u8; MASTER_KEY_LEN],
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
+        public_app_url: String,
         retry: octo_resilience::RetryPolicy,
         circuit: octo_resilience::CircuitBreaker,
     ) -> Self {
@@ -111,6 +117,7 @@ impl AppState {
             network,
             horizon_url,
             friendbot_url,
+            public_app_url,
             secret,
             retry,
             circuit,
@@ -142,6 +149,7 @@ impl AppState {
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
+        public_app_url: String,
         jwt_secret: Vec<u8>,
         retry: RetryPolicy,
         circuit: CircuitBreaker,
@@ -159,6 +167,7 @@ impl AppState {
                 horizon,
                 horizon_url,
                 friendbot_url,
+                public_app_url,
                 jwt_secret,
                 webhooks,
             }),
@@ -233,5 +242,10 @@ impl AppState {
 
     pub fn friendbot_url(&self) -> Option<&str> {
         self.inner.friendbot_url.as_deref()
+    }
+
+    /// Base URL of the hosted checkout frontend (no trailing slash).
+    pub fn public_app_url(&self) -> &str {
+        &self.inner.public_app_url
     }
 }

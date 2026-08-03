@@ -1137,8 +1137,8 @@ impl Store {
         let row = sqlx::query_as::<_, PaymentLink>(
             r#"
             INSERT INTO payment_links
-                (wallet_id, address_id, slug, name, description, image_url, amount_usdc_stroops)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (wallet_id, address_id, slug, name, description, image_url, redirect_url, amount_usdc_stroops)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING *
             "#,
         )
@@ -1148,6 +1148,7 @@ impl Store {
         .bind(link.name)
         .bind(link.description)
         .bind(link.image_url)
+        .bind(link.redirect_url)
         .bind(link.amount_usdc_stroops)
         .fetch_one(&self.pool)
         .await

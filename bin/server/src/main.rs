@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         cfg.network,
         cfg.horizon_url.clone(),
         cfg.friendbot_url.clone(),
+        cfg.public_app_url.clone(),
         resilience.retry_policy(),
         resilience.circuit_breaker(),
     )
@@ -115,6 +116,9 @@ struct Config {
     network: StellarNetwork,
     horizon_url: String,
     friendbot_url: Option<String>,
+    /// Base URL of the hosted checkout frontend (e.g. `https://app.octo.dev`), used to build the
+    /// `url` field on payment-link responses. Defaults to the local frontend dev server.
+    public_app_url: String,
     master_key: [u8; 32],
     /// Optional next master key for zero-downtime rotation. Present only during the rotation
     /// window while `octo-migrate-keys` is backfilling. When set, the server uses this key as
@@ -149,6 +153,11 @@ impl Config {
         let horizon_url = std::env::var("HORIZON_URL")
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
         let friendbot_url = std::env::var("FRIENDBOT_URL").ok();
+
+        let public_app_url = std::env::var("PUBLIC_APP_URL")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string())
+            .trim_end_matches('/')
+            .to_string();
 
         let master_key_b64 = std::env::var("MASTER_KEY").context("MASTER_KEY is required")?;
         let master_key = AppState::decode_master_key(&master_key_b64)
@@ -189,6 +198,7 @@ impl Config {
             network,
             horizon_url,
             friendbot_url,
+            public_app_url,
             master_key,
             master_key_next,
             jwt_secret,

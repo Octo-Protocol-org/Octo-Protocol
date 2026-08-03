@@ -259,6 +259,7 @@ pub struct PaymentLink {
     pub name: String,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub active: bool,
     pub created_at: DateTime<Utc>,
@@ -274,6 +275,7 @@ pub struct NewPaymentLink<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
     pub image_url: Option<&'a str>,
+    pub redirect_url: Option<&'a str>,
     pub amount_usdc_stroops: Option<i64>,
 }
 

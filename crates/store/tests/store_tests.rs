@@ -333,6 +333,7 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
             name: "Support octo",
             description: Some("donations"),
             image_url: None,
+            redirect_url: None,
             amount_usdc_stroops: None,
         })
         .await
@@ -687,7 +688,7 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0016.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0017.
     //
     // NOTE: this version number is a repeat offender — five migrations have now landed with a
     // colliding 0008 at one point or another (scheme_version, token_denylist,
@@ -697,8 +698,8 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     // every version explicitly rather than just checking a count.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-        "expected exactly the sixteen known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+        "expected exactly the seventeen known migrations to be recorded as applied"
     );
 }
 
