@@ -1,0 +1,18 @@
+meta {
+  name: Get Payment Link
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/payment-links/{{link_id}}
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+docs {
+  link_id is auto-saved by Create Payment Link.
+}

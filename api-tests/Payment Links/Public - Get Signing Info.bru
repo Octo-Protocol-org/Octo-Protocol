@@ -1,0 +1,19 @@
+meta {
+  name: Public - Get Signing Info
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{base_url}}/v1/pay/{{link_slug}}/signing-info?account={{payer_account}}
+  auth: none
+}
+
+docs {
+  No auth. account should be the PAYER's own Stellar address (e.g. from Freighter) — this
+  returns THAT account's current sequence number, network passphrase, and base fee, everything
+  needed to build a transaction client-side without hitting Horizon directly.
+
+  Set the payer_account variable to a real G... address to try this (e.g. the one printed by
+  sign-challenge.js, once funded).
+}

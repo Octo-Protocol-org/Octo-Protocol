@@ -1,0 +1,14 @@
+meta {
+  name: Get Wallet
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}

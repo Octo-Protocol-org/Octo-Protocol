@@ -1,0 +1,25 @@
+meta {
+  name: Public - Submit Signed
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{base_url}}/v1/pay/{{link_slug}}/submit-signed
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "transaction_xdr": "paste a base64 client-signed TransactionEnvelope",
+    "payment_id": "{{payment_id}}"
+  }
+}
+
+docs {
+  No auth. This can't be filled in from Bruno alone — the transaction has to be built (using
+  Public - Get Signing Info's response) and signed with the PAYER's own secret key first, which
+  needs a Stellar SDK (this is exactly what the hosted checkout page's Freighter flow does in
+  the browser). Included here for reference / to replay a captured request while debugging.
+}

@@ -1,0 +1,33 @@
+meta {
+  name: Signup
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/v1/auth/signup
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "email": "test-{{$randomInt}}@octo.test",
+    "password": "supersecret123"
+  }
+}
+
+script:post-response {
+  if (res.body?.data?.token) {
+    bru.setVar("token", res.body.data.token);
+    bru.setVar("user_id", res.body.data.user.id);
+  }
+}
+
+docs {
+  Creates a dashboard user and returns a bearer token. The token is auto-saved to the
+  `token` variable so every other request in this collection can reuse it via
+  `Authorization: Bearer {{token}}`.
+
+  Re-run this any time you need a fresh user — each run generates a unique email.
+}

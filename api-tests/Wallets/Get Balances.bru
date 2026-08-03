@@ -1,0 +1,19 @@
+meta {
+  name: Get Balances
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/balances
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+docs {
+  Live balances straight from Horizon. A freshly created testnet wallet should show a small
+  XLM balance from friendbot funding.
+}

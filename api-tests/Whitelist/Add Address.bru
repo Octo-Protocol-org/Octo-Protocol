@@ -1,0 +1,27 @@
+meta {
+  name: Add Address
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/whitelist
+  body: json
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    "label": "known-good destination"
+  }
+}
+
+docs {
+  When the whitelist is enabled (PUT /v1/wallets/:id/whitelist/config), submit-signed rejects
+  any payment to a destination not on this list — an anti-fraud control.
+}

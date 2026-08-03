@@ -1,0 +1,18 @@
+meta {
+  name: Me
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/v1/auth/me
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+docs {
+  Returns the authenticated user. Confirms the token from Signup/Login is still valid.
+}

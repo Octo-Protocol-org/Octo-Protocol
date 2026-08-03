@@ -1,0 +1,16 @@
+meta {
+  name: Public - Get Payment Status
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{base_url}}/v1/pay/{{link_slug}}/payments/{{payment_id}}
+  auth: none
+}
+
+docs {
+  No auth. status is one of pending | confirmed | expired | underpaid | overpaid. The pay page
+  polls this every ~3s while waiting. expected_usdc_stroops/received_usdc_stroops let you show
+  a mismatch banner without a second request.
+}
