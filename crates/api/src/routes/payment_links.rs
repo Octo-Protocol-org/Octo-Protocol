@@ -18,6 +18,11 @@ const USDC_ASSET_CODE: &str = "USDC";
 /// any asset landing at the right address.
 const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
+/// Full hosted checkout URL for a payment link's slug.
+fn checkout_url(state: &AppState, slug: &str) -> String {
+    format!("{}/pay/{}", state.public_app_url(), slug)
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaymentLinkView {
     pub id: Uuid,
@@ -25,10 +30,12 @@ pub struct PaymentLinkView {
     pub name: String,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub active: bool,
     pub collected_usdc_stroops: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,6 +43,7 @@ pub struct CreatePaymentLinkRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
 }
 
@@ -78,20 +86,24 @@ pub async fn create_payment_link(
             name: &name,
             description: req.description.as_deref(),
             image_url: req.image_url.as_deref(),
+            redirect_url: req.redirect_url.as_deref(),
             amount_usdc_stroops: req.amount_usdc_stroops,
         })
         .await?;
 
+    let url = checkout_url(&state, &link.slug);
     let (code, json) = Envelope::created(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         active: link.active,
         collected_usdc_stroops: 0,
         created_at: link.created_at,
+        url,
     });
     Ok((code, json))
 }
@@ -131,16 +143,21 @@ pub async fn list_payment_links(
 
     let views = items
         .into_iter()
-        .map(|l| PaymentLinkView {
-            id: l.id,
-            slug: l.slug,
-            name: l.name,
-            description: l.description,
-            image_url: l.image_url,
-            amount_usdc_stroops: l.amount_usdc_stroops,
-            active: l.active,
-            collected_usdc_stroops: totals.get(&l.id).copied().unwrap_or(0),
-            created_at: l.created_at,
+        .map(|l| {
+            let url = checkout_url(&state, &l.slug);
+            PaymentLinkView {
+                id: l.id,
+                slug: l.slug,
+                name: l.name,
+                description: l.description,
+                image_url: l.image_url,
+                redirect_url: l.redirect_url,
+                amount_usdc_stroops: l.amount_usdc_stroops,
+                active: l.active,
+                collected_usdc_stroops: totals.get(&l.id).copied().unwrap_or(0),
+                created_at: l.created_at,
+                url,
+            }
         })
         .collect();
 
@@ -165,16 +182,19 @@ pub async fn get_payment_link(
     authorize_wallet(&headers, &state, wallet_id).await?;
     let link = state.store().get_payment_link(wallet_id, link_id).await?;
     let collected = state.store().sum_payment_link_collected(link.id).await?;
+    let url = checkout_url(&state, &link.slug);
     Ok(Envelope::ok(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         active: link.active,
         collected_usdc_stroops: collected,
         created_at: link.created_at,
+        url,
     }))
 }
 
@@ -268,16 +288,19 @@ pub async fn set_payment_link_active(
         .set_payment_link_active(wallet_id, link_id, active)
         .await?;
     let collected = state.store().sum_payment_link_collected(link.id).await?;
+    let url = checkout_url(&state, &link.slug);
     Ok(Envelope::ok(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         active: link.active,
         collected_usdc_stroops: collected,
         created_at: link.created_at,
+        url,
     }))
 }
 
@@ -286,6 +309,7 @@ pub struct PublicPaymentLinkView {
     pub name: String,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub deposit_address: String,
     pub asset_code: String,
@@ -337,6 +361,7 @@ pub async fn get_public_payment_link(
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         deposit_address: address.muxed_address,
         asset_code: USDC_ASSET_CODE.into(),
