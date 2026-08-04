@@ -18,6 +18,11 @@ const USDC_ASSET_CODE: &str = "USDC";
 /// any asset landing at the right address.
 const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
+/// Full hosted checkout URL for a payment link's slug.
+fn checkout_url(state: &AppState, slug: &str) -> String {
+    format!("{}/pay/{}", state.public_app_url(), slug)
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaymentLinkView {
     pub id: Uuid,
@@ -25,10 +30,12 @@ pub struct PaymentLinkView {
     pub name: String,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub active: bool,
     pub collected_usdc_stroops: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub url: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,6 +43,7 @@ pub struct CreatePaymentLinkRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
 }
 
@@ -78,20 +86,24 @@ pub async fn create_payment_link(
             name: &name,
             description: req.description.as_deref(),
             image_url: req.image_url.as_deref(),
+            redirect_url: req.redirect_url.as_deref(),
             amount_usdc_stroops: req.amount_usdc_stroops,
         })
         .await?;
 
+    let url = checkout_url(&state, &link.slug);
     let (code, json) = Envelope::created(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         active: link.active,
         collected_usdc_stroops: 0,
         created_at: link.created_at,
+        url,
     });
     Ok((code, json))
 }
@@ -131,16 +143,21 @@ pub async fn list_payment_links(
 
     let views = items
         .into_iter()
-        .map(|l| PaymentLinkView {
-            id: l.id,
-            slug: l.slug,
-            name: l.name,
-            description: l.description,
-            image_url: l.image_url,
-            amount_usdc_stroops: l.amount_usdc_stroops,
-            active: l.active,
-            collected_usdc_stroops: totals.get(&l.id).copied().unwrap_or(0),
-            created_at: l.created_at,
+        .map(|l| {
+            let url = checkout_url(&state, &l.slug);
+            PaymentLinkView {
+                id: l.id,
+                slug: l.slug,
+                name: l.name,
+                description: l.description,
+                image_url: l.image_url,
+                redirect_url: l.redirect_url,
+                amount_usdc_stroops: l.amount_usdc_stroops,
+                active: l.active,
+                collected_usdc_stroops: totals.get(&l.id).copied().unwrap_or(0),
+                created_at: l.created_at,
+                url,
+            }
         })
         .collect();
 
@@ -165,16 +182,87 @@ pub async fn get_payment_link(
     authorize_wallet(&headers, &state, wallet_id).await?;
     let link = state.store().get_payment_link(wallet_id, link_id).await?;
     let collected = state.store().sum_payment_link_collected(link.id).await?;
+    let url = checkout_url(&state, &link.slug);
     Ok(Envelope::ok(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         active: link.active,
         collected_usdc_stroops: collected,
         created_at: link.created_at,
+        url,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaymentLinkPaymentView {
+    pub id: Uuid,
+    pub payer_name: Option<String>,
+    pub payer_email: Option<String>,
+    pub amount_usdc_stroops: i64,
+    /// "pending" | "confirmed".
+    pub status: String,
+    pub transaction_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaymentLinkPaymentListResponse {
+    pub data: Vec<PaymentLinkPaymentView>,
+    pub next_cursor: Option<Uuid>,
+}
+
+/// `GET /v1/wallets/:id/payment-links/:link_id/payments`
+///
+/// Owner-authenticated: these rows carry payer names and email addresses, which must never be
+/// reachable from the public pay-page routes.
+pub async fn list_payment_link_payments(
+    State(state): State<AppState>,
+    Path((wallet_id, link_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Query(q): Query<crate::routes::wallets::ListParams>,
+) -> ApiResult<Json<Envelope<PaymentLinkPaymentListResponse>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    // Scoped fetch: proves the link belongs to this wallet before exposing its payers.
+    let link = state.store().get_payment_link(wallet_id, link_id).await?;
+
+    let limit = crate::routes::wallets::validated_limit(q.limit)?;
+    let rows = state
+        .store()
+        .list_payment_link_payments(link.id, limit + 1, q.before)
+        .await?;
+
+    let has_more = rows.len() > limit as usize;
+    let mut items = rows;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        items.last().map(|p| p.id)
+    } else {
+        None
+    };
+
+    let data = items
+        .into_iter()
+        .map(|p| PaymentLinkPaymentView {
+            id: p.id,
+            payer_name: p.payer_name,
+            payer_email: p.payer_email,
+            amount_usdc_stroops: p.amount_usdc_stroops,
+            status: p.status,
+            transaction_id: p.transaction_id,
+            created_at: p.created_at,
+        })
+        .collect();
+
+    Ok(Envelope::ok(PaymentLinkPaymentListResponse {
+        data,
+        next_cursor,
     }))
 }
 
@@ -200,16 +288,19 @@ pub async fn set_payment_link_active(
         .set_payment_link_active(wallet_id, link_id, active)
         .await?;
     let collected = state.store().sum_payment_link_collected(link.id).await?;
+    let url = checkout_url(&state, &link.slug);
     Ok(Envelope::ok(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         active: link.active,
         collected_usdc_stroops: collected,
         created_at: link.created_at,
+        url,
     }))
 }
 
@@ -218,16 +309,45 @@ pub struct PublicPaymentLinkView {
     pub name: String,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub deposit_address: String,
     pub asset_code: String,
+}
+
+/// Rate-limit an unauthenticated pay-page request by client IP.
+///
+/// These endpoints have no credential to throttle on, so IP is the only available key. Intent
+/// creation is much tighter than the read paths: each intent allocates a muxed address and
+/// inserts a row, so unbounded calls are a cheap way to bloat the table.
+fn check_public_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    class: &'static str,
+    limit: u32,
+) -> Result<(), ApiError> {
+    let ip = crate::rate_limit::client_ip(headers, peer.map(|c| c.0));
+    if state
+        .rate_limiter()
+        .check(&ip, class, limit, std::time::Duration::from_secs(60))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::TooManyRequests(
+            "too many requests — slow down and try again shortly".into(),
+        ))
+    }
 }
 
 /// `GET /v1/pay/:slug` — public, no auth.
 pub async fn get_public_payment_link(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<PublicPaymentLinkView>>> {
+    check_public_rate_limit(&state, &headers, peer, "pay_read", 60)?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -241,6 +361,7 @@ pub async fn get_public_payment_link(
         name: link.name,
         description: link.description,
         image_url: link.image_url,
+        redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
         deposit_address: address.muxed_address,
         asset_code: USDC_ASSET_CODE.into(),
@@ -265,8 +386,11 @@ pub struct PaymentIntentView {
 pub async fn create_payment_intent(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<PaymentIntentView>>)> {
+    check_public_rate_limit(&state, &headers, peer, "pay_intent", 5)?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -282,6 +406,23 @@ pub async fn create_payment_intent(
             .ok_or_else(|| ApiError::BadRequest("amount_usdc_stroops is required".into()))?,
     };
 
+    // Each intent gets its OWN muxed address, so a landing deposit identifies exactly one payment.
+    // Sharing the link's address meant two concurrent payers could be cross-matched.
+    let wallet = state.store().get_wallet(link.wallet_id).await?;
+    let base = wallet.stellar_account_g.clone();
+    let address = state
+        .store()
+        .allocate_address(
+            link.wallet_id,
+            |id| {
+                let id_u64 = u64::try_from(id).map_err(|_| ())?;
+                encode_muxed(&base, id_u64).map_err(|_| ())
+            },
+            None,
+            serde_json::json!({ "payment_link_slug": slug }),
+        )
+        .await?;
+
     let payment = state
         .store()
         .record_payment_link_intent(
@@ -289,13 +430,9 @@ pub async fn create_payment_intent(
             req.payer_name.as_deref(),
             req.payer_email.as_deref(),
             amount,
+            Some(address.id),
         )
         .await?;
-    let address = state
-        .store()
-        .get_address(link.address_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
 
     let (code, json) = Envelope::created(PaymentIntentView {
         payment_id: payment.id,
@@ -307,23 +444,44 @@ pub async fn create_payment_intent(
 
 #[derive(Debug, Serialize)]
 pub struct PaymentStatusView {
+    /// "pending" | "confirmed" | "expired" | "underpaid" | "overpaid".
     pub status: String,
     pub transaction_id: Option<Uuid>,
+    /// The amount this intent expects. Always present, so the frontend can render a mismatch
+    /// banner ("you sent X, expected Y") without a second request.
+    pub expected_usdc_stroops: i64,
+    /// What actually landed on-chain, once a deposit has been matched (confirmed/underpaid/
+    /// overpaid). `None` while still pending or expired unpaid.
+    pub received_usdc_stroops: Option<i64>,
 }
 
 /// `GET /v1/pay/:slug/payments/:payment_id` — public, no auth.
 pub async fn get_payment_status(
     State(state): State<AppState>,
     Path((slug, payment_id)): Path<(String, Uuid)>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<PaymentStatusView>>> {
+    // The pay page polls this every ~3s while waiting, so the ceiling is generous.
+    check_public_rate_limit(&state, &headers, peer, "pay_status", 60)?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     let payment = state
         .store()
         .get_payment_link_payment(link.id, payment_id)
         .await?;
+    let received_usdc_stroops = match payment.transaction_id {
+        Some(tx_id) => state
+            .store()
+            .get_transaction(tx_id)
+            .await?
+            .map(|tx| tx.amount_stroops),
+        None => None,
+    };
     Ok(Envelope::ok(PaymentStatusView {
         status: payment.status,
         transaction_id: payment.transaction_id,
+        expected_usdc_stroops: payment.amount_usdc_stroops,
+        received_usdc_stroops,
     }))
 }
 
@@ -340,7 +498,10 @@ pub async fn public_signing_info(
     State(state): State<AppState>,
     Path(slug): Path<String>,
     Query(params): Query<PublicSigningInfoParams>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<crate::routes::submit::SigningInfo>>> {
+    check_public_rate_limit(&state, &headers, peer, "pay_signing_info", 60)?;
     // Confirms the link exists/is active before doing any Horizon work on the caller's behalf.
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
@@ -369,6 +530,9 @@ pub async fn public_signing_info(
 #[derive(Debug, Default, Deserialize)]
 pub struct SubmitPaymentRequest {
     pub transaction_xdr: Option<String>,
+    /// The intent being paid (from `POST /v1/pay/:slug/intent`). Each intent has its own deposit
+    /// address, so the destination must be checked against that intent's address, not the link's.
+    pub payment_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,19 +548,34 @@ pub struct SubmitPaymentResponse {
 pub async fn submit_payment(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SubmitPaymentResponse>>)> {
+    check_public_rate_limit(&state, &headers, peer, "pay_submit", 20)?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
     }
+    let req: SubmitPaymentRequest = parse_optional(&body)?;
+
+    // Each payment intent gets its own muxed address (see `create_payment_intent`), so the
+    // expected destination is the intent's address. Falling back to the link's own address keeps
+    // pre-per-intent clients working.
+    let address_id = match req.payment_id {
+        Some(payment_id) => state
+            .store()
+            .get_payment_link_payment(link.id, payment_id)
+            .await?
+            .address_id
+            .unwrap_or(link.address_id),
+        None => link.address_id,
+    };
     let address = state
         .store()
-        .get_address(link.address_id)
+        .get_address(address_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-
-    let req: SubmitPaymentRequest = parse_optional(&body)?;
     let signed_xdr = req
         .transaction_xdr
         .filter(|x| !x.is_empty())
@@ -434,7 +613,8 @@ pub async fn submit_payment(
     });
     if !has_matching_payment || v1.tx.operations.len() != 1 {
         return Err(ApiError::BadRequest(
-            "transaction_xdr must contain exactly one USDC Payment to this link's deposit address"
+            "transaction_xdr must contain exactly one USDC Payment to this payment's deposit \
+             address"
                 .into(),
         ));
     }

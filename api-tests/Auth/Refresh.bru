@@ -1,0 +1,24 @@
+meta {
+  name: Refresh
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/v1/auth/refresh
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+script:post-response {
+  if (res.body?.data?.token) {
+    bru.setVar("token", res.body.data.token);
+  }
+}
+
+docs {
+  Issues a fresh token for an already-valid session and auto-saves it, replacing the old one.
+}

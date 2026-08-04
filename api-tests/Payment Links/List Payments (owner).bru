@@ -1,0 +1,19 @@
+meta {
+  name: List Payments (owner)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/payment-links/{{link_id}}/payments
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+docs {
+  Owner-only: includes payer name/email, unlike anything on the public side. Includes pending
+  intents too, not just confirmed payments, so you can see abandoned checkouts.
+}

@@ -33,7 +33,10 @@ fn database_url() -> Option<String> {
 
 const BASE: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
 
-/// Build a trivial payment record directed at BASE.
+/// Build a trivial payment record directed at BASE. `id` should already be unique per test run
+/// (e.g. include a fresh UUID) — the global `(stellar_tx_hash, operation_index)` unique
+/// constraint means a hardcoded hash silently no-ops via `record_deposit`'s benign-conflict path
+/// on any rerun against a non-wiped DB, rather than erroring loudly.
 fn make_record(id: &str) -> PaymentRecord {
     PaymentRecord {
         id: id.to_string(),
@@ -159,8 +162,9 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
     };
 
     // Build a page of 3 records.
+    let run_id = Uuid::new_v4().simple().to_string();
     let records: Vec<PaymentRecord> = (1..=3)
-        .map(|i| make_record(&format!("op-resume-{i}")))
+        .map(|i| make_record(&format!("op-resume-{run_id}-{i}")))
         .collect();
     let last_cursor = records.last().unwrap().paging_token.clone();
 

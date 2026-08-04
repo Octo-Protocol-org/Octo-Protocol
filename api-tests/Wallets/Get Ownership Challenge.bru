@@ -1,0 +1,33 @@
+meta {
+  name: Get Ownership Challenge
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/v1/wallets/challenge
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+script:post-response {
+  if (res.body?.data?.challenge) {
+    bru.setVar("challenge", res.body.data.challenge);
+  }
+}
+
+docs {
+  Step 1 of registering a wallet: fetch a short-lived, user-bound challenge string. You then
+  sign it with the Stellar keypair's own secret key (ed25519) and send both the challenge and
+  the signature to Create Wallet, proving you control the private key for that public account.
+
+  Bruno has no built-in ed25519 signer, so this collection can't complete a real Create Wallet
+  call on its own. Easiest paths to get a real wallet_id for the rest of this collection:
+    1. Create one through the dashboard UI (it does the signing client-side), then copy its id
+       from the URL or the wallets list response.
+    2. Or run `node api-tests/scripts/sign-challenge.js` (see that folder) which takes this
+       challenge and a generated keypair and prints a ready-to-paste Create Wallet body.
+}

@@ -1,0 +1,42 @@
+meta {
+  name: Create Payment Link
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/payment-links
+  body: json
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "name": "Test payment link",
+    "description": "Created from Bruno",
+    "amount_usdc_stroops": 10000000,
+    "redirect_url": "https://example.com/thank-you"
+  }
+}
+
+script:post-response {
+  if (res.body?.data?.slug) {
+    bru.setVar("link_id", res.body.data.id);
+    bru.setVar("link_slug", res.body.data.slug);
+    bru.setVar("checkout_url", res.body.data.url);
+  }
+}
+
+docs {
+  amount_usdc_stroops is optional — omit it for a flexible-amount link the payer fills in.
+  redirect_url is optional too — where the payer's browser goes after a confirmed payment.
+
+  The response's `url` field is the real hosted checkout link — open checkout_url in a browser
+  after running this to see the actual pay page. It's built from PUBLIC_APP_URL on the server,
+  so if it ever shows localhost in production, that env var isn't set correctly on the backend
+  host.
+}

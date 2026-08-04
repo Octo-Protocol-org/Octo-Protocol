@@ -1,0 +1,25 @@
+meta {
+  name: Deactivate Payment Link
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/payment-links/{{link_id}}
+  body: json
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "active": false
+  }
+}
+
+docs {
+  Set active: true to reactivate. An inactive link's public page (GET /v1/pay/:slug) 404s.
+}

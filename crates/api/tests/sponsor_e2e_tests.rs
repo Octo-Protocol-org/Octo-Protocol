@@ -3,6 +3,8 @@
 //! Requires Postgres via `DATABASE_URL` (see `docker-compose.yml`). Each test creates a fresh
 //! user + wallet and uses a local mock Horizon server so tests do not depend on testnet funding.
 
+mod common;
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -115,7 +117,8 @@ async fn auth_token(app: &Router) -> String {
 /// Create a non-custodial wallet (client-generated key) and provision its gas tank so the
 /// sponsorship path has a server-held fee account to sign fee-bumps with.
 async fn create_wallet(app: &Router, token: &str) -> (String, String) {
-    let account = DalekKeyPair::random().unwrap().public_key().account_id();
+    let kp = DalekKeyPair::random().unwrap();
+    let reg_body = common::wallet_body(app, token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -124,7 +127,7 @@ async fn create_wallet(app: &Router, token: &str) -> (String, String) {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(reg_body))
                 .unwrap(),
         )
         .await

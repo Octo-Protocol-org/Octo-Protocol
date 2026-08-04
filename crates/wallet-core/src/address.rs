@@ -92,6 +92,30 @@ pub fn to_base_account(address: &str) -> Result<String, WalletError> {
     Err(WalletError::InvalidAddress)
 }
 
+/// Verify that `signature_b64` is a valid ed25519 signature by `account` (`G...`) over `message`.
+pub fn verify_account_signature(
+    account: &str,
+    message: &[u8],
+    signature_b64: &str,
+) -> Result<(), WalletError> {
+    use base64::Engine as _;
+    use ed25519_dalek::Verifier as _;
+
+    let pk = PublicKey::from_string(account).map_err(|_| WalletError::InvalidAddress)?;
+    let verifying_key =
+        ed25519_dalek::VerifyingKey::from_bytes(&pk.0).map_err(|_| WalletError::InvalidAddress)?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .map_err(|_| WalletError::InvalidSignature)?;
+    let sig_bytes: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| WalletError::InvalidSignature)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| WalletError::InvalidSignature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +314,31 @@ mod tests {
 
         // Completely non-base32: arbitrary printable ASCII.
         assert_invalid_address("not-a-muxed-address-at-all!!");
+    }
+
+    #[test]
+    fn verify_account_signature_roundtrip_and_rejections() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let account = format!("{}", PublicKey(signing.verifying_key().to_bytes()));
+        let msg = b"octo wallet-challenge test";
+        let sig = base64::engine::general_purpose::STANDARD.encode(signing.sign(msg).to_bytes());
+
+        assert!(verify_account_signature(&account, msg, &sig).is_ok());
+
+        // Signature over a different message must fail.
+        assert!(verify_account_signature(&account, b"other message", &sig).is_err());
+
+        // Signature from a different key must fail.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let other_sig =
+            base64::engine::general_purpose::STANDARD.encode(other.sign(msg).to_bytes());
+        assert!(verify_account_signature(&account, msg, &other_sig).is_err());
+
+        // Garbage base64 / wrong-length signatures must fail, not panic.
+        assert!(verify_account_signature(&account, msg, "not-base64!").is_err());
+        assert!(verify_account_signature(&account, msg, "AAAA").is_err());
     }
 }

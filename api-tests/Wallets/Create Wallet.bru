@@ -1,0 +1,38 @@
+meta {
+  name: Create Wallet
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/v1/wallets
+  body: json
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "public_key": "paste-from-sign-challenge.js",
+    "challenge": "paste-from-Get-Ownership-Challenge",
+    "signature": "paste-from-sign-challenge.js",
+    "label": "test wallet"
+  }
+}
+
+script:post-response {
+  if (res.body?.data?.id) {
+    bru.setVar("wallet_id", res.body.data.id);
+  }
+}
+
+docs {
+  Registers a non-custodial wallet: the server never sees a private key, only the public
+  account plus proof (the signed challenge) that you control it. See Get Ownership Challenge
+  and api-tests/scripts/sign-challenge.js for how to fill this body in.
+
+  On success, wallet_id is auto-saved for every other Wallets/Addresses/Payment Links request.
+}

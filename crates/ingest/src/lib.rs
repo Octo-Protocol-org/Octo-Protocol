@@ -273,16 +273,82 @@ impl Ingestor {
         let Some(address_id) = tx.address_id else {
             return;
         };
-        let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await else {
-            return;
+
+        // Preferred path: the deposit landed on an intent's OWN address, so it maps to exactly
+        // one payment even with several payers on the same link concurrently.
+        let exact = self.store.pending_payment_by_address(address_id).await;
+        let (link, payment) = match exact {
+            Ok(Some(payment)) => {
+                let Ok(link) = self
+                    .store
+                    .get_payment_link(self.wallet_id, payment.payment_link_id)
+                    .await
+                else {
+                    return;
+                };
+                (link, payment)
+            }
+            _ => {
+                // Fallback for intents created before per-intent addresses (migration 0015):
+                // the deposit landed on the link's shared address.
+                let Ok(Some(link)) = self.store.get_payment_link_by_address(address_id).await
+                else {
+                    return;
+                };
+                let Ok(Some(payment)) = self
+                    .store
+                    .oldest_pending_payment_link_payment(link.id)
+                    .await
+                else {
+                    return;
+                };
+                (link, payment)
+            }
         };
-        let Ok(Some(payment)) = self
-            .store
-            .oldest_pending_payment_link_payment(link.id)
-            .await
-        else {
+
+        // Exact match confirms; anything else is a mismatch the merchant/payer must be told
+        // about — never silently absorbed as if it were correct, and never confirmed either.
+        if tx.amount_stroops != payment.amount_usdc_stroops {
+            let status = if tx.amount_stroops < payment.amount_usdc_stroops {
+                "underpaid"
+            } else {
+                "overpaid"
+            };
+            tracing::warn!(
+                payment_id = %payment.id,
+                expected = payment.amount_usdc_stroops,
+                received = tx.amount_stroops,
+                status,
+                "payment-link deposit does not match the intended amount"
+            );
+            if self
+                .store
+                .mark_payment_link_payment_mismatched(payment.id, tx.id, status)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Some(sender) = &self.webhooks {
+                let event = Event {
+                    event_type: "payment_link.mismatched".to_string(),
+                    data: serde_json::json!({
+                        "payment_link_id": link.id,
+                        "payment_id": payment.id,
+                        "slug": link.slug,
+                        "payer_name": payment.payer_name,
+                        "payer_email": payment.payer_email,
+                        "status": status,
+                        "expected_usdc_stroops": payment.amount_usdc_stroops,
+                        "received_usdc_stroops": tx.amount_stroops,
+                        "stellar_tx_hash": tx.stellar_tx_hash,
+                    }),
+                };
+                sender.dispatch(self.wallet_id, &event).await;
+            }
             return;
-        };
+        }
+
         if self
             .store
             .confirm_payment_link_payment(payment.id, tx.id)
@@ -460,6 +526,41 @@ impl Supervisor {
         }
     }
 
+    /// Mark stale pending payment-link intents as `expired` and fire one `payment_link.expired`
+    /// webhook per row. Runs every tick — a single indexed `UPDATE ... WHERE` is cheap even when
+    /// it matches nothing, so no separate timer is needed. Best-effort: a DB error here must
+    /// never abort the poll loop.
+    async fn expire_stale_payment_link_payments(&self) {
+        let expired = match self.store.expire_stale_payment_link_payments().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to sweep stale payment-link payments");
+                return;
+            }
+        };
+        for payment in expired {
+            let Ok(Some(link)) = self
+                .store
+                .get_payment_link_by_id(payment.payment_link_id)
+                .await
+            else {
+                continue;
+            };
+            let event = Event {
+                event_type: "payment_link.expired".to_string(),
+                data: serde_json::json!({
+                    "payment_link_id": link.id,
+                    "payment_id": payment.id,
+                    "slug": link.slug,
+                    "payer_name": payment.payer_name,
+                    "payer_email": payment.payer_email,
+                    "amount_usdc_stroops": payment.amount_usdc_stroops,
+                }),
+            };
+            self.webhooks.dispatch(link.wallet_id, &event).await;
+        }
+    }
+
     /// Run forever: every `interval`, poll all wallets on this network once.
     pub async fn run(self, interval: Duration, page_limit: u32) {
         loop {
@@ -479,15 +580,27 @@ impl Supervisor {
     /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
     /// request volume sane regardless of how many wallets exist.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
-        let wallets = self.store.list_wallets().await?;
+        self.expire_stale_payment_link_payments().await;
+
+        // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
+        // wallets that never transact again, and polling them every cycle starves the active ones
+        // of the shared concurrency budget.
+        let wallets = self
+            .store
+            .wallets_due_for_poll(
+                self.network,
+                Self::ACTIVE_AFTER_SECS,
+                Self::IDLE_INTERVAL_SECS,
+                Self::DORMANT_AFTER_SECS,
+                Self::DORMANT_INTERVAL_SECS,
+            )
+            .await?;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
         let mut tasks = tokio::task::JoinSet::new();
 
         for w in wallets {
-            if w.network != self.network {
-                continue;
-            }
             let store = self.store.clone();
+            let store_for_mark = self.store.clone();
             let horizon_url = self.horizon_url.clone();
             let webhooks = self.webhooks.clone();
             let tracker = self.tracker.clone();
@@ -508,7 +621,11 @@ impl Supervisor {
                 )
                 .with_webhooks(webhooks)
                 .with_tracker(tracker);
-                (w.id, ingestor.poll_once(page_limit).await)
+                let result = ingestor.poll_once(page_limit).await;
+                // Record the attempt regardless of outcome, so a wallet whose polls keep failing
+                // still backs off instead of being retried at full rate forever.
+                let _ = store_for_mark.mark_polled(w.id).await;
+                (w.id, result)
             });
         }
 
@@ -527,6 +644,14 @@ impl Supervisor {
 
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;
+
+    /// Activity-based backoff tiers. A wallet that saw a deposit within `ACTIVE_AFTER_SECS` is
+    /// polled every tick; quieter wallets are polled progressively less often. Deposit latency for
+    /// an actively-used wallet is unchanged — only dead accounts are slowed down.
+    const ACTIVE_AFTER_SECS: i64 = 60 * 60; // active if activity in the last hour
+    const IDLE_INTERVAL_SECS: i64 = 120; // idle wallets: at most every 2 minutes
+    const DORMANT_AFTER_SECS: i64 = 24 * 60 * 60; // dormant after a day of silence
+    const DORMANT_INTERVAL_SECS: i64 = 600; // dormant wallets: at most every 10 minutes
 
     /// Get a clone of the `LastPollTracker` to inspect poll lag.
     ///
@@ -725,8 +850,10 @@ mod tests {
 
     #[test]
     fn operation_index_from_toid_handles_edge_cases() {
-        // Negative numbers (invalid for operation index but should parse)
-        assert_eq!(operation_index_from_toid("12345-1--1"), Some(-1));
+        // A real Horizon TOID's operation index is never negative, and a literal "-1" segment
+        // splits the string into 4 hyphen-delimited parts (not 3), so this is correctly rejected
+        // by the same "exactly 3 parts" check that rejects any other malformed TOID shape.
+        assert_eq!(operation_index_from_toid("12345-1--1"), None);
 
         // Large numbers within i32 range
         assert_eq!(

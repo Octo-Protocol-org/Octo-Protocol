@@ -1,0 +1,26 @@
+meta {
+  name: Generate API Key
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/api-key
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+script:post-response {
+  if (res.body?.data?.api_key) {
+    bru.setVar("api_key", res.body.data.api_key);
+  }
+}
+
+docs {
+  Generates (or regenerates, invalidating the previous one) this wallet's API key. Shown once
+  — save it. Auto-saved to api_key, which is what an integrating merchant's backend would use
+  instead of a dashboard JWT for server-to-server calls (e.g. creating payment links).
+}

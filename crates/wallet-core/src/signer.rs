@@ -464,14 +464,7 @@ pub fn compute_inner_tx_hash(
 /// zero-op envelope parses and returns `Ok(0)`; Stellar itself rejects zero-op transactions, so
 /// this helper reports the count, it does not validate the transaction.
 pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
-    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
-
-    let inner_env =
-        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
-    match inner_env {
-        TransactionEnvelope::Tx(v1) => Ok(v1.tx.operations.len()),
-        _ => Err(WalletError::InvalidXdr),
-    }
+    Ok(parse_inner_v1(inner_xdr)?.tx.operations.len())
 }
 
 /// Parse a base64 XDR string and require it to be a v1 `TransactionEnvelope` (`Tx` variant).

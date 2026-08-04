@@ -1,0 +1,14 @@
+meta {
+  name: Get Config
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/sponsorship
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}

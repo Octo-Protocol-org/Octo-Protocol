@@ -1,0 +1,29 @@
+meta {
+  name: Login
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/v1/auth/login
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "email": "your-existing-user@octo.test",
+    "password": "supersecret123"
+  }
+}
+
+script:post-response {
+  if (res.body?.data?.token) {
+    bru.setVar("token", res.body.data.token);
+  }
+}
+
+docs {
+  Log in an existing user. Edit the email/password to match a real account, or just re-run
+  Signup instead if you don't need a persistent one.
+}

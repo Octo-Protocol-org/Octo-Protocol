@@ -1,3 +1,5 @@
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jsonschema::Validator;
@@ -106,12 +108,13 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     //
     // Non-custodial contract: the client generates the keypair and sends only the public key.
     // `public_key` is required — a body with just label/description is now a 400.
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let account = kp.public_key().account_id();
+    let (challenge, signature) = common::signed_challenge(&app, &token, &kp).await;
     let req_body = serde_json::json!({
         "public_key": account,
+        "challenge": challenge,
+        "signature": signature,
         "label": "drift-test-wallet",
         "description": "testing schema drift"
     });
@@ -125,7 +128,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::CREATED);
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
@@ -134,8 +137,9 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     // Validate the documented 201 response shape.
     validate_response(&spec, "~1v1~1wallets", "post", "201", &body_json);
 
-    // 2. Error case: hitting the withdraw endpoint should return a real error envelope,
-    // matching the documented ErrorResponse shape (410 Gone).
+    // 2. Error case: the withdraw endpoint must return a real error envelope matching the
+    // documented ErrorResponse shape. This body carries no idempotency key, so it is rejected
+    // with 400 before any Horizon call or signing attempt.
     let wallet_id = body_json["data"]["id"].as_str().unwrap();
 
     let withdraw_body = serde_json::json!({
@@ -152,7 +156,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         .unwrap();
 
     let withdraw_res = app.clone().oneshot(withdraw_req).await.unwrap();
-    assert_eq!(withdraw_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(withdraw_res.status(), StatusCode::BAD_REQUEST);
 
     let w_bytes = axum::body::to_bytes(withdraw_res.into_body(), 1024 * 1024)
         .await
@@ -166,7 +170,7 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
     let result = error_validator.validate(&w_json);
     if let Err(errors) = result {
         println!("Validation error: {}", errors);
-        panic!("Error response did not match the documented ErrorResponse schema (410 Gone)");
+        panic!("Error response did not match the documented ErrorResponse schema");
     }
 
     // 3. Success case: Get wallet details

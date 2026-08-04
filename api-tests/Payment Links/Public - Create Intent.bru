@@ -1,0 +1,30 @@
+meta {
+  name: Public - Create Intent
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{base_url}}/v1/pay/{{link_slug}}/intent
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "payer_name": "Jane Doe",
+    "payer_email": "jane@example.com"
+  }
+}
+
+script:post-response {
+  if (res.body?.data?.payment_id) {
+    bru.setVar("payment_id", res.body.data.payment_id);
+  }
+}
+
+docs {
+  No auth, rate-limited by IP (5/min). Allocates a dedicated address for THIS payment — two
+  concurrent payers on the same link get different addresses, so a deposit can only ever match
+  one of them. amount_usdc_stroops is required here only if the link itself is flexible-amount.
+}

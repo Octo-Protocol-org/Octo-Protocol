@@ -30,10 +30,44 @@ struct Inner {
     horizon: Horizon,
     horizon_url: String,
     friendbot_url: Option<String>,
+    /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
+    /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
+    public_app_url: String,
     /// HMAC secret for signing dashboard auth JWTs.
     jwt_secret: Vec<u8>,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
     webhooks: WebhookSender,
+    /// Per-IP rate limiting for auth + public endpoints.
+    rate_limiter: crate::rate_limit::RateLimiter,
+    /// Cloudinary credentials for signed image uploads; `None` when unconfigured, in which case
+    /// the upload endpoint reports that the feature is off rather than failing obscurely.
+    cloudinary: Option<CloudinaryConfig>,
+}
+
+/// Cloudinary credentials, read from the environment at startup.
+#[derive(Clone)]
+pub struct CloudinaryConfig {
+    pub cloud_name: String,
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+impl CloudinaryConfig {
+    /// Read from `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET`.
+    /// All three must be present, or image uploads stay disabled.
+    fn from_env() -> Option<Self> {
+        let cloud_name = std::env::var("CLOUDINARY_CLOUD_NAME").ok()?;
+        let api_key = std::env::var("CLOUDINARY_API_KEY").ok()?;
+        let api_secret = std::env::var("CLOUDINARY_API_SECRET").ok()?;
+        if cloud_name.is_empty() || api_key.is_empty() || api_secret.is_empty() {
+            return None;
+        }
+        Some(Self {
+            cloud_name,
+            api_key,
+            api_secret,
+        })
+    }
 }
 
 impl AppState {
@@ -55,6 +89,7 @@ impl AppState {
             network,
             horizon_url,
             friendbot_url,
+            "http://localhost:3000".to_string(),
             secret,
             octo_resilience::RetryPolicy::default(),
             octo_resilience::CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
@@ -62,12 +97,14 @@ impl AppState {
     }
 
     /// Build state with explicit resilience configuration (used by `bin/server`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_resilience(
         store: Store,
         master_key: [u8; MASTER_KEY_LEN],
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
+        public_app_url: String,
         retry: octo_resilience::RetryPolicy,
         circuit: octo_resilience::CircuitBreaker,
     ) -> Self {
@@ -80,6 +117,7 @@ impl AppState {
             network,
             horizon_url,
             friendbot_url,
+            public_app_url,
             secret,
             retry,
             circuit,
@@ -111,6 +149,7 @@ impl AppState {
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
+        public_app_url: String,
         jwt_secret: Vec<u8>,
         retry: RetryPolicy,
         circuit: CircuitBreaker,
@@ -119,6 +158,8 @@ impl AppState {
         let webhooks = WebhookSender::new(store.clone());
         Self {
             inner: Arc::new(Inner {
+                rate_limiter: crate::rate_limit::RateLimiter::default(),
+                cloudinary: CloudinaryConfig::from_env(),
                 store,
                 master_key: Zeroizing::new(master_key),
                 master_key_next: master_key_next.map(Zeroizing::new),
@@ -126,6 +167,7 @@ impl AppState {
                 horizon,
                 horizon_url,
                 friendbot_url,
+                public_app_url,
                 jwt_secret,
                 webhooks,
             }),
@@ -143,6 +185,15 @@ impl AppState {
 
     pub fn store(&self) -> &Store {
         &self.inner.store
+    }
+
+    pub fn rate_limiter(&self) -> &crate::rate_limit::RateLimiter {
+        &self.inner.rate_limiter
+    }
+
+    /// Cloudinary credentials, or `None` when image uploads are not configured.
+    pub fn cloudinary(&self) -> Option<CloudinaryConfig> {
+        self.inner.cloudinary.clone()
     }
 
     pub fn master_key(&self) -> &[u8; MASTER_KEY_LEN] {
@@ -194,5 +245,10 @@ impl AppState {
 
     pub fn friendbot_url(&self) -> Option<&str> {
         self.inner.friendbot_url.as_deref()
+    }
+
+    /// Base URL of the hosted checkout frontend (no trailing slash).
+    pub fn public_app_url(&self) -> &str {
+        &self.inner.public_app_url
     }
 }

@@ -9,6 +9,7 @@ pub mod auth;
 mod error;
 pub mod horizon;
 mod json;
+pub mod rate_limit;
 pub mod routes;
 pub mod sponsor_validation;
 mod state;
@@ -52,8 +53,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/audit-logs", get(routes::audit::list_audit_logs))
         .route(
+            "/v1/uploads/signature",
+            get(routes::uploads::upload_signature),
+        )
+        .route(
             "/v1/wallets",
             post(routes::wallets::create_wallet).get(routes::wallets::list_wallets),
+        )
+        // Static segment takes priority over the :id capture below (matchit routing).
+        .route(
+            "/v1/wallets/challenge",
+            get(routes::wallets::wallet_challenge),
         )
         .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
         .route(
@@ -88,11 +98,13 @@ pub fn build_router(state: AppState) -> Router {
                 .get(routes::apikeys::get_key)
                 .delete(routes::apikeys::delete_key),
         )
-        // Custodial signing tombstones (410 Gone since the non-custodial cutover).
+        // Custodial withdrawal, still served for legacy `custody = 'server'` rows. Client-custody
+        // wallets are refused by the handler itself and must use `/submit-signed` below.
         .route(
             "/v1/wallets/:id/withdraw",
             post(routes::withdrawals::withdraw),
         )
+        // Custodial signing tombstone (410 Gone since the non-custodial cutover).
         .route(
             "/v1/wallets/:id/trustlines",
             post(routes::trustlines::add_trustline),
@@ -141,6 +153,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/payment-links/:link_id",
             get(routes::payment_links::get_payment_link)
                 .put(routes::payment_links::set_payment_link_active),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id/payments",
+            get(routes::payment_links::list_payment_link_payments),
         )
         // Public: no auth, reachable by anyone with the link.
         .route(

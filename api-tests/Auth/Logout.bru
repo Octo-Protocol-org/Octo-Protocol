@@ -1,0 +1,18 @@
+meta {
+  name: Logout
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/v1/auth/logout
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+docs {
+  Revokes the current token. Every other request will 401 until you Signup/Login again.
+}

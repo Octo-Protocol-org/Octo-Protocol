@@ -9,6 +9,8 @@
 //! Require Postgres via `DATABASE_URL` (loaded from `.env`), same as `api_tests.rs`. Skipped
 //! (with an early return) if no `DATABASE_URL` is configured.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use octo_api::{build_router, AppState};
@@ -49,15 +51,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 /// POST with no body but an Authorization bearer token — used only to provision the wallet the
 /// malformed-body cases target; not itself part of the matrix.
-fn post_auth(uri: &str, token: &str) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
 /// Sign up a fresh user via the router and return its bearer token.
 async fn auth_token(app: &axum::Router) -> String {
     let email = format!("u-{}@octo.test", uuid::Uuid::new_v4().simple());
@@ -106,6 +99,8 @@ struct RouteCase {
 /// Every mutating route under `crates/api/src/routes/` (plus dashboard auth) that parses its body
 /// via `crate::json::parse_optional`. Deliberately excludes routes with no body (e.g.
 /// `POST /v1/wallets/:id/api-key`, `DELETE .../api-key`) — there's no JSON shape to be malformed.
+/// Also excludes `POST /v1/wallets/:id/withdraw`: it's a `410 Gone` tombstone (see
+/// `custodial_withdraw_is_gone` in `api_tests.rs`) that never reaches `parse_optional`.
 const MUTATING_ROUTES: &[RouteCase] = &[
     RouteCase {
         method: "POST",
@@ -188,12 +183,10 @@ async fn fixture() -> Option<Fixture> {
     let state = test_state().await?;
     let app = build_router(state);
     let token = auth_token(&app).await;
-    // Since the non-custodial cutover `POST /v1/wallets` requires a client-generated `public_key`
-    // and 400s without one, so this fixture cannot post an empty body.
-    let account = stellar_base::crypto::DalekKeyPair::random()
-        .unwrap()
-        .public_key()
-        .account_id();
+    // Non-custodial contract: `public_key` plus a signed ownership challenge is required, so an
+    // empty body now 400s.
+    let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
+    let body = common::wallet_body(&app, &token, &kp).await;
     let resp = app
         .clone()
         .oneshot(
@@ -202,7 +195,7 @@ async fn fixture() -> Option<Fixture> {
                 .uri("/v1/wallets")
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(format!(r#"{{"public_key":"{account}"}}"#)))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -269,8 +262,12 @@ async fn wrong_top_level_json_shape_returns_400_across_all_mutating_routes() {
     for case in MUTATING_ROUTES {
         let path = resolve_path(case.path_template, &wallet_id);
         let auth = case.needs_auth.then_some(token.as_str());
-        // A JSON array where every one of these routes expects an object.
-        let req = json_request(case.method, &path, b"[]".to_vec(), auth);
+        // A non-empty JSON array where every one of these routes expects an object. `[]` isn't
+        // used here: several request structs (e.g. `CreateAddressRequest`) have every field
+        // `#[serde(default)]`, and serde accepts an empty sequence as a struct with zero elements
+        // to bind — a non-empty array is unambiguously the wrong shape regardless of field
+        // optionality.
+        let req = json_request(case.method, &path, b"[1]".to_vec(), auth);
 
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(

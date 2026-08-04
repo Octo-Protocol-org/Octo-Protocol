@@ -1,0 +1,8 @@
+{
+  "name": "octo-api-test-scripts",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@stellar/stellar-base": "^15.0.0"
+  }
+}

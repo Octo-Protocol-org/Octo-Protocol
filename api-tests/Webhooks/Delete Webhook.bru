@@ -1,0 +1,14 @@
+meta {
+  name: Delete Webhook
+  type: http
+  seq: 3
+}
+
+delete {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/webhooks/{{webhook_id}}
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}

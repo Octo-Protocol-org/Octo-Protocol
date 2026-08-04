@@ -259,6 +259,7 @@ pub struct PaymentLink {
     pub name: String,
     pub description: Option<String>,
     pub image_url: Option<String>,
+    pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub active: bool,
     pub created_at: DateTime<Utc>,
@@ -274,6 +275,7 @@ pub struct NewPaymentLink<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
     pub image_url: Option<&'a str>,
+    pub redirect_url: Option<&'a str>,
     pub amount_usdc_stroops: Option<i64>,
 }
 
@@ -283,6 +285,9 @@ pub struct PaymentLinkPayment {
     pub id: Uuid,
     pub payment_link_id: Uuid,
     pub transaction_id: Option<Uuid>,
+    /// Dedicated muxed deposit address for this intent — how ingest matches a landing deposit to
+    /// exactly one payment. `None` on rows created before migration 0015.
+    pub address_id: Option<Uuid>,
     pub payer_name: Option<String>,
     pub payer_email: Option<String>,
     pub amount_usdc_stroops: i64,
