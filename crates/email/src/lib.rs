@@ -31,6 +31,8 @@ pub struct EmailSender {
     http: reqwest::Client,
     #[cfg(feature = "test-fixtures")]
     captured: Option<Arc<Mutex<Vec<CapturedOtp>>>>,
+    #[cfg(feature = "test-fixtures")]
+    always_fail: bool,
 }
 
 impl EmailSender {
@@ -44,6 +46,8 @@ impl EmailSender {
                 .unwrap_or_default(),
             #[cfg(feature = "test-fixtures")]
             captured: None,
+            #[cfg(feature = "test-fixtures")]
+            always_fail: false,
         }
     }
 
@@ -53,6 +57,16 @@ impl EmailSender {
     pub fn new_captured() -> Self {
         Self {
             captured: Some(Arc::new(Mutex::new(Vec::new()))),
+            ..Self::new(String::new(), "test@octo.test".to_string())
+        }
+    }
+
+    /// A sender that always fails to send — simulates a Resend rejection (e.g. unverified
+    /// domain), so callers can test their rollback/error-handling behavior.
+    #[cfg(feature = "test-fixtures")]
+    pub fn new_failing() -> Self {
+        Self {
+            always_fail: true,
             ..Self::new(String::new(), "test@octo.test".to_string())
         }
     }
@@ -70,6 +84,10 @@ impl EmailSender {
 
     /// Send an OTP email. In captured mode, records `code` instead of calling Resend.
     pub async fn send_otp(&self, to: &str, purpose: &str, code: &str) -> Result<(), EmailError> {
+        #[cfg(feature = "test-fixtures")]
+        if self.always_fail {
+            return Err(EmailError::Rejected("simulated failure".into()));
+        }
         #[cfg(feature = "test-fixtures")]
         if let Some(captured) = &self.captured {
             captured.lock().unwrap().push(CapturedOtp {

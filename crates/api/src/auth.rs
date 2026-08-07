@@ -192,7 +192,12 @@ pub async fn signup(
     )
     .await;
 
-    issue_signup_otp(&state, user.id, &user.email).await?;
+    // If the OTP email can't be sent, this account is otherwise unreachable — delete it rather
+    // than leaving the email permanently stuck as "already registered" with no way to verify.
+    if let Err(e) = issue_signup_otp(&state, user.id, &user.email).await {
+        let _ = state.store().delete_unverified_user(user.id).await;
+        return Err(e);
+    }
 
     let (code, json) = Envelope::created(VerificationRequiredResponse {
         user_id: user.id,
