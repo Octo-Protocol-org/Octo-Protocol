@@ -36,6 +36,24 @@ async fn test_state() -> Option<AppState> {
     )
 }
 
+/// Like `test_state`, but every OTP send fails — simulates a Resend rejection.
+async fn test_state_with_failing_email() -> Option<AppState> {
+    let url = database_url()?;
+    let store = Store::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    Some(
+        AppState::new(
+            store,
+            [42u8; 32],
+            StellarNetwork::Testnet,
+            "https://horizon-testnet.stellar.org".into(),
+            None,
+            octo_email::EmailSender::new_failing(),
+        )
+        .with_jwt_secret(b"test-jwt-secret-at-least-16-bytes".to_vec()),
+    )
+}
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
@@ -385,6 +403,49 @@ async fn duplicate_email_is_rejected() {
         .await
         .unwrap();
     assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn signup_rolls_back_the_user_row_when_the_otp_email_fails_to_send() {
+    let Some(state) = test_state_with_failing_email().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = unique_email();
+    let body = format!(r#"{{"email":"{email}","password":"supersecret"}}"#);
+
+    let resp = app
+        .clone()
+        .oneshot(post_json("/v1/auth/signup", &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "signup must fail when the OTP email can't be sent"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(state.store().pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "the user row must be rolled back, not left stuck as unverifiable"
+    );
+
+    // The same email must be free to retry signup — this is the whole point of the rollback.
+    let resp = app
+        .oneshot(post_json("/v1/auth/signup", &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "retrying with the same email must attempt signup again (fails again only because \
+         this test's email sender always fails), not 400 as \"already registered\""
+    );
 }
 
 #[tokio::test]

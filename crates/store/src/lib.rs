@@ -114,6 +114,16 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
+    /// Delete a user outright. Only safe pre-verification — used to roll back a signup whose
+    /// OTP email never went out, so the email isn't stuck as "already registered" forever.
+    pub async fn delete_unverified_user(&self, user_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM users WHERE id = $1 AND email_verified_at IS NULL")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Look up a user by email (caller lowercases).
     pub async fn find_user_by_email(&self, email: &str) -> Result<Option<User>, StoreError> {
         let row = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
