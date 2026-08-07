@@ -12,7 +12,6 @@ authors.workspace = true
 test-fixtures = []
 
 [dependencies]
-base64.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
