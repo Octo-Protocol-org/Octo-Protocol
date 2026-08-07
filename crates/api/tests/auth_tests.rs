@@ -1,5 +1,7 @@
 //! Integration tests for dashboard auth (signup / login / me). Require Postgres via DATABASE_URL.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use octo_api::{build_router, AppState};
@@ -28,6 +30,7 @@ async fn test_state() -> Option<AppState> {
             StellarNetwork::Testnet,
             "https://horizon-testnet.stellar.org".into(),
             None,
+            octo_email::EmailSender::new_captured(),
         )
         .with_jwt_secret(b"test-jwt-secret-at-least-16-bytes".to_vec()),
     )
@@ -53,22 +56,11 @@ fn unique_email() -> String {
     format!("user-{}@octo.test", uuid::Uuid::new_v4().simple())
 }
 
-/// Sign up a fresh user and return `(token, user_id)`.
-async fn signup(app: &axum::Router, email: &str) -> (String, String) {
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let j = body_json(resp).await;
-    (
-        j["data"]["token"].as_str().unwrap().to_string(),
-        j["data"]["user"]["id"].as_str().unwrap().to_string(),
-    )
+/// Sign up a fresh user, verify via the captured OTP, and return `(token, user_id)`.
+async fn signup(app: &axum::Router, state: &AppState, email: &str) -> (String, String) {
+    let token = common::signup_and_verify(app, state, email).await;
+    let claims = octo_api::auth::verify_token(state.jwt_secret(), &token).unwrap();
+    (token, claims.sub)
 }
 
 fn post_refresh(token: Option<&str>) -> Request<Body> {
@@ -110,9 +102,9 @@ async fn refresh_issues_a_new_token_with_an_extended_expiry_for_the_same_user() 
         eprintln!("SKIPPED: set DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
-    let (token, user_id) = signup(&app, &email).await;
+    let (token, user_id) = signup(&app, &state, &email).await;
     let old_claims = jwt_claims(&token);
 
     // Ensure the wall clock advances so the new exp is strictly later.
@@ -154,8 +146,8 @@ async fn refresh_rejects_an_expired_token() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let (_token, user_id) = signup(&app, &unique_email()).await;
+    let app = build_router(state.clone());
+    let (_token, user_id) = signup(&app, &state, &unique_email()).await;
 
     // Correctly signed, but expired a minute ago.
     let expired = forge_token(&user_id, chrono::Utc::now().timestamp() - 60);
@@ -203,10 +195,10 @@ async fn signup_login_me_flow() {
         eprintln!("SKIPPED: set DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
 
-    // Signup → 201 + token.
+    // Signup → 201, but no token yet — an OTP is emailed and must be verified first.
     let resp = app
         .clone()
         .oneshot(post_json(
@@ -216,6 +208,21 @@ async fn signup_login_me_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+    let j = body_json(resp).await;
+    assert_eq!(j["data"]["email_verification_required"], true);
+    let user_id = j["data"]["user_id"].as_str().unwrap().to_string();
+
+    // Verify with the captured OTP → token.
+    let code = state.email().last_otp_for(&email).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/verify-email",
+            &format!(r#"{{"user_id":"{user_id}","code":"{code}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     let token = j["data"]["token"].as_str().unwrap().to_string();
     assert_eq!(j["data"]["user"]["email"], email);
@@ -236,7 +243,7 @@ async fn signup_login_me_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["data"]["email"], email);
 
-    // Login with the right password → token.
+    // Login with the right password, now that the account is verified → a real token directly.
     let resp = app
         .oneshot(post_json(
             "/v1/auth/login",
@@ -249,6 +256,113 @@ async fn signup_login_me_flow() {
         .as_str()
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn login_before_verification_resends_otp_instead_of_a_token() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = unique_email();
+
+    app.clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+
+    // Correct password, but the account was never verified — login must gate on OTP too.
+    let resp = app
+        .oneshot(post_json(
+            "/v1/auth/login",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["data"]["email_verification_required"], true);
+    assert!(j["data"]["token"].is_null());
+}
+
+#[tokio::test]
+async fn verify_email_rejects_a_wrong_code() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = unique_email();
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    let user_id = body_json(resp).await["data"]["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .oneshot(post_json(
+            "/v1/auth/verify-email",
+            &format!(r#"{{"user_id":"{user_id}","code":"000000"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn resend_otp_issues_a_working_code() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = unique_email();
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
+        ))
+        .await
+        .unwrap();
+    let user_id = body_json(resp).await["data"]["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/resend-otp",
+            &format!(r#"{{"user_id":"{user_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The resend replaces the code — the newest capture must verify.
+    let code = state.email().last_otp_for(&email).unwrap();
+    let resp = app
+        .oneshot(post_json(
+            "/v1/auth/verify-email",
+            &format!(r#"{{"user_id":"{user_id}","code":"{code}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -338,20 +452,9 @@ async fn short_password_rejected() {
 
 /// Helper: sign up a fresh user and return (cloneable app, token).
 async fn signup_and_get_token(state: AppState) -> (axum::Router, String) {
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    let token = body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let token = common::signup_and_verify(&app, &state, &email).await;
     (app, token)
 }
 

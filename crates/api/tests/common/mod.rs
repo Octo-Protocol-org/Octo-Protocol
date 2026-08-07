@@ -3,8 +3,74 @@
 
 use axum::body::Body;
 use axum::http::Request;
+use octo_api::AppState;
 use stellar_base::crypto::DalekKeyPair;
 use tower::ServiceExt;
+
+/// Sign up a fresh user, verify via the captured OTP (`state`'s `EmailSender` must be
+/// `new_captured()`), and return the bearer token. `email` should be unique per call.
+pub async fn signup_and_verify(app: &axum::Router, state: &AppState, email: &str) -> String {
+    signup_and_verify_full(app, state, email).await.0
+}
+
+/// Same as `signup_and_verify` but also returns the verified user's id.
+pub async fn signup_and_verify_full(
+    app: &axum::Router,
+    state: &AppState,
+    email: &str,
+) -> (String, String) {
+    let body = serde_json::json!({ "email": email, "password": "supersecret123" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/signup")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let user_id = json["data"]["user_id"]
+        .as_str()
+        .expect("signup must return user_id");
+    let code = state
+        .email()
+        .last_otp_for(email)
+        .expect("otp must be captured");
+
+    let verify_body = serde_json::json!({ "user_id": user_id, "code": code });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/verify-email")
+                .header("content-type", "application/json")
+                .body(Body::from(verify_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let token = json["data"]["token"]
+        .as_str()
+        .expect("verify-email must return a token")
+        .to_string();
+    let user_id = json["data"]["user"]["id"]
+        .as_str()
+        .expect("verify-email must return the user")
+        .to_string();
+    (token, user_id)
+}
 
 /// Fetch an ownership challenge for the authenticated user and sign it with `kp`.
 /// Returns `(challenge, signature_b64)` ready for `POST /v1/wallets`.

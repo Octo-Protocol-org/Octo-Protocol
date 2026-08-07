@@ -13,6 +13,7 @@ octo-crypto.workspace = true
 octo-wallet-core.workspace = true
 octo-store.workspace = true
 octo-webhooks.workspace = true
+octo-email.workspace = true
 octo-resilience.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -53,3 +54,5 @@ serde_yaml = "0.9"
 jsonschema = "0.26"
 # Signing fixtures for validation tests only — never enabled in production builds.
 octo-wallet-core = { workspace = true, features = ["test-fixtures"] }
+# Captures OTP codes in memory instead of emailing them — never enabled in production builds.
+octo-email = { workspace = true, features = ["test-fixtures"] }

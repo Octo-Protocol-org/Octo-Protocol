@@ -5,7 +5,7 @@
 //! user's own ed25519 signature (checked by the network); the API credential only authorizes use
 //! of Octo's relay + bookkeeping.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, require_login};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -17,6 +17,15 @@ use axum::Json;
 use octo_wallet_core::compute_inner_tx_hash;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Withdrawal-OTP TTL. Matches the signup OTP's 10-minute window.
+const WITHDRAW_OTP_TTL_MINUTES: i64 = 10;
+
+/// Stroops (1e-7) as a trimmed decimal string, matching Horizon's own asset precision.
+fn format_amount(stroops: i64) -> String {
+    let s = format!("{:.7}", stroops as f64 / 10_000_000.0);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SubmitSignedRequest {
@@ -59,26 +68,25 @@ fn explain_code(code: &str) -> String {
     }
 }
 
-/// `POST /v1/wallets/:id/submit-signed`
-pub async fn submit_signed(
-    State(state): State<AppState>,
-    Path(wallet_id): Path<Uuid>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> ApiResult<(StatusCode, Json<Envelope<SubmitSignedResponse>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
-    // For the audit log only: present when the caller used a login JWT (None for API keys).
-    let audit_user = crate::auth::authenticate(&headers, &state).await.ok();
-    let wallet = state.store().get_wallet(wallet_id).await?;
+/// Result of `relay_signed_transaction`: the response plus the payment destination (for audit
+/// logging / withdrawal emails), when the transaction was a Payment/PathPayment.
+pub struct RelayOutcome {
+    pub response: SubmitSignedResponse,
+    pub destination: Option<String>,
+    pub amount_stroops: Option<i64>,
+    pub asset_code: Option<String>,
+}
 
-    let req: SubmitSignedRequest = parse_optional(&body)?;
-    let signed_xdr = req
-        .transaction_xdr
-        .filter(|x| !x.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("transaction_xdr is required".into()))?;
-
+/// Core relay logic shared by `submit_signed` and the withdrawal OTP `confirm` endpoint: validate,
+/// allowlist-check, submit to Horizon, and record history. Callers handle auth and OTP gating.
+pub async fn relay_signed_transaction(
+    state: &AppState,
+    wallet_id: Uuid,
+    wallet: &octo_store::Wallet,
+    signed_xdr: &str,
+) -> ApiResult<RelayOutcome> {
     // Pure validation: v1 envelope, ≥1 signature, source == this wallet, op allowlist.
-    let payment = validate_signed_xdr(&signed_xdr, &wallet.stellar_account_g)?;
+    let payment = validate_signed_xdr(signed_xdr, &wallet.stellar_account_g)?;
 
     // Withdrawal allowlist: if the wallet has opted in, a Payment/PathPayment destination must be
     // pre-approved. Checked BEFORE anything touches Horizon, so a blocked send never reaches the
@@ -110,11 +118,11 @@ pub async fn submit_signed(
     // Compute the canonical tx hash up-front so the response/record always reference it, even
     // when Horizon submission errors out at the transport layer.
     let precomputed_hash = hex::encode(
-        compute_inner_tx_hash(&signed_xdr, state.network())
+        compute_inner_tx_hash(signed_xdr, state.network())
             .map_err(|_| ApiError::BadRequest("transaction_xdr could not be hashed".into()))?,
     );
 
-    let submit = state.horizon().submit_transaction(&signed_xdr).await;
+    let submit = state.horizon().submit_transaction(signed_xdr).await;
 
     let (status, hash, detail) = match submit {
         Ok(r) if r.successful => ("confirmed", Some(r.hash), None),
@@ -152,24 +160,232 @@ pub async fn submit_signed(
             .await;
     }
 
+    Ok(RelayOutcome {
+        response: SubmitSignedResponse {
+            status: status.to_string(),
+            stellar_tx_hash: hash,
+            detail,
+        },
+        destination: payment.as_ref().map(|p| p.destination.clone()),
+        amount_stroops: payment.as_ref().map(|p| p.amount_stroops),
+        asset_code: payment.as_ref().map(|p| p.asset_code.clone()),
+    })
+}
+
+/// `POST /v1/wallets/:id/submit-signed`
+pub async fn submit_signed(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Envelope<SubmitSignedResponse>>)> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    // For the audit log only: present when the caller used a login JWT (None for API keys).
+    let audit_user = crate::auth::authenticate(&headers, &state).await.ok();
+    let wallet = state.store().get_wallet(wallet_id).await?;
+
+    let req: SubmitSignedRequest = parse_optional(&body)?;
+    let signed_xdr = req
+        .transaction_xdr
+        .filter(|x| !x.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("transaction_xdr is required".into()))?;
+
+    let outcome = relay_signed_transaction(&state, wallet_id, &wallet, &signed_xdr).await?;
+
     if let Some(user_id) = audit_user {
         crate::audit::record(
             &state,
             user_id,
-            &format!("submitted a signed transaction ({status})"),
+            &format!(
+                "submitted a signed transaction ({})",
+                outcome.response.status
+            ),
             crate::audit::category::WALLET,
-            payment.as_ref().map(|p| p.destination.as_str()),
+            outcome.destination.as_deref(),
             &headers,
         )
         .await;
     }
 
-    let resp = SubmitSignedResponse {
-        status: status.to_string(),
-        stellar_tx_hash: hash,
-        detail,
-    };
-    let (code, json) = Envelope::created(resp);
+    let (code, json) = Envelope::created(outcome.response);
+    Ok((code, json))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WithdrawOtpRequest {
+    pub transaction_xdr: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WithdrawConfirmRequest {
+    pub transaction_xdr: Option<String>,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WithdrawOtpResponse {
+    pub sent: bool,
+}
+
+fn require_xdr(x: Option<String>) -> ApiResult<String> {
+    x.filter(|x| !x.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("transaction_xdr is required".into()))
+}
+
+/// `POST /v1/wallets/:id/withdraw/request-otp` — email a code bound to this exact, already-signed
+/// transaction. Requires a dashboard login (not an API key) since this gates a sensitive action.
+pub async fn withdraw_request_otp(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<WithdrawOtpResponse>>> {
+    let user_id = require_login(&headers, &state).await?;
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    let req: WithdrawOtpRequest = parse_optional(&body)?;
+    let signed_xdr = require_xdr(req.transaction_xdr)?;
+
+    // Validate up front so a garbage transaction never gets an OTP issued for it.
+    validate_signed_xdr(&signed_xdr, &wallet.stellar_account_g)?;
+    let tx_hash = hex::encode(
+        compute_inner_tx_hash(&signed_xdr, state.network())
+            .map_err(|_| ApiError::BadRequest("transaction_xdr could not be hashed".into()))?,
+    );
+
+    let code = octo_email::generate_otp();
+    let code_hash = octo_email::hash_otp(&code);
+    state
+        .store()
+        .create_otp(
+            user_id,
+            "withdrawal",
+            &code_hash,
+            Some(&tx_hash),
+            chrono::Duration::minutes(WITHDRAW_OTP_TTL_MINUTES),
+        )
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .email()
+        .send_otp(&user.email, "withdrawal", &code)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    Ok(Envelope::ok(WithdrawOtpResponse { sent: true }))
+}
+
+/// `POST /v1/wallets/:id/withdraw/confirm` — verify the OTP (bound to this exact transaction) and,
+/// only if it's correct, relay to Horizon. A wrong/expired/reused code never reaches Horizon.
+pub async fn withdraw_confirm(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Envelope<SubmitSignedResponse>>)> {
+    let user_id = require_login(&headers, &state).await?;
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    let req: WithdrawConfirmRequest = parse_optional(&body)?;
+    let signed_xdr = require_xdr(req.transaction_xdr)?;
+    let code = req
+        .code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("code is required".into()))?;
+
+    let tx_hash = hex::encode(
+        compute_inner_tx_hash(&signed_xdr, state.network())
+            .map_err(|_| ApiError::BadRequest("transaction_xdr could not be hashed".into()))?,
+    );
+
+    let code_hash = octo_email::hash_otp(&code);
+    let payment = validate_signed_xdr(&signed_xdr, &wallet.stellar_account_g)?;
+    if state
+        .store()
+        .verify_and_consume_otp(user_id, "withdrawal", &code_hash, Some(&tx_hash))
+        .await
+        .is_err()
+    {
+        // Wrong/expired/reused code: never touches Horizon. Tell the user in case it wasn't them.
+        if let Some(p) = &payment {
+            let html = octo_email::templates::withdrawal_failed_email(
+                &format_amount(p.amount_stroops),
+                &p.asset_code,
+                &p.destination,
+                "an incorrect verification code was entered",
+            );
+            let _ = state
+                .email()
+                .send(&user.email, "Withdrawal attempt failed", &html)
+                .await;
+        }
+        return Err(ApiError::BadRequest("invalid or expired code".into()));
+    }
+
+    let outcome = relay_signed_transaction(&state, wallet_id, &wallet, &signed_xdr).await?;
+
+    crate::audit::record(
+        &state,
+        user_id,
+        &format!("confirmed a withdrawal ({})", outcome.response.status),
+        crate::audit::category::WALLET,
+        outcome.destination.as_deref(),
+        &headers,
+    )
+    .await;
+
+    let (amount, asset, destination) = (
+        outcome.amount_stroops.map(format_amount),
+        outcome.asset_code.clone(),
+        outcome.destination.clone(),
+    );
+    if let (Some(amount), Some(asset), Some(destination)) = (amount, asset, destination) {
+        let html = if outcome.response.status == "confirmed" {
+            octo_email::templates::withdrawal_success_email(
+                &amount,
+                &asset,
+                &destination,
+                outcome.response.stellar_tx_hash.as_deref().unwrap_or(""),
+            )
+        } else {
+            octo_email::templates::withdrawal_failed_email(
+                &amount,
+                &asset,
+                &destination,
+                outcome
+                    .response
+                    .detail
+                    .as_deref()
+                    .unwrap_or("the transaction was rejected"),
+            )
+        };
+        let subject = if outcome.response.status == "confirmed" {
+            "Withdrawal successful"
+        } else {
+            "Withdrawal attempt failed"
+        };
+        let _ = state.email().send(&user.email, subject, &html).await;
+    }
+
+    let (code, json) = Envelope::created(outcome.response);
     Ok((code, json))
 }
 

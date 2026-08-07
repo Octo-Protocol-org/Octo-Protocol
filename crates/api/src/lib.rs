@@ -43,6 +43,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/auth/signup", post(auth::signup))
+        .route("/v1/auth/verify-email", post(auth::verify_email))
+        .route("/v1/auth/resend-otp", post(auth::resend_otp))
         .route("/v1/auth/login", post(auth::login))
         .route("/v1/auth/refresh", post(auth::refresh))
         .route("/v1/auth/me", get(auth::me))
@@ -107,6 +109,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/submit-signed",
             post(routes::submit::submit_signed),
+        )
+        .route(
+            "/v1/wallets/:id/withdraw/request-otp",
+            post(routes::submit::withdraw_request_otp),
+        )
+        .route(
+            "/v1/wallets/:id/withdraw/confirm",
+            post(routes::submit::withdraw_confirm),
         )
         .route(
             "/v1/wallets/:id/signing-info",

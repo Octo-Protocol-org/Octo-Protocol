@@ -46,6 +46,7 @@ async fn test_state() -> Option<AppState> {
         StellarNetwork::Testnet,
         "https://horizon-testnet.stellar.org".into(),
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -74,26 +75,9 @@ fn post_auth(uri: &str, token: &str) -> Request<Body> {
 }
 
 /// Sign up a fresh user via the router and return its bearer token.
-async fn auth_token(app: &axum::Router) -> String {
+async fn auth_token(app: &axum::Router, state: &AppState) -> String {
     let email = format!("u-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 /// Create a wallet for `token`'s user and return its id. Non-custodial: the caller generates the
@@ -228,12 +212,12 @@ async fn jwt_owner_of_wallet_a_is_404_on_every_guarded_route_for_wallet_b() {
         eprintln!("SKIPPED: set DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
-    let token_a = auth_token(&app).await;
+    let token_a = auth_token(&app, &state).await;
     let wallet_a = create_wallet(&app, &token_a).await;
 
-    let token_b = auth_token(&app).await;
+    let token_b = auth_token(&app, &state).await;
     let wallet_b = create_wallet(&app, &token_b).await;
 
     for route in guarded_routes() {
@@ -277,13 +261,13 @@ async fn api_key_for_wallet_a_is_404_on_every_guarded_route_for_wallet_b() {
         eprintln!("SKIPPED: set DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
-    let token_a = auth_token(&app).await;
+    let token_a = auth_token(&app, &state).await;
     let wallet_a = create_wallet(&app, &token_a).await;
     let key_a = api_key_for(&app, &token_a, &wallet_a).await;
 
-    let token_b = auth_token(&app).await;
+    let token_b = auth_token(&app, &state).await;
     let wallet_b = create_wallet(&app, &token_b).await;
 
     for route in guarded_routes() {
