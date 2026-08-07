@@ -1728,6 +1728,7 @@ dependencies = [
  "http-body-util",
  "jsonschema",
  "octo-crypto",
+ "octo-email",
  "octo-ingest",
  "octo-resilience",
  "octo-store",
@@ -1763,6 +1764,21 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "zeroize",
+]
+
+[[package]]
+name = "octo-email"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "hex",
+ "rand 0.8.6",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -1818,6 +1834,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "octo-api",
+ "octo-email",
  "octo-ingest",
  "octo-resilience",
  "octo-store",

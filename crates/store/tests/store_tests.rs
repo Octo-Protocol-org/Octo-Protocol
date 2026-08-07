@@ -850,18 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0018.
-    //
-    // NOTE: this version number is a repeat offender — five migrations have now landed with a
-    // colliding 0008 at one point or another (scheme_version, token_denylist,
-    // sponsored_tx_status_index, sponsored_and_audit_indexing, client_custody). sqlx keys
-    // migrations by version, so only one of any colliding set could ever apply and the rest
-    // silently never ran. This assertion is what guards against that recurring, so it must list
-    // every version explicitly rather than just checking a count.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0019.
+    // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
+    // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "expected exactly the eighteen known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        "expected exactly the nineteen known migrations to be recorded as applied"
     );
 }
 

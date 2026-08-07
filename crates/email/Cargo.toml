@@ -1,0 +1,23 @@
+[package]
+name = "octo-email"
+description = "Transactional email via Resend, plus OTP generation and hashing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+test-fixtures = []
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

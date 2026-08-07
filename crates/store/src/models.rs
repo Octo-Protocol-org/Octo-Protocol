@@ -107,6 +107,8 @@ pub struct User {
     pub email: String,
     /// argon2id PHC hash — never returned to clients.
     pub password_hash: String,
+    /// Null until the signup/login OTP is verified.
+    pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -292,5 +294,20 @@ pub struct PaymentLinkPayment {
     pub payer_email: Option<String>,
     pub amount_usdc_stroops: i64,
     pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A one-time email code, for signup verification or withdrawal confirmation.
+#[derive(Debug, Clone, FromRow)]
+pub struct EmailOtp {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub purpose: String,
+    pub code_hash: String,
+    /// Withdrawal OTPs bind to the exact transaction hash they gate; null for signup.
+    pub tx_hash_bound: Option<String>,
+    pub attempts: i16,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }

@@ -45,6 +45,7 @@ async fn test_state(horizon_url: String) -> Option<AppState> {
         StellarNetwork::Testnet,
         horizon_url,
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -92,26 +93,9 @@ fn get_auth(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-async fn auth_token(app: &Router) -> String {
+async fn auth_token(app: &Router, state: &AppState) -> String {
     let email = format!("sponsor-e2e-{}@octo.test", Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 /// Create a non-custodial wallet (client-generated key) and provision its gas tank so the
@@ -293,7 +277,7 @@ async fn e2e_sponsor_full_flow() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     let (hook_url, captured) = start_webhook_sink().await;
@@ -359,8 +343,8 @@ async fn e2e_sponsor_rejected_when_disabled() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
@@ -394,8 +378,8 @@ async fn e2e_sponsor_update_config_persists() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, _) = create_wallet(&app, &token).await;
     let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
 
@@ -437,7 +421,7 @@ async fn e2e_sponsorship_get_counts_only_confirmed_fees_spent_today() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let (wallet_id, _) = create_wallet(&app, &token).await;
     enable_sponsorship_via_api(&app, &token, &wallet_id).await;
     let wallet_id = Uuid::parse_str(&wallet_id).expect("wallet UUID");
@@ -480,8 +464,8 @@ async fn e2e_sponsor_rejects_account_merge_op() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, _) = create_wallet(&app, &token).await;
     enable_sponsorship_via_api(&app, &token, &wallet_id).await;
 
@@ -510,8 +494,8 @@ async fn e2e_sponsor_rejects_self_sponsorship() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
     enable_sponsorship_via_api(&app, &token, &wallet_id).await;
 
@@ -554,8 +538,8 @@ async fn e2e_sponsor_duplicate_inner_tx_hash() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
     enable_sponsorship_via_api(&app, &token, &wallet_id).await;
 
@@ -583,8 +567,8 @@ async fn e2e_sponsor_budget_exceeded() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
@@ -629,8 +613,8 @@ async fn sponsor_at_exact_fee_cap_succeeds() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     let cap = 250_000_i64;
@@ -669,8 +653,8 @@ async fn sponsor_one_stroop_over_fee_cap_is_rejected() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     let cap = 250_000_i64;
@@ -712,8 +696,8 @@ async fn sponsor_uncapped_per_tx_with_daily_budget_set_succeeds_under_budget() {
     let Some(state) = test_state(horizon).await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     // No per_tx_fee_cap_stroops in the request body -> stored as NULL (uncapped per-tx),
@@ -763,7 +747,7 @@ async fn e2e_concurrent_sponsor_requests_respect_budget() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
 
     let fee_per_tx = 200_i64;

@@ -18,6 +18,7 @@ octo-api.workspace = true
 octo-ingest.workspace = true
 octo-store.workspace = true
 octo-webhooks.workspace = true
+octo-email.workspace = true
 octo-wallet-core.workspace = true
 octo-resilience.workspace = true
 tokio.workspace = true
