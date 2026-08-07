@@ -1770,7 +1770,6 @@ dependencies = [
 name = "octo-email"
 version = "0.1.0"
 dependencies = [
- "base64",
  "chrono",
  "hex",
  "rand 0.8.6",
