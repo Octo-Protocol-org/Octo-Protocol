@@ -25,6 +25,10 @@ pub enum StoreError {
     /// The daily sponsorship budget would be exceeded by this request.
     #[error("daily sponsorship budget exceeded")]
     BudgetExceeded,
+
+    /// An OTP was wrong, expired, already used, over the attempt limit, or tx-hash mismatched.
+    #[error("invalid or expired code")]
+    InvalidOtp,
 }
 
 impl StoreError {

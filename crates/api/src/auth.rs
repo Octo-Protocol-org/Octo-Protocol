@@ -67,6 +67,28 @@ pub struct AuthResponse {
     pub user: UserView,
 }
 
+/// Returned by signup, and by login when the account isn't yet email-verified — tells the
+/// client to show the OTP-entry step instead of a token.
+#[derive(Debug, Serialize)]
+pub struct VerificationRequiredResponse {
+    pub user_id: Uuid,
+    pub email_verification_required: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct VerifyEmailRequest {
+    pub user_id: Option<Uuid>,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ResendOtpRequest {
+    pub user_id: Option<Uuid>,
+}
+
+/// Signup-OTP TTL. Matches the wallet-ownership challenge's 10-minute window.
+const OTP_TTL_MINUTES: i64 = 10;
+
 #[derive(Debug, Serialize)]
 pub struct UserView {
     pub id: Uuid,
@@ -113,13 +135,37 @@ fn check_auth_rate_limit(
     }
 }
 
+/// Generate, store, and email a signup-verification OTP. Shared by `signup`, `resend_otp`, and
+/// `login` when the account isn't yet verified.
+async fn issue_signup_otp(state: &AppState, user_id: Uuid, email: &str) -> Result<(), ApiError> {
+    let code = octo_email::generate_otp();
+    let code_hash = octo_email::hash_otp(&code);
+    state
+        .store()
+        .create_otp(
+            user_id,
+            "signup",
+            &code_hash,
+            None,
+            chrono::Duration::minutes(OTP_TTL_MINUTES),
+        )
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    state
+        .email()
+        .send_otp(email, "signup", &code)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(())
+}
+
 /// `POST /v1/auth/signup`
 pub async fn signup(
     State(state): State<AppState>,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
-) -> ApiResult<(StatusCode, Json<Envelope<AuthResponse>>)> {
+) -> ApiResult<(StatusCode, Json<Envelope<VerificationRequiredResponse>>)> {
     check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
@@ -146,15 +192,115 @@ pub async fn signup(
     )
     .await;
 
+    // If the OTP email can't be sent, this account is otherwise unreachable — delete it rather
+    // than leaving the email permanently stuck as "already registered" with no way to verify.
+    if let Err(e) = issue_signup_otp(&state, user.id, &user.email).await {
+        let _ = state.store().delete_unverified_user(user.id).await;
+        return Err(e);
+    }
+
+    let (code, json) = Envelope::created(VerificationRequiredResponse {
+        user_id: user.id,
+        email_verification_required: true,
+    });
+    Ok((code, json))
+}
+
+/// `POST /v1/auth/verify-email` — consume a signup OTP and issue the first session token.
+pub async fn verify_email(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<AuthResponse>>> {
+    let req: VerifyEmailRequest = parse_optional(&body)?;
+    let user_id = req
+        .user_id
+        .ok_or_else(|| ApiError::BadRequest("user_id is required".into()))?;
+    let code = req
+        .code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("code is required".into()))?;
+
+    let code_hash = octo_email::hash_otp(&code);
+    state
+        .store()
+        .verify_and_consume_otp(user_id, "signup", &code_hash, None)
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid or expired code".into()))?;
+
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    state
+        .store()
+        .mark_email_verified(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    let welcome_html = octo_email::templates::welcome_email(&user.email);
+    let _ = state
+        .email()
+        .send(&user.email, "Welcome to Octo", &welcome_html)
+        .await;
+
     let token = issue_token(state.jwt_secret(), user.id)?;
-    let (code, json) = Envelope::created(AuthResponse {
+    Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
             id: user.id,
             email: user.email,
         },
-    });
-    Ok((code, json))
+    }))
+}
+
+/// `POST /v1/auth/resend-otp` — re-send a signup verification code.
+pub async fn resend_otp(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<serde_json::Value>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    let req: ResendOtpRequest = parse_optional(&body)?;
+    let user_id = req
+        .user_id
+        .ok_or_else(|| ApiError::BadRequest("user_id is required".into()))?;
+
+    let ip = crate::rate_limit::client_ip(&headers, peer.map(|c| c.0));
+    if !state.rate_limiter().check(
+        &format!("otp:{user_id}"),
+        "otp_resend",
+        3,
+        std::time::Duration::from_secs(60 * 60),
+    ) {
+        return Err(ApiError::TooManyRequests(
+            "too many resend attempts — wait a while and try again".into(),
+        ));
+    }
+    // Belt and suspenders: also cap per-IP, so one IP can't hammer many user_ids.
+    if !state.rate_limiter().check(
+        &ip,
+        "otp_resend_ip",
+        10,
+        std::time::Duration::from_secs(60 * 60),
+    ) {
+        return Err(ApiError::TooManyRequests(
+            "too many resend attempts — wait a while and try again".into(),
+        ));
+    }
+
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    issue_signup_otp(&state, user.id, &user.email).await?;
+    Ok(Envelope::ok(serde_json::json!({ "sent": true })))
 }
 
 /// `POST /v1/auth/login`
@@ -163,7 +309,7 @@ pub async fn login(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
-) -> ApiResult<Json<Envelope<AuthResponse>>> {
+) -> ApiResult<Json<Envelope<serde_json::Value>>> {
     check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
@@ -178,6 +324,19 @@ pub async fn login(
     verify_password(&password, &user.password_hash)
         .map_err(|_| ApiError::BadRequest("invalid email or password".into()))?;
 
+    // A correct password on an unverified account (pre-existing user, or one who abandoned
+    // signup before verifying) re-triggers the same OTP gate signup uses, instead of a token.
+    if user.email_verified_at.is_none() {
+        issue_signup_otp(&state, user.id, &user.email).await?;
+        return Ok(Envelope::ok(
+            serde_json::to_value(VerificationRequiredResponse {
+                user_id: user.id,
+                email_verification_required: true,
+            })
+            .map_err(|_| ApiError::Internal)?,
+        ));
+    }
+
     crate::audit::record(
         &state,
         user.id,
@@ -189,13 +348,16 @@ pub async fn login(
     .await;
 
     let token = issue_token(state.jwt_secret(), user.id)?;
-    Ok(Envelope::ok(AuthResponse {
-        token,
-        user: UserView {
-            id: user.id,
-            email: user.email,
-        },
-    }))
+    Ok(Envelope::ok(
+        serde_json::to_value(AuthResponse {
+            token,
+            user: UserView {
+                id: user.id,
+                email: user.email,
+            },
+        })
+        .map_err(|_| ApiError::Internal)?,
+    ))
 }
 
 /// `POST /v1/auth/refresh` — exchange a valid, unexpired token for a freshly-signed one.

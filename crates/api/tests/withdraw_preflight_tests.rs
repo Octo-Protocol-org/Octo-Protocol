@@ -18,6 +18,8 @@
 //! check and (where the flow reaches it) the destination-exists check, without this test needing
 //! to predict the wallet's randomly-derived address ahead of creating it.
 
+mod common;
+
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
@@ -49,6 +51,7 @@ async fn test_state(horizon_url: String) -> Option<AppState> {
         StellarNetwork::Testnet,
         horizon_url,
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -72,33 +75,13 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<axum::body::Bod
 /// Sign up a fresh user and return both its login JWT and its id. The id is needed because the
 /// withdrawal fixture writes its wallet row directly (see [`create_wallet`]) and has to set
 /// `user_id` itself for the route's ownership check to pass.
+///
+/// Signup only issues a token once the emailed OTP is consumed, so this goes through
+/// `common::signup_and_verify_full` rather than posting to `/v1/auth/signup` directly.
 async fn auth_token(app: &Router, state: &AppState) -> (String, Uuid) {
     let email = format!("withdraw-preflight-{}@octo.test", Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let token = body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let user = state
-        .store()
-        .find_user_by_email(&email)
-        .await
-        .expect("lookup user")
-        .expect("signup created the user");
-    (token, user.id)
+    let (token, user_id) = common::signup_and_verify_full(app, state, &email).await;
+    (token, Uuid::parse_str(&user_id).expect("user id is a uuid"))
 }
 
 /// Create a **server-custody** wallet (real key derivation, real sealed seed) and return its id.

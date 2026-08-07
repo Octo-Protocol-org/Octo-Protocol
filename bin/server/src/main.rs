@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use octo_api::{build_router, AppState};
+use octo_email::EmailSender;
 use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
 use octo_store::Store;
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
     );
 
     // Shared state (includes the API's Horizon client wired with resilience).
+    let email = EmailSender::new(cfg.resend_api_key.clone(), cfg.email_from_address.clone());
     let mut state = AppState::new_with_resilience(
         store.clone(),
         cfg.master_key,
@@ -49,6 +51,7 @@ async fn main() -> Result<()> {
         cfg.horizon_url.clone(),
         cfg.friendbot_url.clone(),
         cfg.public_app_url.clone(),
+        email,
         resilience.retry_policy(),
         resilience.circuit_breaker(),
     )
@@ -119,6 +122,8 @@ struct Config {
     /// Base URL of the hosted checkout frontend (e.g. `https://app.octo.dev`), used to build the
     /// `url` field on payment-link responses. Defaults to the local frontend dev server.
     public_app_url: String,
+    resend_api_key: String,
+    email_from_address: String,
     master_key: [u8; 32],
     /// Optional next master key for zero-downtime rotation. Present only during the rotation
     /// window while `octo-migrate-keys` is backfilling. When set, the server uses this key as
@@ -158,6 +163,11 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:3000".to_string())
             .trim_end_matches('/')
             .to_string();
+
+        let resend_api_key =
+            std::env::var("RESEND_API_KEY").context("RESEND_API_KEY is required")?;
+        let email_from_address =
+            std::env::var("EMAIL_FROM_ADDRESS").context("EMAIL_FROM_ADDRESS is required")?;
 
         let master_key_b64 = std::env::var("MASTER_KEY").context("MASTER_KEY is required")?;
         let master_key = AppState::decode_master_key(&master_key_b64)
@@ -199,6 +209,8 @@ impl Config {
             horizon_url,
             friendbot_url,
             public_app_url,
+            resend_api_key,
+            email_from_address,
             master_key,
             master_key_next,
             jwt_secret,

@@ -39,6 +39,7 @@ async fn test_state() -> Option<AppState> {
         StellarNetwork::Testnet,
         "https://horizon-testnet.stellar.org".into(),
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -49,29 +50,10 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-/// POST with no body but an Authorization bearer token — used only to provision the wallet the
-/// malformed-body cases target; not itself part of the matrix.
 /// Sign up a fresh user via the router and return its bearer token.
-async fn auth_token(app: &axum::Router) -> String {
+async fn auth_token(app: &axum::Router, state: &AppState) -> String {
     let email = format!("u-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 /// Build a request carrying a raw (possibly malformed) JSON body, with an optional bearer token.
@@ -181,8 +163,8 @@ struct Fixture {
 
 async fn fixture() -> Option<Fixture> {
     let state = test_state().await?;
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     // Non-custodial contract: `public_key` plus a signed ownership challenge is required, so an
     // empty body now 400s.
     let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();

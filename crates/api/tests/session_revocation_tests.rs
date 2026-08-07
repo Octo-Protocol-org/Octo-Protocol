@@ -7,6 +7,8 @@
 //! - logout revokes the current token
 //! - a request in-flight at the moment of refresh: documents the accepted race window
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use octo_api::{build_router, AppState};
@@ -35,6 +37,7 @@ async fn test_state() -> Option<AppState> {
             StellarNetwork::Testnet,
             "https://horizon-testnet.stellar.org".into(),
             None,
+            octo_email::EmailSender::new_captured(),
         )
         .with_jwt_secret(b"test-jwt-secret-at-least-16-bytes".to_vec()),
     )
@@ -45,15 +48,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&b).unwrap()
-}
-
-fn post_json(uri: &str, body: &str) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
 }
 
 fn authed(method: &str, uri: &str, token: &str) -> Request<Body> {
@@ -70,21 +64,10 @@ fn unique_email() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: signup and return the initial token
+// Helper: signup, verify the OTP, and return the resulting token
 // ---------------------------------------------------------------------------
-async fn signup_and_get_token(app: axum::Router, email: &str) -> String {
-    let resp = app
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+async fn signup_and_get_token(app: axum::Router, state: &AppState, email: &str) -> String {
+    common::signup_and_verify(&app, state, email).await
 }
 
 // ---------------------------------------------------------------------------
@@ -96,9 +79,9 @@ async fn refresh_revokes_the_previous_token_so_it_can_no_longer_authenticate() {
         eprintln!("SKIPPED: set DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
-    let token1 = signup_and_get_token(app.clone(), &email).await;
+    let token1 = signup_and_get_token(app.clone(), &state, &email).await;
 
     // Refresh using token1 — should succeed and return token2.
     let resp = app
@@ -142,9 +125,9 @@ async fn logout_revokes_the_current_token() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
-    let token = signup_and_get_token(app.clone(), &email).await;
+    let token = signup_and_get_token(app.clone(), &state, &email).await;
 
     // Logout.
     let resp = app
@@ -185,9 +168,9 @@ async fn in_flight_request_behaviour_around_refresh_is_as_documented() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
-    let token1 = signup_and_get_token(app.clone(), &email).await;
+    let token1 = signup_and_get_token(app.clone(), &state, &email).await;
 
     // Part a: old token is valid BEFORE refresh.
     let resp = app
@@ -232,9 +215,9 @@ async fn double_logout_is_harmless() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let email = unique_email();
-    let token = signup_and_get_token(app.clone(), &email).await;
+    let token = signup_and_get_token(app.clone(), &state, &email).await;
 
     app.clone()
         .oneshot(authed("POST", "/v1/auth/logout", &token))

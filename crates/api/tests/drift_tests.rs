@@ -30,6 +30,7 @@ async fn test_state() -> Option<AppState> {
         StellarNetwork::Testnet,
         String::from("https://horizon-testnet.stellar.org"),
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -67,31 +68,10 @@ fn validate_response(spec: &Value, path: &str, method: &str, status: &str, respo
     }
 }
 
-/// Sign up a fresh user and return its bearer token. Every /v1/wallets route is authenticated,
-/// so the drift test needs a real token or it only ever exercises the 401 path.
-async fn auth_token(app: &axum::Router) -> String {
+/// Sign up a fresh user, verify via the captured OTP, and return its bearer token.
+async fn auth_token(app: &axum::Router, state: &AppState) -> String {
     let email = format!("drift-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let body = serde_json::json!({ "email": email, "password": "correct horse battery" });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: Value = serde_json::from_slice(&bytes).unwrap();
-    json["data"]["token"]
-        .as_str()
-        .expect("signup must return a token")
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 #[tokio::test]
@@ -100,9 +80,9 @@ async fn live_wallet_creation_response_matches_the_openapi_schema() {
         Some(s) => s,
         None => return,
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let spec = load_openapi_spec();
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
 
     // 1. Success case: Create wallet.
     //

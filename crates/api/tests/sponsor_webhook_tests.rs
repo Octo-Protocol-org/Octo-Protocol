@@ -51,6 +51,7 @@ async fn test_state() -> Option<AppState> {
         StellarNetwork::Testnet,
         "https://horizon-testnet.stellar.org".into(),
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -80,26 +81,9 @@ fn post_json_auth(uri: &str, body: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
-async fn auth_token(app: &Router) -> String {
+async fn auth_token(app: &Router, state: &AppState) -> String {
     let email = format!("sponsor-{}@octo.test", Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 /// Create a non-custodial wallet (client-generated key) via the API and provision its gas tank
@@ -228,7 +212,7 @@ async fn sponsored_webhook_fires_on_failure() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
     enable_sponsorship(&state, &wallet_id).await;
 
@@ -290,7 +274,7 @@ async fn sponsored_webhook_skipped_when_no_endpoint() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let (wallet_id, master_g) = create_wallet(&app, &token).await;
     enable_sponsorship(&state, &wallet_id).await;
     // Deliberately no webhook endpoint registered for this wallet.

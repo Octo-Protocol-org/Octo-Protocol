@@ -17,9 +17,9 @@ mod models;
 
 pub use error::StoreError;
 pub use models::{
-    Address, ApiKey, AuditLog, DenylistedToken, GasSponsorshipConfig, NewDeposit, NewPaymentLink,
-    NewSponsoredTx, PaymentLink, PaymentLinkPayment, SponsoredTransaction, Transaction, User,
-    Wallet, WebhookDelivery, WebhookEndpoint, WhitelistedAddress, Withdrawal,
+    Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
+    NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, SponsoredTransaction,
+    Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint, WhitelistedAddress, Withdrawal,
     WithdrawalAllowlistConfig,
 };
 
@@ -114,6 +114,16 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
+    /// Delete a user outright. Only safe pre-verification — used to roll back a signup whose
+    /// OTP email never went out, so the email isn't stuck as "already registered" forever.
+    pub async fn delete_unverified_user(&self, user_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM users WHERE id = $1 AND email_verified_at IS NULL")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Look up a user by email (caller lowercases).
     pub async fn find_user_by_email(&self, email: &str) -> Result<Option<User>, StoreError> {
         let row = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
@@ -130,6 +140,85 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    /// Mark a user's email as verified.
+    pub async fn mark_email_verified(&self, user_id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE users SET email_verified_at = now() WHERE id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // --- email OTP ----------------------------------------------------------
+
+    /// Issue a fresh OTP row. Callers hash the code themselves before calling this.
+    pub async fn create_otp(
+        &self,
+        user_id: Uuid,
+        purpose: &str,
+        code_hash: &str,
+        tx_hash_bound: Option<&str>,
+        ttl: chrono::Duration,
+    ) -> Result<Uuid, StoreError> {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO email_otps (user_id, purpose, code_hash, tx_hash_bound, expires_at)
+             VALUES ($1, $2, $3, $4, now() + $5) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .bind(code_hash)
+        .bind(tx_hash_bound)
+        .bind(ttl)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Verify an already-hashed code against the most recent unconsumed OTP for
+    /// `(user_id, purpose)`. On a wrong code, increments `attempts` and returns `InvalidOtp`
+    /// rather than panicking — callers should surface a generic "invalid or expired code" either
+    /// way, so guessing can't distinguish "wrong code" from "no such code exists".
+    pub async fn verify_and_consume_otp(
+        &self,
+        user_id: Uuid,
+        purpose: &str,
+        code_hash: &str,
+        tx_hash_bound: Option<&str>,
+    ) -> Result<(), StoreError> {
+        const MAX_ATTEMPTS: i16 = 5;
+
+        let otp = sqlx::query_as::<_, EmailOtp>(
+            "SELECT * FROM email_otps WHERE user_id = $1 AND purpose = $2
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::InvalidOtp)?;
+
+        if otp.consumed_at.is_some()
+            || otp.attempts >= MAX_ATTEMPTS
+            || otp.expires_at < chrono::Utc::now()
+            || otp.tx_hash_bound.as_deref() != tx_hash_bound
+        {
+            return Err(StoreError::InvalidOtp);
+        }
+        if otp.code_hash != code_hash {
+            sqlx::query("UPDATE email_otps SET attempts = attempts + 1 WHERE id = $1")
+                .bind(otp.id)
+                .execute(&self.pool)
+                .await?;
+            return Err(StoreError::InvalidOtp);
+        }
+
+        sqlx::query("UPDATE email_otps SET consumed_at = now() WHERE id = $1")
+            .bind(otp.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // --- audit logs -------------------------------------------------------

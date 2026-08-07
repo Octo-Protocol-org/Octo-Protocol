@@ -38,6 +38,7 @@ async fn test_state() -> Option<AppState> {
         StellarNetwork::Testnet,
         "https://horizon-testnet.stellar.org".into(),
         None,
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -96,26 +97,9 @@ async fn create_wallet_req(app: &axum::Router, token: &str) -> Request<Body> {
 }
 
 /// Sign up a fresh user via the router and return its bearer token.
-async fn auth_token(app: &axum::Router) -> String {
+async fn auth_token(app: &axum::Router, state: &AppState) -> String {
     let email = format!("u-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 async fn body_limit_handler(_: Bytes) -> Result<StatusCode, std::convert::Infallible> {
@@ -153,7 +137,7 @@ async fn test_oversized_body_returns_413() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // إرسال طلب كبير جداً (أكبر من الحد المسموح به عادة)
     let resp = app
@@ -184,7 +168,7 @@ async fn create_wallet_is_non_custodial_and_stores_no_seed() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
 
     // The client generates the keypair, proves ownership, and sends only public material.
     let kp = stellar_base::crypto::DalekKeyPair::random().unwrap();
@@ -241,8 +225,8 @@ async fn create_wallet_rejects_bad_public_key() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Missing public_key → 400.
     let resp = app
@@ -269,8 +253,8 @@ async fn addresses_return_both_forms_and_share_base() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Create a wallet (empty body is allowed).
     let resp = app
@@ -314,8 +298,8 @@ async fn transactions_endpoint_returns_list() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -346,8 +330,8 @@ async fn get_unknown_wallet_is_404() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let uri = format!("/v1/wallets/{}", uuid::Uuid::new_v4());
     let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -358,8 +342,8 @@ async fn balances_requires_auth_and_a_real_wallet() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
     let uri = format!("/v1/wallets/{wallet_id}/balances");
 
@@ -369,7 +353,7 @@ async fn balances_requires_auth_and_a_real_wallet() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Another user must not learn whether this wallet exists.
-    let other = auth_token(&app).await;
+    let other = auth_token(&app, &state).await;
     let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
@@ -418,8 +402,8 @@ async fn signing_info_requires_auth_and_a_real_wallet() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
     let uri = format!("/v1/wallets/{wallet_id}/signing-info");
 
@@ -430,7 +414,7 @@ async fn signing_info_requires_auth_and_a_real_wallet() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Another user must not learn whether this wallet exists.
-    let other = auth_token(&app).await;
+    let other = auth_token(&app, &state).await;
     let resp = app.clone().oneshot(get_auth(&uri, &other)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
@@ -445,7 +429,7 @@ async fn health_is_public_and_ok() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     // The liveness probe must not require auth — a load balancer has no token.
     let resp = app.oneshot(get("/health")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -456,8 +440,8 @@ async fn backup_round_trips_the_opaque_blob_verbatim() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // The blob is ciphertext the CLIENT produced; the server must store and return it byte-for
     // byte without interpreting it.
@@ -496,8 +480,8 @@ async fn backup_is_null_when_the_client_stored_none() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // encrypted_backup is optional — a user may decline server-side backup entirely.
     let wallet_id = create_wallet_for(&app, &token).await;
@@ -512,8 +496,8 @@ async fn backup_rejects_api_key_auth_and_other_users() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
     let uri = format!("/v1/wallets/{wallet_id}/backup");
 
@@ -528,7 +512,7 @@ async fn backup_rejects_api_key_auth_and_other_users() {
     );
 
     // Another logged-in user gets 404 (not 403) so wallet existence isn't leaked.
-    let other = auth_token(&app).await;
+    let other = auth_token(&app, &state).await;
     let resp = app.oneshot(get_auth(&uri, &other)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
@@ -538,7 +522,7 @@ async fn unauthenticated_request_is_401() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     // No token at all → 401 (auth required on wallet endpoints).
     let uri = format!("/v1/wallets/{}", uuid::Uuid::new_v4());
     let resp = app.oneshot(get(&uri)).await.unwrap();
@@ -550,8 +534,8 @@ async fn addresses_on_unknown_wallet_is_404() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let uri = format!("/v1/wallets/{}/addresses", uuid::Uuid::new_v4());
     let resp = app.oneshot(post_auth(&uri, &token)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -630,7 +614,7 @@ async fn withdraw_refuses_to_sign_for_a_client_custody_wallet() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -683,8 +667,8 @@ async fn submit_signed_requires_transaction_xdr() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -730,7 +714,7 @@ async fn withdraw_header_idempotency_key_takes_precedence_over_body() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -792,7 +776,7 @@ async fn withdraw_body_only_idempotency_key_works() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -841,8 +825,8 @@ async fn withdraw_missing_idempotency_key_is_400() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -879,8 +863,8 @@ async fn withdraw_empty_string_idempotency_key_is_treated_as_absent() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -957,7 +941,7 @@ async fn withdraw_rejects_invalid_asset_code_before_creating_withdrawal_row() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -1007,8 +991,8 @@ async fn custodial_trustline_is_gone() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token).await)
@@ -1035,8 +1019,8 @@ async fn api_key_generate_and_get() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Create a wallet owned by this user.
     let resp = app
@@ -1105,10 +1089,10 @@ async fn api_key_requires_ownership() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // User A creates a wallet.
-    let token_a = auth_token(&app).await;
+    let token_a = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token_a).await)
@@ -1120,7 +1104,7 @@ async fn api_key_requires_ownership() {
         .to_string();
 
     // User B cannot generate a key for A's wallet → 404 (not revealed).
-    let token_b = auth_token(&app).await;
+    let token_b = auth_token(&app, &state).await;
     let resp = app
         .oneshot(post_auth(
             &format!("/v1/wallets/{wallet_id}/api-key"),
@@ -1150,8 +1134,8 @@ async fn regenerating_api_key_invalidates_the_previous_one() {
     // is implemented in `Store::upsert_api_key`; the only way to confirm it *replaces* rather
     // than *appends* a row is to check the hash lookup, not just the HTTP responses).
     let store = state.store().clone();
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -1286,8 +1270,8 @@ async fn api_key_bearer_calling_generate_key_behavior_is_documented() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -1333,8 +1317,8 @@ async fn api_key_can_create_address_on_its_wallet() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Create a wallet + its API key.
     let resp = app
@@ -1374,8 +1358,8 @@ async fn api_key_cannot_touch_another_wallet() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Two wallets owned by the same user; key for wallet A.
     let a = body_json(
@@ -1413,8 +1397,8 @@ async fn delete_api_key_revokes_it_and_subsequent_calls_using_it_are_401() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Create a wallet and generate an API key.
     let resp = app
@@ -1481,10 +1465,10 @@ async fn delete_api_key_requires_wallet_ownership() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // User A creates a wallet with an API key.
-    let token_a = auth_token(&app).await;
+    let token_a = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(create_wallet_req(&app, &token_a).await)
@@ -1497,7 +1481,7 @@ async fn delete_api_key_requires_wallet_ownership() {
     api_key_for(&app, &token_a, &wallet_id).await;
 
     // User B cannot revoke A's key → 404 (not revealed).
-    let token_b = auth_token(&app).await;
+    let token_b = auth_token(&app, &state).await;
     let resp = app
         .clone()
         .oneshot(delete_auth(
@@ -1514,8 +1498,8 @@ async fn delete_api_key_on_a_wallet_with_no_key_is_ok() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Create a wallet without generating a key.
     let resp = app
@@ -1545,8 +1529,8 @@ async fn delete_api_key_rejects_api_key_auth() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -1576,8 +1560,8 @@ async fn api_key_cannot_provision_gas_tank() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     let wallet_id = body_json(
         app.clone()
@@ -1613,22 +1597,11 @@ async fn audit_logs_record_and_list() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
-    // Signup records "created an account"; capture the token.
+    // Signup + verify records "created an account"; capture the token.
     let email = format!("audit-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    let token = body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let token = common::signup_and_verify(&app, &state, &email).await;
 
     // Create a wallet → records "created master wallet".
     app.clone()
@@ -1670,21 +1643,11 @@ async fn audit_logs_are_strictly_scoped_to_the_authenticated_user() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // User A signs up and performs an auditable action with a distinctive marker.
     let email_a = format!("audit-a-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email_a}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    let data_a = body_json(resp).await;
-    let token_a = data_a["data"]["token"].as_str().unwrap().to_string();
-    let user_id_a = data_a["data"]["user"]["id"].as_str().unwrap().to_string();
+    let (token_a, user_id_a) = common::signup_and_verify_full(&app, &state, &email_a).await;
 
     let kp_a = stellar_base::crypto::DalekKeyPair::random().unwrap();
     let account_a = kp_a.public_key().account_id();
@@ -1702,17 +1665,7 @@ async fn audit_logs_are_strictly_scoped_to_the_authenticated_user() {
 
     // User B signs up and performs its own auditable action with a different marker.
     let email_b = format!("audit-b-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email_b}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    let data_b = body_json(resp).await;
-    let token_b = data_b["data"]["token"].as_str().unwrap().to_string();
-    let user_id_b = data_b["data"]["user"]["id"].as_str().unwrap().to_string();
+    let (token_b, user_id_b) = common::signup_and_verify_full(&app, &state, &email_b).await;
 
     let kp_b = stellar_base::crypto::DalekKeyPair::random().unwrap();
     let account_b = kp_b.public_key().account_id();
@@ -1788,22 +1741,11 @@ async fn audit_logs_category_all_behaves_like_no_filter() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
-    // Signup records "created an account"; capture the token.
+    // Signup + verify records "created an account"; capture the token.
     let email = format!("audit-all-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(post_json(
-            "/v1/auth/signup",
-            &format!(r#"{{"email":"{email}","password":"supersecret"}}"#),
-        ))
-        .await
-        .unwrap();
-    let token = body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let token = common::signup_and_verify(&app, &state, &email).await;
 
     // Create a wallet → records "created master wallet", so there's more than one row/category.
     app.clone()
@@ -1845,7 +1787,7 @@ async fn audit_logs_without_token_is_401() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     // No Authorization header at all → 401 (audit-logs requires `authenticate`).
     let resp = app.oneshot(get("/v1/audit-logs")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -1881,8 +1823,8 @@ async fn list_sponsored_transactions_returns_empty_for_new_wallet() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -1908,7 +1850,7 @@ async fn list_sponsored_transactions_pagination() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -1970,7 +1912,7 @@ async fn list_sponsored_transactions_status_filter() {
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
 
     let resp = app
         .clone()
@@ -2006,7 +1948,7 @@ async fn list_sponsored_transactions_requires_auth() {
     let Some(state) = test_state().await else {
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let uri = format!(
         "/v1/wallets/{}/sponsored-transactions",
         uuid::Uuid::new_v4()
@@ -2038,8 +1980,8 @@ async fn list_wallets_pagination_returns_a_next_cursor_and_respects_limit() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Create 5 wallets for this user.
     for _ in 0..5 {
@@ -2091,8 +2033,8 @@ async fn list_addresses_pagination_returns_a_next_cursor_and_respects_limit() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     // Create 5 addresses.
@@ -2135,7 +2077,7 @@ async fn list_transactions_pagination_returns_a_next_cursor_and_respects_limit()
         return;
     };
     let app = build_router(state.clone());
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     // Insert 5 synthetic deposit transactions directly via the store.
@@ -2210,8 +2152,8 @@ async fn pagination_limit_boundaries_are_validated_consistently_with_sponsored_t
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     // limit=0 → 400 on all three endpoints.
@@ -2267,7 +2209,7 @@ async fn payment_link_public_routes_require_no_auth_and_404_unknown_slugs() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // No Authorization header at all — must not be treated as unauthenticated-401, just 404.
     let resp = app
@@ -2303,9 +2245,9 @@ async fn payment_link_management_requires_wallet_ownership() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let owner = auth_token(&app).await;
-    let other = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let owner = auth_token(&app, &state).await;
+    let other = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &owner).await;
 
     let uri = format!("/v1/wallets/{wallet_id}/payment-links");
@@ -2383,8 +2325,8 @@ async fn payment_link_response_includes_checkout_url_and_redirect_url() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     let uri = format!("/v1/wallets/{wallet_id}/payment-links");
@@ -2439,8 +2381,8 @@ async fn payment_link_intent_rejects_flexible_amount_without_one() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     let resp = app
@@ -2488,8 +2430,8 @@ async fn create_wallet_without_challenge_is_rejected() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // A valid public key but no ownership proof — must be rejected, or anyone could register a
     // stranger's account and watch its deposit history.
@@ -2514,8 +2456,8 @@ async fn create_wallet_rejects_signature_from_a_different_key() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // The challenge is signed by key B, but the registration claims key A's account.
     let kp_a = stellar_base::crypto::DalekKeyPair::random().unwrap();
@@ -2545,9 +2487,9 @@ async fn create_wallet_rejects_another_users_challenge() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let user_a = auth_token(&app).await;
-    let user_b = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let user_a = auth_token(&app, &state).await;
+    let user_b = auth_token(&app, &state).await;
 
     // Challenge issued to user A, redeemed by user B: the HMAC user-binding must reject it,
     // otherwise a captured (challenge, signature) pair could be replayed cross-account.
@@ -2590,7 +2532,7 @@ async fn signup_is_rate_limited_per_ip() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let ip = format!("203.0.113.{}", rand_octet());
 
     // The limit is 10/min/IP; the 11th attempt from the same IP must be refused.
@@ -2636,8 +2578,8 @@ async fn payment_intent_creation_is_rate_limited_per_ip() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     let resp = app
@@ -2685,8 +2627,8 @@ async fn concurrent_payment_intents_get_distinct_deposit_addresses() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     let resp = app
@@ -2770,9 +2712,9 @@ async fn payment_link_payments_list_requires_ownership_and_returns_payers() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let owner = auth_token(&app).await;
-    let other = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let owner = auth_token(&app, &state).await;
+    let other = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &owner).await;
 
     let resp = app
@@ -2837,7 +2779,7 @@ async fn upload_signature_requires_auth() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // No credential: must be 401 rather than handing out signed upload params.
     let resp = app
@@ -2849,7 +2791,7 @@ async fn upload_signature_requires_auth() {
 
     // Authenticated: 200 with params when Cloudinary is configured, or a clear 400 when it
     // isn't. Either way it must not be a 401/500 — the test env usually has no credentials.
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let resp = app
         .oneshot(get_auth("/v1/uploads/signature", &token))
         .await
@@ -2867,8 +2809,8 @@ async fn submit_payment_validates_against_the_intents_own_address() {
         eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
     let wallet_id = create_wallet_for(&app, &token).await;
 
     let resp = app

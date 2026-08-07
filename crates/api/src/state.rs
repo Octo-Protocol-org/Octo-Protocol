@@ -4,6 +4,7 @@ use crate::error::ApiError;
 use crate::horizon::Horizon;
 use base64::Engine;
 use octo_crypto::{master_key_from_slice, MASTER_KEY_LEN};
+use octo_email::EmailSender;
 use octo_resilience::{CircuitBreaker, RetryPolicy};
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
@@ -37,6 +38,8 @@ struct Inner {
     jwt_secret: Vec<u8>,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
     webhooks: WebhookSender,
+    /// Sends OTP/welcome/withdrawal emails via Resend.
+    email: EmailSender,
     /// Per-IP rate limiting for auth + public endpoints.
     rate_limiter: crate::rate_limit::RateLimiter,
     /// Cloudinary credentials for signed image uploads; `None` when unconfigured, in which case
@@ -79,6 +82,7 @@ impl AppState {
         network: StellarNetwork,
         horizon_url: String,
         friendbot_url: Option<String>,
+        email: EmailSender,
     ) -> Self {
         let mut secret = vec![0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
@@ -90,6 +94,7 @@ impl AppState {
             horizon_url,
             friendbot_url,
             "http://localhost:3000".to_string(),
+            email,
             secret,
             octo_resilience::RetryPolicy::default(),
             octo_resilience::CircuitBreaker::new(5, std::time::Duration::from_secs(30)),
@@ -105,6 +110,7 @@ impl AppState {
         horizon_url: String,
         friendbot_url: Option<String>,
         public_app_url: String,
+        email: EmailSender,
         retry: octo_resilience::RetryPolicy,
         circuit: octo_resilience::CircuitBreaker,
     ) -> Self {
@@ -118,6 +124,7 @@ impl AppState {
             horizon_url,
             friendbot_url,
             public_app_url,
+            email,
             secret,
             retry,
             circuit,
@@ -150,6 +157,7 @@ impl AppState {
         horizon_url: String,
         friendbot_url: Option<String>,
         public_app_url: String,
+        email: EmailSender,
         jwt_secret: Vec<u8>,
         retry: RetryPolicy,
         circuit: CircuitBreaker,
@@ -170,6 +178,7 @@ impl AppState {
                 public_app_url,
                 jwt_secret,
                 webhooks,
+                email,
             }),
         }
     }
@@ -237,6 +246,10 @@ impl AppState {
 
     pub fn webhooks(&self) -> &WebhookSender {
         &self.inner.webhooks
+    }
+
+    pub fn email(&self) -> &EmailSender {
+        &self.inner.email
     }
 
     pub fn horizon_url(&self) -> &str {

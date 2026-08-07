@@ -42,6 +42,7 @@ async fn live_state() -> Option<AppState> {
         StellarNetwork::Testnet,
         "https://horizon-testnet.stellar.org".into(),
         Some("https://friendbot.stellar.org".into()),
+        octo_email::EmailSender::new_captured(),
     ))
 }
 
@@ -72,26 +73,9 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 /// Sign up a fresh user and return its bearer token (wallet creation requires auth).
-async fn auth_token(app: &axum::Router) -> String {
+async fn auth_token(app: &axum::Router, state: &AppState) -> String {
     let email = format!("live-{}@octo.test", uuid::Uuid::new_v4().simple());
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/auth/signup")
-                .header("content-type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"email":"{email}","password":"supersecret"}}"#
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    common::signup_and_verify(app, state, &email).await
 }
 
 #[tokio::test]
@@ -100,8 +84,8 @@ async fn create_wallet_funds_and_has_balance() {
         eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL to run live testnet tests");
         return;
     };
-    let app = build_router(state);
-    let token = auth_token(&app).await;
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
 
     // Client generates the key; server friendbot-funds the supplied account on testnet.
     let kp = DalekKeyPair::random().unwrap();
@@ -154,8 +138,11 @@ async fn create_wallet_funds_and_has_balance() {
 
 /// Create a non-custodial wallet from a caller-generated keypair, friendbot-funded on testnet.
 /// Returns `(wallet_id, account_g, keypair, owner_token)` so the test can sign + relay locally.
-async fn create_funded_wallet(app: &axum::Router) -> (String, String, DalekKeyPair, String) {
-    let token = auth_token(app).await;
+async fn create_funded_wallet(
+    app: &axum::Router,
+    state: &AppState,
+) -> (String, String, DalekKeyPair, String) {
+    let token = auth_token(app, state).await;
     let kp = DalekKeyPair::random().unwrap();
     let body = common::wallet_body(app, &token, &kp).await;
     let resp = app
@@ -186,12 +173,12 @@ async fn submit_signed_sends_xlm_on_chain() {
         eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // Two funded wallets: A pays B. A signs the payment CLIENT-SIDE (the server never holds A's
     // key) and relays it through submit-signed.
-    let (wallet_a, addr_a, kp_a, token_a) = create_funded_wallet(&app).await;
-    let (_wallet_b, addr_b, _kp_b, _token_b) = create_funded_wallet(&app).await;
+    let (wallet_a, addr_a, kp_a, token_a) = create_funded_wallet(&app, &state).await;
+    let (_wallet_b, addr_b, _kp_b, _token_b) = create_funded_wallet(&app, &state).await;
 
     // Build + sign a 1 XLM payment locally, using signing-info for the sequence number.
     let seq = sequence_with_retry("https://horizon-testnet.stellar.org", &addr_a).await;
@@ -309,13 +296,13 @@ async fn submit_signed_enforces_withdrawal_allowlist() {
         eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL");
         return;
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     // A pays B, but B is never whitelisted — a third wallet C seeds the allowlist so enabling it
     // doesn't require B to already be on the list (that would defeat the point of the test).
-    let (wallet_a, addr_a, kp_a, token_a) = create_funded_wallet(&app).await;
-    let (_wallet_b, addr_b, _kp_b, _token_b) = create_funded_wallet(&app).await;
-    let (_wallet_c, addr_c, _kp_c, _token_c) = create_funded_wallet(&app).await;
+    let (wallet_a, addr_a, kp_a, token_a) = create_funded_wallet(&app, &state).await;
+    let (_wallet_b, addr_b, _kp_b, _token_b) = create_funded_wallet(&app, &state).await;
+    let (_wallet_c, addr_c, _kp_c, _token_c) = create_funded_wallet(&app, &state).await;
 
     enable_allowlist(&app, &wallet_a, &token_a, &addr_c).await;
 
@@ -458,7 +445,7 @@ async fn sponsored_webhook_fires_on_confirmation() {
     let app = build_router(state.clone());
 
     // One user owns both the wallet and its webhook registration throughout.
-    let token = auth_token(&app).await;
+    let token = auth_token(&app, &state).await;
     let kp = DalekKeyPair::random().unwrap();
     let wallet_reg_body = common::wallet_body(&app, &token, &kp).await;
     let resp = app
@@ -574,7 +561,7 @@ async fn payment_link_wrong_asset_deposit_is_recorded_but_not_confirmed() {
     };
     let app = build_router(state.clone());
 
-    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app).await;
+    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app, &state).await;
     // Friendbot's HTTP call returning success doesn't guarantee Horizon has indexed the new
     // account yet for lookups from other calls — settle before anyone tries to pay it.
     sequence_with_retry("https://horizon-testnet.stellar.org", &merchant_g).await;
@@ -727,7 +714,7 @@ async fn payment_link_public_submit_rejects_wrong_asset() {
     };
     let app = build_router(state.clone());
 
-    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app).await;
+    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app, &state).await;
     sequence_with_retry("https://horizon-testnet.stellar.org", &merchant_g).await;
     let resp = app
         .clone()
@@ -817,7 +804,7 @@ async fn payment_link_public_submit_rejects_wrong_destination() {
     };
     let app = build_router(state.clone());
 
-    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app).await;
+    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app, &state).await;
     sequence_with_retry("https://horizon-testnet.stellar.org", &merchant_g).await;
     let resp = app
         .clone()
@@ -885,7 +872,7 @@ async fn payment_link_signing_info_returns_the_requested_payer_account_sequence(
     };
     let app = build_router(state.clone());
 
-    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app).await;
+    let (wallet_id, merchant_g, _kp, token) = create_funded_wallet(&app, &state).await;
     sequence_with_retry("https://horizon-testnet.stellar.org", &merchant_g).await;
     let resp = app
         .clone()

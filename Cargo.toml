@@ -5,6 +5,7 @@ members = [
     "crates/wallet-core",
     "crates/store",
     "crates/webhooks",
+    "crates/email",
     "crates/ingest",
     "crates/api",
     "crates/resilience",
@@ -68,6 +69,7 @@ octo-crypto = { path = "crates/crypto" }
 octo-wallet-core = { path = "crates/wallet-core" }
 octo-store = { path = "crates/store" }
 octo-webhooks = { path = "crates/webhooks" }
+octo-email = { path = "crates/email" }
 octo-ingest = { path = "crates/ingest" }
 octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
