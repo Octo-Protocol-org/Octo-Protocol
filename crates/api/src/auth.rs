@@ -93,6 +93,12 @@ const OTP_TTL_MINUTES: i64 = 10;
 pub struct UserView {
     pub id: Uuid,
     pub email: String,
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateUsernameRequest {
+    pub username: Option<String>,
 }
 
 /// JWT claims.
@@ -252,6 +258,7 @@ pub async fn verify_email(
         user: UserView {
             id: user.id,
             email: user.email,
+            username: user.username,
         },
     }))
 }
@@ -354,6 +361,7 @@ pub async fn login(
             user: UserView {
                 id: user.id,
                 email: user.email,
+                username: user.username,
             },
         })
         .map_err(|_| ApiError::Internal)?,
@@ -416,6 +424,7 @@ pub async fn refresh(
         user: UserView {
             id: user.id,
             email: user.email,
+            username: user.username,
         },
     }))
 }
@@ -435,6 +444,35 @@ pub async fn me(
     Ok(Envelope::ok(UserView {
         id: user.id,
         email: user.email,
+        username: user.username,
+    }))
+}
+
+/// `PATCH /v1/auth/me` — set the authenticated user's display username.
+pub async fn update_username(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<UserView>>> {
+    let user_id = authenticate(&headers, &state).await?;
+    let req: UpdateUsernameRequest = parse_optional(&body)?;
+    let username = validate_username(req.username)?;
+
+    let user = state
+        .store()
+        .update_username(user_id, &username)
+        .await
+        .map_err(|e| match e {
+            octo_store::StoreError::Conflict => {
+                ApiError::BadRequest("username already taken".into())
+            }
+            _ => ApiError::Internal,
+        })?;
+
+    Ok(Envelope::ok(UserView {
+        id: user.id,
+        email: user.email,
+        username: user.username,
     }))
 }
 
@@ -499,6 +537,29 @@ fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
         .filter(|p| p.len() >= 8)
         .ok_or_else(|| ApiError::BadRequest("password must be at least 8 characters".into()))?;
     Ok((email, password))
+}
+
+/// 3–20 chars, ASCII letters/digits/underscore/hyphen only. Case is preserved for display;
+/// uniqueness is enforced case-insensitively by `users_username_unique_idx`.
+fn validate_username(input: Option<String>) -> Result<String, ApiError> {
+    let username = input
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("username is required".into()))?;
+    if username.len() < 3 || username.len() > 20 {
+        return Err(ApiError::BadRequest(
+            "username must be 3-20 characters".into(),
+        ));
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ApiError::BadRequest(
+            "username may only contain letters, numbers, underscores, and hyphens".into(),
+        ));
+    }
+    Ok(username)
 }
 
 fn hash_password(password: &str) -> Result<String, ApiError> {

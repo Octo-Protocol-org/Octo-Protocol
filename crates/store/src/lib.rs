@@ -114,6 +114,19 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
+    /// Set a user's display username. Returns [`StoreError::Conflict`] if another user already
+    /// has it (compared case-insensitively, per the `users_username_unique_idx` index).
+    pub async fn update_username(&self, user_id: Uuid, username: &str) -> Result<User, StoreError> {
+        sqlx::query_as::<_, User>(
+            "UPDATE users SET username = $2, updated_at = now() WHERE id = $1 RETURNING *",
+        )
+        .bind(user_id)
+        .bind(username)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from_sqlx_conflict)
+    }
+
     /// Delete a user outright. Only safe pre-verification — used to roll back a signup whose
     /// OTP email never went out, so the email isn't stuck as "already registered" forever.
     pub async fn delete_unverified_user(&self, user_id: Uuid) -> Result<(), StoreError> {
