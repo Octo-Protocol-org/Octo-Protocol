@@ -105,6 +105,8 @@ pub struct Withdrawal {
 pub struct User {
     pub id: Uuid,
     pub email: String,
+    /// Optional display name, set by the user. Null until they choose one.
+    pub username: Option<String>,
     /// argon2id PHC hash — never returned to clients.
     pub password_hash: String,
     /// Null until the signup/login OTP is verified.
