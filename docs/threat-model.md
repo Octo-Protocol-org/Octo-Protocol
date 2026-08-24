@@ -80,6 +80,9 @@ responsible for the largest share of real-world crypto theft.
 | Spoofed asset / fake token deposit | Credit only **whitelisted assets** (issuer + code must match an enabled asset); ignore unknown trustlines/tokens | 8, later (asset mgmt) |
 | Claimable-balance side-channel | Treat claimable balances explicitly; do not credit until claimed into the master under our control | 8 (documented), later |
 | Dust / griefing to inflate accounting | Minimum-amount thresholds; amounts stored as exact integers (stroops), never floats | 8 |
+| **EVM deposit credited, then reorged away** (deposit-reorg-withdraw class) | Stellar has instant finality (row above); EVM blocks reorg. An EVM deposit is recorded `pending`/`detected`, **not** `confirmed`, and every balance/aggregate query (`sum_deposits_for_address[es]`) filters on `status = 'confirmed'` — so it is invisible to a withdrawal check until the confirmation tracker promotes it at `wallets.confirmation_depth`. **Can a deposit already withdrawn against be reorged away?** No: withdrawal eligibility is gated on the same `status = 'confirmed'` a reorg reversal (`Store::orphan_evm_deposits_from_block`) also targets, and confirmed means depth confirmations already elapsed — the depth **is** the boundary that makes "credited but not yet irreversible" a zero-width window in practice, for whatever depth an operator configures for that chain. A reorg deeper than the configured depth is a real residual risk (see below), traded off against latency | #222 |
+| **Same-height, different-hash EVM reorg** a number-only cursor can't see | The confirmation tracker stores `(block_number, block_hash)` per verified block (`evm_block_headers`) and re-checks the cursor height's on-chain hash every tick before trusting it further — a divergence there (or mid-walk) triggers a bounded backward search for the last common ancestor, not a number comparison alone | #222 |
+| Unbounded rewind against a malicious/misbehaving RPC (DoS) | The backward search for a common ancestor is capped at `wallets.reorg_rewind_bound` (operator-set per wallet, suggested `≥ 2× confirmation_depth`); hitting the bound without finding an ancestor **alerts** (`tracing::error!`, `TickOutcome::DeepReorgAlert`) and leaves state untouched rather than looping or guessing | #222 |
 
 ### D. Outbound transfer attacks
 > Since the cutover these are largely enforced **by Stellar itself**, not by octo — the client
@@ -157,5 +160,18 @@ responsible for the largest share of real-world crypto theft.
   engine exists. That engine inherits everything above plus a live-spending key, not just a
   derivation key — treat it as a materially bigger threat surface when it's built, not an
   incremental extension of this one.
+- **Confirmation depth is a latency/safety trade-off the operator makes per wallet, not a
+  built-in constant.** `wallets.confirmation_depth` is set at wallet-provisioning time (see
+  `docs/deposit-model.md`'s "Confirmation depth and reorg handling" section for the reasoning per
+  chain). A depth configured too shallow for a given chain's actual reorg risk (e.g. an L2 during
+  a sequencer failover) is a real residual risk this system does not auto-detect — it is an
+  operational configuration decision, reviewed when onboarding a new chain, not a code guarantee.
+- **The reorg detector's own history has a finite window.** `evm_block_headers` is pruned to
+  roughly `reorg_rewind_bound` blocks behind the cursor. A reorg whose common ancestor lies
+  outside that window cannot be distinguished from "we truly don't know" — both alert
+  (`TickOutcome::DeepReorgAlert`) rather than silently doing the wrong thing, but recovering from
+  one requires operator intervention (manually resetting the wallet's `ingest_cursor`/
+  `evm_block_headers` state after confirming the true canonical chain out-of-band), not an
+  automated path.
 
 > If you add a feature, add its row(s) above and the test that proves the defense.

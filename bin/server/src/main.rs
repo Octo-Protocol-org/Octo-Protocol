@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use octo_api::{build_router, AppState};
 use octo_email::EmailSender;
+use octo_ingest::confirmation::EvmSupervisor;
 use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
 use octo_store::Store;
@@ -89,6 +90,30 @@ async fn main() -> Result<()> {
         "deposit ingest supervisor started"
     );
 
+    // EVM confirmation tracker (background task) — only runs when an RPC endpoint is
+    // configured. Not every deployment has EVM wallets yet, and there is no sane default RPC
+    // URL to fall back to (unlike Horizon, which has a public testnet endpoint).
+    if let Some(evm_rpc_url) = cfg.evm_rpc_url.clone() {
+        let evm_supervisor = EvmSupervisor::new_with_resilience(
+            store.clone(),
+            evm_rpc_url,
+            WebhookSender::new(store.clone()),
+            cfg.network.as_str(),
+            cfg.resilience.retry_policy(),
+            cfg.resilience.circuit_breaker(),
+        );
+        let interval = Duration::from_secs(cfg.evm_confirmation_interval_secs);
+        tokio::spawn(async move {
+            evm_supervisor.run(interval).await;
+        });
+        tracing::info!(
+            interval_secs = cfg.evm_confirmation_interval_secs,
+            "evm confirmation tracker started"
+        );
+    } else {
+        tracing::info!("EVM_RPC_URL not set; evm confirmation tracker not started");
+    }
+
     // REST API.
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
@@ -134,6 +159,10 @@ struct Config {
     bind_addr: String,
     ingest_interval_secs: u64,
     ingest_page_limit: u32,
+    /// JSON-RPC endpoint for the EVM confirmation tracker. Optional: unset means no EVM wallets
+    /// are in use yet, and the tracker simply doesn't start (see `docs/deposit-model.md`).
+    evm_rpc_url: Option<String>,
+    evm_confirmation_interval_secs: u64,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -203,6 +232,12 @@ impl Config {
 
         let resilience = ResilienceConfig::from_env();
 
+        let evm_rpc_url = std::env::var("EVM_RPC_URL").ok();
+        let evm_confirmation_interval_secs = std::env::var("EVM_CONFIRMATION_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15);
+
         Ok(Config {
             database_url,
             network,
@@ -217,6 +252,8 @@ impl Config {
             bind_addr,
             ingest_interval_secs,
             ingest_page_limit,
+            evm_rpc_url,
+            evm_confirmation_interval_secs,
             resilience,
         })
     }

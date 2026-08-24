@@ -8,8 +8,8 @@
 //! green). If a URL is found but the DB is unreachable, the test fails loudly with the reason.
 
 use octo_store::{
-    NewDeposit, NewEvmWallet, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store,
-    StoreError,
+    NewDeposit, NewEvmDeposit, NewEvmWallet, NewPaymentLink, NewSponsoredTx, NewWallet,
+    NewWithdrawal, Store, StoreError,
 };
 use std::sync::Once;
 use uuid::Uuid;
@@ -119,16 +119,24 @@ async fn allocate_address_increments_atomically() {
 
 /// Create a throwaway EVM wallet with a unique identity address (so tests don't collide).
 async fn fresh_evm_wallet(store: &Store) -> Uuid {
+    fresh_evm_wallet_with_depth(store, 6).await
+}
+
+/// Like [`fresh_evm_wallet`], with an explicit confirmation depth (rewind bound defaults to 2x,
+/// the issue's suggested default) — for tests that exercise confirmation/reorg behavior.
+async fn fresh_evm_wallet_with_depth(store: &Store, confirmation_depth: i32) -> Uuid {
     let identity = format!("0x{:040x}", Uuid::new_v4().as_u128());
     let w = store
         .create_evm_wallet(NewEvmWallet {
             network: "testnet",
-            chain_id: "eip155:11155111",
+            chain_id: "eip155:31337", // anvil's default chain id
             identity_address: &identity,
             sealed_ciphertext: b"ciphertext",
             sealed_nonce: b"nonce12bytes",
             sealed_salt: b"saltsaltsaltsalt",
             sealed_scheme: 1,
+            confirmation_depth,
+            reorg_rewind_bound: confirmation_depth * 2,
             label: Some("test-evm"),
             user_id: None,
             description: None,
@@ -334,6 +342,52 @@ async fn record_deposit_is_idempotent() {
         .await
         .expect("list");
     assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain op");
+}
+
+/// Mirrors `record_deposit_is_idempotent`, but for EVM: dedup on `(evm_tx_hash, log_index)`
+/// rather than the Horizon op id. This is what makes a post-reorg rescan safe — if a
+/// transaction the reorg carried away survives (re-included, same hash, in a later block), the
+/// scanner re-detecting it must not credit it a second time.
+#[tokio::test]
+async fn record_evm_deposit_is_idempotent_on_rescan() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_evm_wallet(&store).await;
+    let evm_tx_hash = format!("0x{}", Uuid::new_v4().simple());
+
+    let dep = NewEvmDeposit {
+        wallet_id,
+        address_id: None,
+        asset_code: "ETH".into(),
+        asset_issuer: None,
+        amount_stroops: 1_000_000,
+        source_account: Some("0xsender".into()),
+        destination_account: Some("0xreceiver".into()),
+        evm_tx_hash: evm_tx_hash.clone(),
+        log_index: 0,
+        block_number: 100,
+        block_hash: "0xblock100".into(),
+    };
+
+    // First detection records it — pending/detected, not yet spendable.
+    let first = store.record_evm_deposit(&dep).await.expect("first");
+    assert_eq!(
+        first.expect("first detection must be recorded").status,
+        "pending"
+    );
+
+    // A rescan re-detecting the SAME (evm_tx_hash, log_index) must be a no-op, never a second
+    // credit — regardless of whether the row it collides with is detected/confirming/orphaned.
+    let second = store.record_evm_deposit(&dep).await.expect("second");
+    assert!(
+        second.is_none(),
+        "rescanning an already-recorded transaction must not double-credit it"
+    );
+
+    let txs = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .expect("list");
+    assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain deposit");
 }
 
 #[tokio::test]
@@ -1040,13 +1094,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0022.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-        "expected exactly the twenty-one known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+        "expected exactly the twenty-two known migrations to be recorded as applied"
     );
 }
 
