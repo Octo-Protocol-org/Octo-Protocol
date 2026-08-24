@@ -35,6 +35,15 @@ pub struct Wallet {
     pub custody: String,
     pub encrypted_backup: Option<String>,
     pub gas_tank_account_g: Option<String>,
+    /// `"stellar"` or `"evm"` (see `migrations/0021_evm_deposit_addresses.sql`). Determines which
+    /// half of `Store::allocate_address` / `allocate_evm_address` this wallet uses.
+    pub chain_kind: String,
+    /// CAIP-2 chain id (e.g. `"eip155:11155111"`). `None` for Stellar wallets; always `Some` for
+    /// `chain_kind == "evm"` (enforced by `wallets_evm_has_chain_id`).
+    pub chain_id: Option<String>,
+    /// Next non-hardened BIP-44 index to hand out at `m/44'/60'/0'/0/{index}`. The EVM analogue
+    /// of `next_muxed_id`; meaningless for Stellar wallets.
+    pub next_derivation_index: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -44,15 +53,35 @@ impl Wallet {
     pub fn is_client_custody(&self) -> bool {
         self.custody == "client"
     }
+
+    /// True for an EVM (HD-derived-EOA) wallet, false for Stellar (muxed-address) wallets.
+    pub fn is_evm(&self) -> bool {
+        self.chain_kind == "evm"
+    }
 }
 
 /// A per-customer deposit address (off-chain row).
+///
+/// Exactly one of the two shapes below is populated, never both and never neither — enforced by
+/// the `addresses_chain_shape` CHECK constraint:
+/// - Stellar: `muxed_id` + `muxed_address` (see `docs/deposit-model.md`'s muxed model).
+/// - EVM: `derivation_index` + `evm_address` (+ generated `evm_address_lower`) — a real HD-derived
+///   EOA (see `docs/deposit-model.md`'s EVM model).
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Address {
     pub id: Uuid,
     pub wallet_id: Uuid,
-    pub muxed_id: i64,
-    pub muxed_address: String,
+    pub muxed_id: Option<i64>,
+    pub muxed_address: Option<String>,
+    /// BIP-44 non-hardened index (`0..=2^31-1`) this address was derived at. `None` for Stellar
+    /// rows. Stored (not just the address) so the address is re-derivable from seed + index alone
+    /// for disaster recovery.
+    pub derivation_index: Option<i64>,
+    /// EIP-55 checksummed form, for display. `None` for Stellar rows.
+    pub evm_address: Option<String>,
+    /// Lowercased form of `evm_address` — a generated column, so it can never drift. Lookups key
+    /// off this, not `evm_address`, so a client sending any casing still resolves to this row.
+    pub evm_address_lower: Option<String>,
     pub customer_ref: Option<String>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
