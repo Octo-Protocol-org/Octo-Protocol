@@ -65,8 +65,14 @@ decrypt. Consequently:
 ## Addresses
 
 - `POST /v1/wallets/{id}/addresses` — generate a dedicated customer address.
-  Returns `muxed_address` (`M...`) **and** the `{ base_address, memo_id }` fallback.
 - `GET  /v1/wallets/{id}/addresses` — list addresses (paginated).
+
+Response shape depends on the wallet's chain (`chain_kind` is always present so a client can
+branch without inspecting which optional fields exist — see `docs/deposit-model.md`):
+
+- **Stellar**: `muxed_address` (`M...`) **and** the `{ base_address, memo_id }` fallback.
+- **EVM**: a single `address` (EIP-55 checksummed). `memo_id` is **omitted entirely**, not
+  `null` — EVM has nowhere for a memo to go, so there is nothing to send one to.
 
 ## Gas sponsorship
 

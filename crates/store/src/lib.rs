@@ -50,6 +50,30 @@ pub struct NewWallet<'a> {
     pub description: Option<&'a str>,
 }
 
+/// Parameters for creating an EVM HD wallet (see `migrations/0021_evm_deposit_addresses.sql`).
+///
+/// Always server-custody: deriving (and later sweeping) customer deposit addresses requires the
+/// sealed HD seed to live on this row — see `docs/threat-model.md` for the exception this is to
+/// octo's normal non-custodial posture.
+pub struct NewEvmWallet<'a> {
+    pub network: &'a str,
+    /// CAIP-2 chain id, e.g. `"eip155:11155111"`.
+    pub chain_id: &'a str,
+    /// The wallet's own identity address (`m/44'/60'/0'/1/0`) — reuses the `stellar_account_g`
+    /// column's existing NOT NULL + UNIQUE constraints as a chain-agnostic "wallet identity"
+    /// slot. Never a customer deposit address (those come only from the `0` branch). A proper
+    /// rename belongs to a full multi-chain schema migration; see `docs/deposit-model.md`.
+    pub identity_address: &'a str,
+    pub sealed_ciphertext: &'a [u8],
+    pub sealed_nonce: &'a [u8],
+    pub sealed_salt: &'a [u8],
+    /// Scheme version tag for the sealed seed. Use `octo_crypto::SCHEME_V1`.
+    pub sealed_scheme: i16,
+    pub label: Option<&'a str>,
+    pub user_id: Option<Uuid>,
+    pub description: Option<&'a str>,
+}
+
 /// Parameters for creating a non-custodial (client-custody) wallet: the client generated the
 /// keypair and sends only the public account plus an opaque password-encrypted backup blob the
 /// server cannot decrypt.
@@ -360,6 +384,33 @@ impl Store {
         )
         .bind(new.network)
         .bind(new.stellar_account_g)
+        .bind(new.sealed_ciphertext)
+        .bind(new.sealed_nonce)
+        .bind(new.sealed_salt)
+        .bind(new.sealed_scheme)
+        .bind(new.label)
+        .bind(new.user_id)
+        .bind(new.description)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from_sqlx_conflict)
+    }
+
+    /// Create a server-custody EVM HD wallet. See [`NewEvmWallet`] for why this is always
+    /// server-custody.
+    pub async fn create_evm_wallet(&self, new: NewEvmWallet<'_>) -> Result<Wallet, StoreError> {
+        sqlx::query_as::<_, Wallet>(
+            r#"
+            INSERT INTO wallets
+                (network, stellar_account_g, chain_kind, chain_id, sealed_ciphertext,
+                 sealed_nonce, sealed_salt, sealed_scheme, label, user_id, description, custody)
+            VALUES ($1, $2, 'evm', $3, $4, $5, $6, $7, $8, $9, $10, 'server')
+            RETURNING *
+            "#,
+        )
+        .bind(new.network)
+        .bind(new.identity_address)
+        .bind(new.chain_id)
         .bind(new.sealed_ciphertext)
         .bind(new.sealed_nonce)
         .bind(new.sealed_salt)
@@ -702,6 +753,73 @@ impl Store {
         Ok(address)
     }
 
+    /// Atomically allocate the next BIP-44 derivation index for an EVM `wallet_id` and insert the
+    /// address row.
+    ///
+    /// Mirrors [`allocate_address`](Self::allocate_address) exactly — same transaction + row-lock
+    /// pattern, bumping `next_derivation_index` instead of `next_muxed_id` — so two concurrent
+    /// callers always get distinct indexes and never collide. `evm_address_for` receives the
+    /// index and returns the EIP-55 checksummed address (e.g. via `octo_evm_core`); the
+    /// lowercased lookup form is derived by the database, not passed in, so it can never drift.
+    pub async fn allocate_evm_address(
+        &self,
+        wallet_id: Uuid,
+        evm_address_for: impl FnOnce(u32) -> Result<String, ()>,
+        customer_ref: Option<&str>,
+        metadata: serde_json::Value,
+    ) -> Result<Address, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Lock the wallet row and read+bump the counter.
+        let next_index: i64 = sqlx::query_scalar(
+            "SELECT next_derivation_index FROM wallets WHERE id = $1 FOR UPDATE",
+        )
+        .bind(wallet_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+        // BIP-44's non-hardened index level is bounded at 2^31 - 1; the schema CHECK on
+        // addresses.derivation_index enforces the same bound, but we surface a specific error
+        // here rather than letting an out-of-range wallet fail obscurely on the INSERT. (Store
+        // deliberately does not depend on octo-evm-core — same separation as the Stellar path,
+        // which never depends on octo-wallet-core — so this bound is restated, not imported.)
+        const MAX_NON_HARDENED_INDEX: u32 = 0x7fff_ffff;
+        let index_u32 = u32::try_from(next_index)
+            .ok()
+            .filter(|&i| i <= MAX_NON_HARDENED_INDEX)
+            .ok_or(StoreError::DerivationIndexExhausted)?;
+
+        sqlx::query(
+            "UPDATE wallets SET next_derivation_index = next_derivation_index + 1, \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(wallet_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let evm_address = evm_address_for(index_u32).map_err(|_| StoreError::NotFound)?;
+
+        let address = sqlx::query_as::<_, Address>(
+            r#"
+            INSERT INTO addresses (wallet_id, derivation_index, evm_address, customer_ref, metadata)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(next_index)
+        .bind(&evm_address)
+        .bind(customer_ref)
+        .bind(metadata)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::from_sqlx_conflict)?;
+
+        tx.commit().await?;
+        Ok(address)
+    }
+
     /// List addresses for a wallet (most recent first), with optional cursor-based pagination.
     pub async fn list_addresses(
         &self,
@@ -775,6 +893,22 @@ impl Store {
         )
         .bind(wallet_id)
         .bind(muxed_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Find the address for a given EVM address, matching case-insensitively (the caller may
+    /// send any casing — lowercase, uppercase, or EIP-55 checksummed — and all resolve to the
+    /// same row via the `evm_address_lower` generated column).
+    pub async fn address_by_evm_address(
+        &self,
+        address: &str,
+    ) -> Result<Option<Address>, StoreError> {
+        let row = sqlx::query_as::<_, Address>(
+            "SELECT * FROM addresses WHERE evm_address_lower = lower($1)",
+        )
+        .bind(address)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
