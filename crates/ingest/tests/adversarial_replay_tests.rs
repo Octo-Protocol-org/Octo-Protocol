@@ -69,7 +69,24 @@ fn database_url() -> Option<String> {
     std::env::var("DATABASE_URL").ok()
 }
 
-const BASE: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
+/// A fresh, syntactically-valid `G...` base account, distinct on every call.
+///
+/// Every wallet in this harness needs its own real base account rather than sharing one fixed
+/// constant: `octo_store`'s multi-chain schema (#214) now enforces `UNIQUE(chain_id,
+/// deposit_address)` across *all* wallets on a chain (previously only `UNIQUE(wallet_id,
+/// muxed_id)` was enforced), and `encode_muxed(base, id)` is a pure function of the base account —
+/// two wallets sharing one base account would derive identical muxed addresses for the same id
+/// and collide against that constraint, which is exactly the on-chain reality this schema now
+/// models correctly (two real Stellar accounts never share a base key).
+///
+/// The bytes don't need to correspond to a real keypair — `stellar_strkey` only checks the
+/// checksum/format, which is all `encode_muxed`'s decode step verifies.
+fn fresh_base_account() -> String {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    format!("{}", stellar_strkey::ed25519::PublicKey(bytes))
+}
 
 /// Number of randomized property-test cases to run. Each case does several real Postgres
 /// round-trips, so this is kept modest by default to keep normal CI fast. Override with
@@ -84,10 +101,11 @@ fn fuzz_case_count() -> u32 {
 
 /// A fresh wallet + `Ingestor` targeting it, isolated per test case so cases never interact.
 async fn fresh_ingestor(store: &Store) -> (Ingestor, Uuid) {
+    let base_account = fresh_base_account();
     let wallet = store
         .create_wallet(NewWallet {
             network: "testnet",
-            stellar_account_g: &format!("{BASE}-{}", Uuid::new_v4().simple()),
+            stellar_account_g: &base_account,
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
@@ -98,7 +116,7 @@ async fn fresh_ingestor(store: &Store) -> (Ingestor, Uuid) {
         })
         .await
         .expect("create wallet");
-    let ingestor = Ingestor::new(store.clone(), "http://unused", wallet.id, BASE.to_string());
+    let ingestor = Ingestor::new(store.clone(), "http://unused", wallet.id, base_account);
     (ingestor, wallet.id)
 }
 
@@ -107,12 +125,17 @@ async fn fresh_ingestor(store: &Store) -> (Ingestor, Uuid) {
 /// verify not just presence but *which* record ended up recorded (catches cross-record
 /// corruption, not just duplicate/missing counts).
 async fn build_pool(store: &Store, wallet_id: Uuid, n: usize) -> Vec<PaymentRecord> {
+    let base_account = store
+        .get_wallet(wallet_id)
+        .await
+        .expect("get wallet")
+        .stellar_account_g;
     let mut pool = Vec::with_capacity(n);
     for i in 0..n {
         let addr = store
             .allocate_address(
                 wallet_id,
-                |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+                |id| encode_muxed(&base_account, id as u64).map_err(|_| ()),
                 Some(&format!("cust-{i}")),
                 serde_json::json!({}),
             )
@@ -126,7 +149,7 @@ async fn build_pool(store: &Store, wallet_id: Uuid, n: usize) -> Vec<PaymentReco
             transaction_hash: Some(format!("hash-{wallet_id}-{i}")),
             transaction_successful: true,
             from: Some("Gsender".into()),
-            to: Some(BASE.into()),
+            to: Some(base_account.clone()),
             to_muxed: Some(addr.muxed_address.clone()),
             to_muxed_id: None,
             asset_type: Some("native".into()),

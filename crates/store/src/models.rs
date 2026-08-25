@@ -21,6 +21,11 @@ use uuid::Uuid;
 pub struct Wallet {
     pub id: Uuid,
     pub network: String,
+    /// CAIP-2-shaped chain slug (see `migrations/0021_chains_registry.sql`), e.g.
+    /// `stellar:pubnet`. Derived from `network` at write time until every caller passes a chain id
+    /// directly (see `octo_store::stellar_chain_id_for_network`); kept in lockstep with `network`
+    /// by every `Store` write path, so the two never disagree in practice.
+    pub chain_id: String,
     pub stellar_account_g: String,
     pub sealed_ciphertext: Option<Vec<u8>>,
     pub sealed_nonce: Option<Vec<u8>>,
@@ -51,8 +56,18 @@ impl Wallet {
 pub struct Address {
     pub id: Uuid,
     pub wallet_id: Uuid,
+    /// CAIP-2-shaped chain slug; always equal to the parent wallet's `chain_id`.
+    pub chain_id: String,
     pub muxed_id: i64,
     pub muxed_address: String,
+    /// Generic on-chain deposit address, unique within `chain_id`
+    /// (`uq_addresses_chain_deposit`). Mirrors `muxed_address` for Stellar rows; for a future EVM
+    /// adapter this is the actual HD-derived `0x...` address.
+    pub deposit_address: String,
+    /// BIP-44-style HD derivation index, for chains (EVM) that derive one address per index.
+    /// Always `None` for Stellar, which routes by `muxed_id` instead — that's an off-chain id,
+    /// not a key-derivation index.
+    pub derivation_index: Option<i64>,
     pub customer_ref: Option<String>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
@@ -63,6 +78,8 @@ pub struct Address {
 pub struct Transaction {
     pub id: Uuid,
     pub wallet_id: Uuid,
+    /// CAIP-2-shaped chain slug; always equal to the parent wallet's `chain_id`.
+    pub chain_id: String,
     pub address_id: Option<Uuid>,
     pub direction: String,
     pub asset_code: String,
@@ -71,6 +88,11 @@ pub struct Transaction {
     pub source_account: Option<String>,
     pub destination_account: Option<String>,
     pub stellar_tx_hash: Option<String>,
+    /// Generic on-chain tx hash, mirroring `stellar_tx_hash`. Together with `chain_id` and
+    /// `operation_index` this is the anti-double-credit dedup key (`uq_tx_onchain_chain`).
+    pub tx_hash: Option<String>,
+    /// Operation index within the transaction (Stellar) or log index within the tx receipt
+    /// (EVM) — the concept generalizes without needing a new column.
     pub operation_index: Option<i32>,
     pub horizon_op_id: Option<String>,
     pub ledger: Option<i64>,
