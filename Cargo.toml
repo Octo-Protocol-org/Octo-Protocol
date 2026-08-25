@@ -9,6 +9,7 @@ members = [
     "crates/ingest",
     "crates/api",
     "crates/resilience",
+    "crates/evm-core",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
@@ -39,6 +40,17 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 base64 = "0.22"
 argon2 = "0.5"
+# --- EVM / secp256k1 ---
+# k256 gives us constant-time scalar/point arithmetic and ECDSA (incl. recoverable signing +
+# low-s normalisation) for BIP-32 derivation and transaction signing. sha3 gives Keccak-256 for
+# EIP-55 addressing. subtle gives explicit constant-time comparisons for secret scalars. See the
+# ADR in docs/architecture.md for why this is preferred over alloy-primitives / coins-bip32.
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
+sha3 = "0.10"
+subtle = "2.6"
+# Test-only: decodes the official BIP-32 spec's base58check xprv test vectors in
+# crates/evm-core/src/derive.rs so the expected bytes come from the spec text, not transcription.
+bs58 = { version = "0.5", features = ["check"] }
 # Note: the MSRV-aware resolver (.cargo/config.toml: incompatible-rust-versions = "fallback")
 # keeps the whole tree on Rust-1.84-compatible versions, so no manual transitive pins are needed.
 
@@ -73,6 +85,7 @@ octo-email = { path = "crates/email" }
 octo-ingest = { path = "crates/ingest" }
 octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
+octo-evm-core = { path = "crates/evm-core" }
 
 [profile.release]
 lto = "thin"
