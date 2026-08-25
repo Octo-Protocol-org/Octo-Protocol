@@ -1,0 +1,39 @@
+# Worked multi-chain configuration example. Copy to `octo.chains.toml` (or point
+# CHAIN_CONFIG_PATH at a copy of this file) to use it instead of the legacy flat
+# NETWORK/HORIZON_URL/FRIENDBOT_URL env vars. See .env.example and
+# docs/architecture.md's "Per-chain configuration" section for the full precedence rules.
+#
+# `rpc_url` below is safe to commit as a placeholder — the real value for a chain that carries
+# secrets should come from the OCTO_CHAIN_<CHAIN_ID>_RPC_URL env var override at deploy time, not
+# be checked into this file.
+
+[[chains]]
+chain_id = "stellar:testnet"
+kind = "stellar"
+rpc_url = "https://horizon-testnet.stellar.org"
+enabled = true
+confirmation_depth = 1
+poll_interval_secs = 5
+faucet_url = "https://friendbot.stellar.org"
+
+[chains.retry]
+max_attempts = 3
+base_delay_ms = 200
+max_delay_ms = 5000
+
+[chains.circuit]
+failure_threshold = 5
+reset_timeout_secs = 30
+
+# A second chain, disabled — illustrates the shape for a chain not yet live (e.g. a local
+# quickstart node used in CI, switched on only when needed). This issue does not add EVM support
+# (no adapter exists yet for `kind = "stellar"`'s siblings), so this entry stays a Stellar-kind
+# placeholder rather than a fabricated working EVM chain. Once an EVM ChainKind and adapter exist,
+# a real Base/Arbitrum entry looks like this but with kind = "evm".
+[[chains]]
+chain_id = "stellar:standalone"
+kind = "stellar"
+rpc_url = "http://localhost:8000"
+enabled = false
+confirmation_depth = 1
+poll_interval_secs = 5

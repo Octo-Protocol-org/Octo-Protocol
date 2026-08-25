@@ -77,3 +77,45 @@ server, and it is confined to one crate:
 
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
+
+## Deployment: per-chain configuration
+
+`bin/server` resolves its chain set into a `ChainRegistry` (`octo-api::chain_registry`) at
+startup — one entry per configured chain, each with its own RPC endpoint, confirmation depth,
+poll interval, and resilience state (`RetryPolicy` + `CircuitBreaker`). This is what makes a
+degraded RPC on one chain unable to open another chain's circuit breaker: each chain's breaker is
+a distinct instance, never a shared process-global one.
+
+Configuration precedence, resolved by `bin/server`'s `load_chain_config`:
+
+1. **`CHAIN_CONFIG_PATH`**, if set, must name an existing TOML file — see
+   [`octo.chains.example.toml`](../octo.chains.example.toml) for a worked example with two
+   `[[chains]]` entries (one enabled Stellar testnet chain, one disabled placeholder). A path
+   that doesn't exist aborts boot rather than silently falling back.
+2. Else, `./octo.chains.toml` in the working directory, if present.
+3. Else, the legacy flat env vars (`NETWORK`, `HORIZON_URL`, `FRIENDBOT_URL`, `HORIZON_*`) build
+   a single implicit Stellar chain — today's single-chain deployments keep working unmodified.
+
+Whichever source wins, each configured chain's `rpc_url` can additionally be overridden by
+`OCTO_CHAIN_<CHAIN_ID>_RPC_URL` (chain id upper-cased, non-alphanumeric characters replaced with
+`_`) — the one field most likely to carry a secret (Alchemy/Infura-style API keys) and most
+likely to differ per deploy environment.
+
+**Fail fast at startup.** After the registry is built, every *enabled* chain's RPC is probed with
+a short-timeout liveness check (`ChainRegistry::probe_liveness`); a bad endpoint aborts boot with
+a clear message instead of surfacing lazily on the first customer deposit. The probe's error path
+deliberately never includes the raw RPC URL or the underlying transport error's `Display` — both
+can embed the request URL, defeating the redaction below.
+
+**RPC URLs are redacted everywhere they might be logged.** `ChainConfig::rpc_url` is a
+`RedactedUrl`: its `Debug`/`Display` show only `scheme://host/***`, stripping path, query, and
+userinfo (where provider API keys live). Reaching the real value requires the deliberate
+`.expose_secret()` call used only where a request is actually made. `GET /health/chains` reports
+per-chain reachability (last successful ingest poll, derived from each chain's own poll loop) and
+never includes `rpc_url` at all.
+
+This registry is deliberately lightweight — config, a Horizon client for Stellar-kind chains, and
+resilience/poll-health state, not a trait-based chain-adapter abstraction. A more general
+trait-based registry (chain-agnostic address validation, deposit derivation, EVM adapters, ...)
+is expected to supersede or wrap it later without disturbing the config/validation/isolation work
+described here.

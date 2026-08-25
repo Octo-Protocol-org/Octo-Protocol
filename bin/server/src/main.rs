@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
+use octo_api::chain_config::{AppConfig, ChainConfig, ChainKind, RedactedUrl};
+use octo_api::chain_registry::ChainRegistry;
 use octo_api::{build_router, AppState};
 use octo_email::EmailSender;
 use octo_ingest::Supervisor;
@@ -13,7 +15,11 @@ use octo_resilience::ResilienceConfig;
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// How long the startup liveness probe waits per chain before treating it as unreachable.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,7 +28,17 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cfg = Config::from_env()?;
-    tracing::info!(network = cfg.network.as_str(), bind = %cfg.bind_addr, "starting octo-server");
+
+    let app_config = load_chain_config(&cfg)?;
+    for chain in &app_config.chains {
+        tracing::info!(
+            chain_id = %chain.chain_id,
+            kind = ?chain.kind,
+            enabled = chain.enabled,
+            rpc_url = ?chain.rpc_url, // redacted Debug impl — never the raw URL.
+            "configured chain"
+        );
+    }
 
     // Database.
     let store = Store::connect(&cfg.database_url)
@@ -31,29 +47,25 @@ async fn main() -> Result<()> {
     store.migrate().await.context("run migrations")?;
     tracing::info!("database connected and migrated");
 
-    // Resilience config (shared between API Horizon client and ingest HorizonPayments client).
-    let resilience = cfg.resilience.clone();
-    tracing::info!(
-        max_attempts = resilience.max_attempts,
-        base_delay_ms = resilience.base_delay_ms,
-        max_delay_ms = resilience.max_delay_ms,
-        cb_failure_threshold = resilience.cb_failure_threshold,
-        cb_reset_timeout_secs = resilience.cb_reset_timeout_secs,
-        "horizon resilience config"
-    );
+    // Resolve into the runtime registry, then fail fast and loudly if any enabled chain's RPC
+    // doesn't answer — a bad endpoint must abort boot, not surface lazily on the first deposit.
+    let registry = ChainRegistry::new(&app_config).context("build chain registry")?;
+    registry
+        .probe_liveness(LIVENESS_PROBE_TIMEOUT)
+        .await
+        .context("chain liveness probe failed at startup")?;
+    tracing::info!("all enabled chains passed the startup liveness probe");
+    let registry = Arc::new(registry);
 
-    // Shared state (includes the API's Horizon client wired with resilience).
+    // Shared state (includes the API's Horizon client(s), wired with each chain's own
+    // resilience config).
     let email = EmailSender::new(cfg.resend_api_key.clone(), cfg.email_from_address.clone());
-    let mut state = AppState::new_with_resilience(
+    let mut state = AppState::from_chain_registry(
         store.clone(),
         cfg.master_key,
-        cfg.network,
-        cfg.horizon_url.clone(),
-        cfg.friendbot_url.clone(),
+        registry.clone(),
         cfg.public_app_url.clone(),
         email,
-        resilience.retry_policy(),
-        resilience.circuit_breaker(),
     )
     .with_jwt_secret(cfg.jwt_secret.clone());
     // MASTER_KEY_NEXT, when set, activates zero-downtime key rotation: already-migrated rows
@@ -63,31 +75,25 @@ async fn main() -> Result<()> {
         state = state.with_master_key_next(next);
     }
 
-    // Ingest supervisor (background task) — uses its own HorizonPayments client with the same
-    // resilience config (separate circuit-breaker instance so ingest and API failures are counted
-    // independently).
-    let ingest_retry = cfg.resilience.retry_policy();
-    let ingest_circuit = cfg.resilience.circuit_breaker();
-    let supervisor = Supervisor::new_with_resilience(
-        store.clone(),
-        cfg.horizon_url.clone(),
-        WebhookSender::new(store.clone()),
-        cfg.network.as_str(),
-        ingest_retry,
-        ingest_circuit,
-    );
-    tokio::spawn(async move {
-        supervisor
-            .run(
-                Duration::from_secs(cfg.ingest_interval_secs),
-                cfg.ingest_page_limit,
-            )
-            .await;
-    });
-    tracing::info!(
-        interval_secs = cfg.ingest_interval_secs,
-        "deposit ingest supervisor started"
-    );
+    // One ingest supervisor per enabled Stellar-kind chain, each with that chain's OWN retry
+    // policy and circuit breaker — a degraded RPC on one chain must never open another chain's
+    // circuit. (Today there is at most one; the loop is structural so a second Stellar network,
+    // or a future non-Stellar adapter, slots in without changing this shape.)
+    for chain in app_config.chains.iter().filter(|c| c.enabled) {
+        match chain.kind {
+            ChainKind::Stellar => {
+                spawn_stellar_ingest(&registry, &store, chain, cfg.ingest_page_limit)
+            }
+            // `ChainKind` is `#[non_exhaustive]` so this crate compiles unchanged when a future
+            // kind (EVM) is added elsewhere — until an adapter exists for it, an enabled chain of
+            // an unknown kind gets no ingest supervisor, loudly, rather than silently.
+            other => tracing::warn!(
+                chain_id = %chain.chain_id,
+                kind = ?other,
+                "no ingest adapter for this chain kind yet; chain is configured but will not be polled"
+            ),
+        }
+    }
 
     // REST API.
     let app = build_router(state);
@@ -116,6 +122,10 @@ fn init_tracing() {
 /// Server configuration, read from environment variables.
 struct Config {
     database_url: String,
+    /// Path to a `[[chains]]` TOML file (see [`load_chain_config`]). `None` means no file was
+    /// found and the legacy flat env vars below (`network`/`horizon_url`/`friendbot_url`/
+    /// `resilience`) build a single implicit Stellar chain instead.
+    chain_config_path: Option<String>,
     network: StellarNetwork,
     horizon_url: String,
     friendbot_url: Option<String>,
@@ -149,6 +159,25 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Config> {
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+
+        // Precedence: CHAIN_CONFIG_PATH if set (the file MUST exist — a typo'd path is a startup
+        // error, not a silent fallback); else `octo.chains.toml` in the working directory, if
+        // present; else `None`, meaning `main` builds one implicit chain from the legacy env vars
+        // read below (NETWORK/HORIZON_URL/FRIENDBOT_URL/HORIZON_*).
+        let chain_config_path = match std::env::var("CHAIN_CONFIG_PATH") {
+            Ok(path) => {
+                if !std::path::Path::new(&path).is_file() {
+                    anyhow::bail!("CHAIN_CONFIG_PATH={path} does not exist");
+                }
+                Some(path)
+            }
+            Err(_) => {
+                let default_path = "octo.chains.toml";
+                std::path::Path::new(default_path)
+                    .is_file()
+                    .then(|| default_path.to_string())
+            }
+        };
 
         let network_str = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
         // Accepted values: "mainnet" | "public", "testnet" | "test", "standalone".
@@ -205,6 +234,7 @@ impl Config {
 
         Ok(Config {
             database_url,
+            chain_config_path,
             network,
             horizon_url,
             friendbot_url,
@@ -220,4 +250,84 @@ impl Config {
             resilience,
         })
     }
+}
+
+/// Resolve the chain configuration: a TOML file if [`Config::chain_config_path`] names one (with
+/// each chain's `rpc_url` overridable via `OCTO_CHAIN_<CHAIN_ID>_RPC_URL`), else a single implicit
+/// Stellar chain built from the legacy flat env vars. Either way the result passes through
+/// [`AppConfig::new`]'s validation (unique/non-empty chain ids, at least one enabled).
+fn load_chain_config(cfg: &Config) -> Result<AppConfig> {
+    let mut app_config = match &cfg.chain_config_path {
+        Some(path) => {
+            let toml_str = std::fs::read_to_string(path)
+                .with_context(|| format!("read chain config file {path}"))?;
+            AppConfig::from_toml_str(&toml_str)
+                .with_context(|| format!("parse chain config file {path}"))?
+        }
+        None => {
+            let chain = ChainConfig {
+                chain_id: cfg.network.as_str().to_string(),
+                kind: ChainKind::Stellar,
+                rpc_url: RedactedUrl::new(cfg.horizon_url.clone()),
+                enabled: true,
+                confirmation_depth: 1,
+                poll_interval: Duration::from_secs(cfg.ingest_interval_secs),
+                retry: cfg.resilience.retry_policy(),
+                circuit: cfg.resilience.circuit_breaker(),
+                faucet_url: cfg.friendbot_url.clone(),
+            };
+            AppConfig::new(vec![chain]).context("build legacy single-chain config")?
+        }
+    };
+    app_config.apply_env_overrides(|key| std::env::var(key).ok());
+    Ok(app_config)
+}
+
+/// Spawn the ingest supervisor loop for one enabled Stellar-kind chain, using that chain's own
+/// `retry`/`circuit` (never a shared process-global one — a degraded RPC on one chain must not
+/// open another chain's breaker) and recording each successful poll into the shared registry so
+/// `/health/chains` can report it.
+fn spawn_stellar_ingest(
+    registry: &Arc<ChainRegistry>,
+    store: &Store,
+    chain: &ChainConfig,
+    page_limit: u32,
+) {
+    let Some(network) = registry.chain_stellar_network(&chain.chain_id) else {
+        tracing::warn!(chain_id = %chain.chain_id, "no resolved Stellar network for chain; skipping ingest");
+        return;
+    };
+    let supervisor = Supervisor::new_with_resilience(
+        store.clone(),
+        chain.rpc_url.expose_secret().to_string(),
+        WebhookSender::new(store.clone()),
+        network.as_str(),
+        chain.retry.clone(),
+        chain.circuit.clone(),
+    );
+    let registry = registry.clone();
+    let chain_id = chain.chain_id.clone();
+    let interval = chain.poll_interval;
+
+    tokio::spawn(async move {
+        loop {
+            match supervisor.tick(page_limit).await {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::debug!(chain_id = %chain_id, processed = n, "ingest poll");
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+                        .unwrap_or(0);
+                    registry.record_chain_poll_success(&chain_id, now);
+                }
+                Err(e) => {
+                    tracing::warn!(chain_id = %chain_id, error = ?e, "ingest supervisor tick failed; will retry")
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+    tracing::info!(chain_id = %chain.chain_id, "deposit ingest supervisor started");
 }
