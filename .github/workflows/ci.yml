@@ -72,3 +72,9 @@ jobs:
       - name: Test
         # --locked: same rationale as Clippy above — fail loudly on lockfile drift.
         run: cargo test --workspace --locked
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: EVM integration tests (Anvil)
+        run: OCTO_EVM_TESTS=1 cargo test -p octo-evm-test-support --locked

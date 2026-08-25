@@ -9,6 +9,7 @@ members = [
     "crates/ingest",
     "crates/api",
     "crates/resilience",
+    "crates/evm-test-support",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
