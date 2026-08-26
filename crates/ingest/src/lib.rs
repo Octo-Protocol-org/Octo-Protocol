@@ -15,6 +15,7 @@
 
 pub mod amount;
 pub mod horizon;
+pub mod evm;
 
 #[cfg(test)]
 mod backfill_tests;

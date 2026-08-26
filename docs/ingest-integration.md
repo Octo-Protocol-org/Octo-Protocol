@@ -409,3 +409,169 @@ but wasteful.
 > confirmation-depth check, a reorg detector, or a `pending → confirmed` state machine), update
 > this document to reflect the new behaviour. The [Known Limitations](#known-limitations) section
 > in particular must be kept honest.
+
+---
+
+## EVM Deposit Detection (ERC-20 Transfer Logs)
+
+> **Added:** Issue #221. **Blocks:** #222 (confirmation/crediting).
+
+### Architecture
+
+The EVM ingest worker (`crates/ingest/src/evm.rs`) mirrors the Stellar `Ingestor`'s shape and
+reliability contract but operates on a fundamentally different data model:
+
+| Dimension | Stellar | EVM |
+|---|---|---|
+| **Scan method** | `Horizon /payments` feed per account | `eth_getLogs` with a block range filter |
+| **Cursor type** | Horizon paging token (opaque string) | Block number (`u64`) |
+| **Customer attribution** | Muxed id embedded in the payment destination | Deposit address registered in `addresses` table |
+| **Dedup key** | `horizon_op_id` (Horizon TOID) | `(chain_id, tx_hash, log_index)` |
+| **Initial status** | `confirmed` (Stellar has instant finality) | `unconfirmed` (EVM has probabilistic finality) |
+
+### What is detected
+
+The EVM worker detects **ERC-20 Transfer events** only. Specifically, it calls `eth_getLogs`
+filtered by:
+
+- **Address list:** all registered token contracts on the chain (from `RegisteredToken`).
+- **Topic 0:** the `Transfer(address,address,uint256)` event signature hash
+  (`0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`).
+
+### Native ETH is out of scope for v1
+
+Native ETH transfers emit **no logs**. They are only detectable by inspecting block transactions
+(`eth_getBlockByNumber`) or via `debug_traceBlock`, which are significantly more expensive than a
+targeted `eth_getLogs` filter — and `debug_traceBlock` is not available on all providers.
+
+**Decision:** For v1, native ETH deposits are **explicitly out of scope**. This is a deliberate,
+documented choice, not a silent omission.
+
+- Operators must communicate to their users that only ERC-20 tokens are accepted at EVM deposit
+  addresses.
+- A customer who sends ETH directly to their deposit address will **not** have it credited.
+- Supporting native ETH is tracked as a future enhancement; the architecture does not prevent it.
+
+### Security: contract address verification
+
+**The single most important invariant in the EVM ingest module:**
+
+Logs are matched on the **emitting contract address** (`log.address`), not on topics alone.
+
+Any contract can emit a `Transfer` event with arbitrary topics — including a deposit address in
+`topics[2]` (the `to` field) and an enormous value in `data`. If the worker attributed transfers
+based on topics alone, an attacker could:
+
+1. Deploy a hostile contract.
+2. Call it, emitting a `Transfer` event with an octo deposit address as `to` and e.g.
+   `2^64 - 1` units as the value.
+3. Receive a credit for that amount, without ever sending any tokens.
+
+The defence is in `EvmIngestor::process_log` (step 1):
+
+```rust
+// Step 1: Verify the log was emitted by a registered token contract.
+let token = self.registered_tokens.iter()
+    .find(|t| t.contract_address.eq_ignore_ascii_case(&log.address));
+
+let token = match token {
+    Some(t) => t,
+    None => return Ok(Processed::Skipped), // not a registered contract → skip
+};
+```
+
+This check happens **before** reading any topic. A log from an unregistered contract is always
+`Skipped`, regardless of what its topics claim.
+
+The adversarial test `fake_transfer_from_unregistered_contract_is_skipped` in
+`crates/ingest/tests/evm_ingest_tests.rs` is the primary regression guard for this property.
+
+### Non-standard ERC-20s: fee-on-transfer and rebasing tokens
+
+Fee-on-transfer tokens (e.g. SafeMoon clones) emit a `Transfer` event with a `value` that is
+**larger than the amount actually received** by the `to` address (a fee is deducted in transit).
+Rebasing tokens (e.g. AMPL) change holders' balances without emitting Transfer events.
+
+**Defence:** The token registry (`RegisteredToken`) is the gate. Only tokens explicitly
+registered are credited. Operators must not register fee-on-transfer or rebasing tokens until
+the crediting layer (#222) has explicit support for them. The `amount_base_units` stored is
+the value from the Transfer event — for registered stablecoins (USDC, USDT, DAI) this is
+accurate. For fee-on-transfer tokens it would overstate the received amount, which is why
+only the registry can admit new tokens.
+
+### Cursor contract
+
+The block-number cursor is stored in `ingest_cursor(wallet_id, chain_id)` and advances
+**after each log is durably processed**, not at the end of a batch. If the process crashes
+mid-range:
+
+1. On restart, `get_evm_cursor` returns the last durably-processed block.
+2. `poll_once` starts from `cursor + 1`.
+3. Any logs in the current block that were already processed are caught by the
+   `(chain_id, tx_hash, log_index)` dedup index in `transactions` and returned as `Duplicate`.
+
+This is the same crash-safety guarantee the Stellar path gives via the Horizon paging token.
+
+### Unconfirmed status
+
+EVM deposits are recorded as `status = 'unconfirmed'`, not `'confirmed'`. They must not be
+treated as spendable until issue #222 (confirmation-depth check) promotes them.
+
+This is enforced at the DB level: `Store::record_evm_deposit` always inserts
+`status = 'unconfirmed'`. Merging the ingest worker (#221) before the crediting layer (#222)
+cannot create spendable balances.
+
+The test `evm_deposit_status_is_always_unconfirmed` in `crates/ingest/tests/evm_ingest_tests.rs`
+locks this in as a non-negotiable regression guard.
+
+### Adaptive range bisection
+
+Different EVM providers cap `eth_getLogs` block ranges differently (Alchemy: 2 000 blocks,
+Infura: 10 000 blocks, self-hosted: unlimited). A fixed range would stall on providers with
+tighter caps.
+
+When `eth_getLogs` returns a `RangeTooLarge` error (detected by message pattern matching on
+the JSON-RPC error object), `EvmIngestor::poll_once` halves the block range and retries, up
+to `MAX_BISECTIONS = 16` times. If the range reaches `MIN_BLOCK_RANGE = 1` and still fails,
+the error is surfaced as `EvmIngestError::RangeTooLargeExhausted`.
+
+### Schema changes (migration 0021)
+
+Migration `crates/store/migrations/0021_evm_ingest.sql` adds:
+
+| Table | Change |
+|---|---|
+| `ingest_cursor` | Nullable `chain_id TEXT` and `block_number BIGINT` columns; unique index `uq_ingest_cursor_wallet_chain (wallet_id, chain_id) WHERE chain_id IS NOT NULL` |
+| `transactions` | Nullable `chain_id TEXT` and `evm_log_index INTEGER` columns; unique index `uq_tx_evm_onchain (chain_id, stellar_tx_hash, evm_log_index) WHERE chain_id IS NOT NULL AND ...` |
+| `transactions` | Status constraint extended to include `'unconfirmed'` |
+
+All new columns are nullable — existing Stellar rows are unaffected. The migration is
+forward-only and append-only.
+
+### Store functions added
+
+| Function | Purpose |
+|---|---|
+| `Store::get_evm_cursor(wallet_id, chain_id)` | Read the EVM block-number cursor |
+| `Store::set_evm_cursor(wallet_id, chain_id, block)` | Advance the cursor after a durable record |
+| `Store::mark_evm_polled(wallet_id, chain_id)` | Record "looked at" time (drives backoff tiers) |
+| `Store::record_evm_deposit(NewEvmDeposit)` | Idempotent insert of an EVM deposit row |
+| `Store::evm_address_by_hex(wallet_id, hex)` | Look up a deposit address by hex (case-insensitive) |
+
+### Test coverage
+
+| Test | File | What it verifies |
+|---|---|---|
+| `erc20_transfer_to_deposit_address_is_recorded` | `evm_ingest_tests.rs` | Happy path; attributed, unconfirmed |
+| `dai_transfer_18_decimals_stored_correctly` | `evm_ingest_tests.rs` | 18-decimal amounts fit in `i64` correctly |
+| `fake_transfer_from_unregistered_contract_is_skipped` | `evm_ingest_tests.rs` | **Critical security test** |
+| `replay_same_log_is_idempotent` | `evm_ingest_tests.rs` | Dedup on `(chain_id, tx_hash, log_index)` |
+| `cursor_advances_per_block_and_resume_is_exactly_once` | `evm_ingest_tests.rs` | Crash-resume contract |
+| `transfer_of_unregistered_token_to_known_address_is_skipped` | `evm_ingest_tests.rs` | Quarantine of unregistered tokens |
+| `range_too_large_error_causes_bisection_not_stall` | `evm_ingest_tests.rs` | Adaptive range bisection |
+| `removed_log_is_never_processed` | `evm_ingest_tests.rs` | Reorged logs ignored |
+| `transfer_to_non_deposit_address_is_skipped` | `evm_ingest_tests.rs` | Non-deposit addresses ignored |
+| `evm_deposit_status_is_always_unconfirmed` | `evm_ingest_tests.rs` | `status = 'unconfirmed'` invariant |
+
+Unit tests for `EvmLog` parsing (amount, address extraction, hex parsing) are in
+`crates/ingest/src/evm.rs` under `#[cfg(test)]`.
