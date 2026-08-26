@@ -9,6 +9,7 @@ members = [
     "crates/ingest",
     "crates/api",
     "crates/resilience",
+    "crates/chain",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
@@ -50,7 +51,12 @@ tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # --- persistence ---
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "chrono", "json", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "chrono", "json", "migrate", "bigdecimal"] }
+# Arbitrary-precision unsigned integer (U256) for on-chain amounts. See crates/chain/src/amount.rs
+# for why `primitive-types` was chosen over `alloy-primitives`/`ruint`.
+primitive-types = { version = "0.13", default-features = false, features = ["std", "serde"] }
+# Matches the version sqlx's `bigdecimal` feature pulls in, so there's one copy in the tree.
+bigdecimal = { version = "0.4", features = ["serde"] }
 
 # --- serde / utility ---
 serde = { version = "1", features = ["derive"] }
@@ -73,6 +79,7 @@ octo-email = { path = "crates/email" }
 octo-ingest = { path = "crates/ingest" }
 octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
+octo-chain = { path = "crates/chain" }
 
 [profile.release]
 lto = "thin"

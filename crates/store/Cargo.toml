@@ -15,6 +15,8 @@ serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+bigdecimal.workspace = true
+octo-chain.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

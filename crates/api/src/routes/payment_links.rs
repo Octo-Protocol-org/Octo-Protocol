@@ -122,10 +122,14 @@ pub async fn list_payment_links(
         .store()
         .list_payment_links(wallet_id, limit + 1, q.before)
         .await?;
-    let has_more = rows.len() > limit as usize;
+    // `limit` is already bounded to 1..=200 by `validated_limit`, so this conversion cannot
+    // truncate or flip sign in practice; `try_from` is used rather than `as` regardless so a
+    // future change to that bound can't silently reintroduce a lossy cast here.
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_more = rows.len() > limit_usize;
     let mut items = rows;
     if has_more {
-        items.truncate(limit as usize);
+        items.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         items.last().map(|l| l.id)
@@ -236,10 +240,14 @@ pub async fn list_payment_link_payments(
         .list_payment_link_payments(link.id, limit + 1, q.before)
         .await?;
 
-    let has_more = rows.len() > limit as usize;
+    // `limit` is already bounded to 1..=200 by `validated_limit`, so this conversion cannot
+    // truncate or flip sign in practice; `try_from` is used rather than `as` regardless so a
+    // future change to that bound can't silently reintroduce a lossy cast here.
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_more = rows.len() > limit_usize;
     let mut items = rows;
     if has_more {
-        items.truncate(limit as usize);
+        items.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         items.last().map(|p| p.id)

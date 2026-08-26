@@ -29,6 +29,13 @@ pub enum StoreError {
     /// An OTP was wrong, expired, already used, over the attempt limit, or tx-hash mismatched.
     #[error("invalid or expired code")]
     InvalidOtp,
+
+    /// An `amount_stroops` value could not be represented as an [`octo_chain::Amount`] (e.g.
+    /// negative). This should be unreachable in practice — `amount_stroops` columns already carry
+    /// a `> 0` check constraint — but the conversion is fallible on principle: an amount
+    /// conversion must never silently truncate or wrap.
+    #[error("invalid amount: {0}")]
+    InvalidAmount(#[from] octo_chain::AmountError),
 }
 
 impl StoreError {

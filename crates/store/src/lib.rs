@@ -11,6 +11,10 @@
 //!   unique index, so a replayed/reorged Horizon event cannot double-credit.
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
 #![forbid(unsafe_code)]
+// This crate persists amounts (issue #215): a lossy `as i64`/`as u32`/etc. cast on a monetary
+// value is a fund-loss bug, not a style issue. Mirrors the lint wall in wallet-core/crypto.
+#![deny(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![cfg_attr(test, allow(clippy::cast_possible_truncation, clippy::cast_sign_loss))]
 
 mod error;
 mod models;
@@ -23,6 +27,7 @@ pub use models::{
     WithdrawalAllowlistConfig,
 };
 
+use octo_chain::Amount;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
@@ -788,13 +793,15 @@ impl Store {
     /// already recorded (the `(tx_hash, operation_index)` unique index fired) — so replays and
     /// reorged re-deliveries never double-credit.
     pub async fn record_deposit(&self, d: &NewDeposit) -> Result<Option<Transaction>, StoreError> {
+        // Fallible, never-truncating conversion — see `StoreError::InvalidAmount`.
+        let amount_base_units = Amount::try_from(d.amount_stroops)?.to_decimal();
         let result = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
                 (wallet_id, address_id, direction, asset_code, asset_issuer, amount_stroops,
-                 source_account, destination_account, stellar_tx_hash, operation_index,
-                 horizon_op_id, ledger, memo_id, status)
-            VALUES ($1, $2, 'deposit', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'confirmed')
+                 amount_base_units, source_account, destination_account, stellar_tx_hash,
+                 operation_index, horizon_op_id, ledger, memo_id, status)
+            VALUES ($1, $2, 'deposit', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'confirmed')
             RETURNING *
             "#,
         )
@@ -803,6 +810,7 @@ impl Store {
         .bind(&d.asset_code)
         .bind(&d.asset_issuer)
         .bind(d.amount_stroops)
+        .bind(&amount_base_units)
         .bind(&d.source_account)
         .bind(&d.destination_account)
         .bind(&d.stellar_tx_hash)
@@ -921,12 +929,14 @@ impl Store {
         stellar_tx_hash: Option<&str>,
         status: &str,
     ) -> Result<Transaction, StoreError> {
+        // Fallible, never-truncating conversion — see `StoreError::InvalidAmount`.
+        let amount_base_units = Amount::try_from(amount_stroops)?.to_decimal();
         let row = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
                 (wallet_id, direction, asset_code, asset_issuer, amount_stroops,
-                 source_account, destination_account, stellar_tx_hash, status)
-            VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8)
+                 amount_base_units, source_account, destination_account, stellar_tx_hash, status)
+            VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -934,6 +944,7 @@ impl Store {
         .bind(asset_code)
         .bind(asset_issuer)
         .bind(amount_stroops)
+        .bind(&amount_base_units)
         .bind(source_account)
         .bind(destination_account)
         .bind(stellar_tx_hash)
@@ -947,12 +958,14 @@ impl Store {
         &self,
         new: NewWithdrawal<'_>,
     ) -> Result<Withdrawal, StoreError> {
+        // Fallible, never-truncating conversion — see `StoreError::InvalidAmount`.
+        let amount_base_units = Amount::try_from(new.amount_stroops)?.to_decimal();
         sqlx::query_as::<_, Withdrawal>(
             r#"
             INSERT INTO withdrawals
                 (wallet_id, idempotency_key, destination_account, asset_code, asset_issuer,
-                 amount_stroops, memo_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 amount_stroops, amount_base_units, memo_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING *
             "#,
         )
@@ -962,6 +975,7 @@ impl Store {
         .bind(new.asset_code)
         .bind(new.asset_issuer)
         .bind(new.amount_stroops)
+        .bind(&amount_base_units)
         .bind(new.memo_id)
         .fetch_one(&self.pool)
         .await

@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "expected exactly the twenty known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        "expected exactly the twenty-one known migrations to be recorded as applied"
     );
 }
 
@@ -1199,4 +1199,132 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
         token.is_none(),
         "mark_polled must not fabricate a cursor position"
     );
+}
+
+// --- arbitrary-precision amounts (issue #215) --------------------------
+
+/// The exact case a `NUMERIC`-backed `i64` schema alone would still handle, but a JSON *number*
+/// could not: `10^18` (1 ETH in wei) exceeds `2^53 - 1`, the largest integer a JS double can
+/// represent exactly. `record_deposit` dual-writes `amount_base_units`; this asserts the value
+/// that comes back out of Postgres converts to the exact same `Amount`, and that `Amount`
+/// serializes as a JSON string bit-identical to the source value — the full store round trip
+/// described in the issue.
+#[tokio::test]
+async fn one_eth_in_wei_round_trips_through_store_and_json_bit_identically() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let tx_hash = Uuid::new_v4().to_string();
+
+    let one_eth_wei: i64 = 1_000_000_000_000_000_000; // 10^18, fits i64 but not a JS-safe double.
+
+    let dep = NewDeposit {
+        wallet_id,
+        address_id: None,
+        asset_code: "native".into(),
+        asset_issuer: None,
+        amount_stroops: one_eth_wei,
+        source_account: Some("Gsender".into()),
+        destination_account: Some("Gmaster".into()),
+        stellar_tx_hash: tx_hash.clone(),
+        operation_index: 0,
+        horizon_op_id: format!("{tx_hash}-0"),
+        ledger: Some(123),
+        memo_id: None,
+    };
+
+    let tx = store
+        .record_deposit(&dep)
+        .await
+        .expect("record deposit")
+        .expect("first insert is not a duplicate");
+
+    let stored_base_units = tx
+        .amount_base_units
+        .clone()
+        .expect("amount_base_units is populated on every new write");
+
+    // Read the row back fresh from Postgres (not just the RETURNING clause) to prove this is a
+    // genuine round trip through NUMERIC(78,0), not just an in-memory echo.
+    let reloaded = store
+        .get_transaction(tx.id)
+        .await
+        .expect("get_transaction")
+        .expect("transaction exists");
+    let reloaded_base_units = reloaded
+        .amount_base_units
+        .expect("amount_base_units survives a fresh read");
+    assert_eq!(
+        reloaded_base_units, stored_base_units,
+        "NUMERIC(78,0) round trip must be exact"
+    );
+
+    let amount =
+        octo_chain::Amount::try_from(reloaded_base_units).expect("valid non-negative integer");
+    let expected = octo_chain::Amount::try_from(one_eth_wei).expect("i64 -> Amount");
+    assert_eq!(amount, expected, "DB round trip must be bit-identical");
+
+    // The client-facing half: this Amount, once wired into a response type (issue #227 does the
+    // full API cutover), must serialize as a JSON string, not a bare number that would lose
+    // precision in every JS client.
+    let json = serde_json::to_string(&amount).expect("serialize");
+    assert_eq!(json, "\"1000000000000000000\"");
+    let back: octo_chain::Amount = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, amount);
+}
+
+/// `i64::MAX` stroops is the largest value the legacy Stellar path can produce; it must survive
+/// the new column without loss.
+#[tokio::test]
+async fn i64_max_stroops_round_trips_through_amount_base_units() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let tx_hash = Uuid::new_v4().to_string();
+
+    let dep = NewDeposit {
+        wallet_id,
+        address_id: None,
+        asset_code: "native".into(),
+        asset_issuer: None,
+        amount_stroops: i64::MAX,
+        source_account: None,
+        destination_account: None,
+        stellar_tx_hash: tx_hash.clone(),
+        operation_index: 0,
+        horizon_op_id: format!("{tx_hash}-0"),
+        ledger: None,
+        memo_id: None,
+    };
+
+    let tx = store
+        .record_deposit(&dep)
+        .await
+        .expect("record deposit")
+        .expect("first insert");
+    let base_units = tx.amount_base_units.expect("populated");
+    let amount = octo_chain::Amount::try_from(base_units).expect("valid");
+    assert_eq!(amount.to_i64(), Ok(i64::MAX));
+}
+
+/// `create_withdrawal` must dual-write `amount_base_units` too, not just deposits.
+#[tokio::test]
+async fn withdrawal_dual_writes_amount_base_units() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    let w = store
+        .create_withdrawal(NewWithdrawal {
+            wallet_id,
+            idempotency_key: &Uuid::new_v4().to_string(),
+            destination_account: "Gdest",
+            asset_code: "native",
+            asset_issuer: None,
+            amount_stroops: 42_000_000,
+            memo_id: None,
+        })
+        .await
+        .expect("create withdrawal");
+
+    let base_units = w.amount_base_units.expect("populated");
+    let amount = octo_chain::Amount::try_from(base_units).expect("valid");
+    assert_eq!(amount.to_i64(), Ok(42_000_000));
 }
