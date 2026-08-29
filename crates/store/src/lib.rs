@@ -2444,4 +2444,179 @@ impl Store {
             .await?;
         Ok(result.rows_affected())
     }
+
+    // --- EVM ingest cursor -----------------------------------------------
+
+    /// Read the saved EVM block-number cursor for a (wallet, chain) pair, if any.
+    ///
+    /// The cursor advances only when a log is durably processed, so a crash resumes without
+    /// missing or double-processing logs — the same guarantee the Stellar path gives via the
+    /// Horizon paging token.
+    pub async fn get_evm_cursor(
+        &self,
+        wallet_id: Uuid,
+        chain_id: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        let block: Option<i64> = sqlx::query_scalar(
+            "SELECT block_number FROM ingest_cursor WHERE wallet_id = $1 AND chain_id = $2",
+        )
+        .bind(wallet_id)
+        .bind(chain_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        // block_number is stored as BIGINT (i64); EVM block numbers are u64 but fit in i64 for
+        // any realistic chain (2^63 blocks ≈ 9.2 × 10^18 seconds at 1-second block times).
+        Ok(block.map(|b| b as u64))
+    }
+
+    /// Upsert the EVM block-number cursor for a (wallet, chain) pair (durable resume point).
+    ///
+    /// Only called after a log record is durably processed — `updated_at` therefore means "the
+    /// last block at which this wallet received an EVM deposit", which drives the activity-based
+    /// backoff tiers in `wallets_due_for_poll`.
+    pub async fn set_evm_cursor(
+        &self,
+        wallet_id: Uuid,
+        chain_id: &str,
+        block_number: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO ingest_cursor (wallet_id, chain_id, block_number, updated_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (wallet_id, chain_id)
+            DO UPDATE SET block_number = EXCLUDED.block_number, updated_at = now()
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(chain_id)
+        .bind(block_number as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that a (wallet, chain) pair was polled for EVM logs (whether or not anything new
+    /// arrived). Mirrors `mark_polled` for the Stellar path.
+    pub async fn mark_evm_polled(
+        &self,
+        wallet_id: Uuid,
+        chain_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO ingest_cursor (wallet_id, chain_id, last_polled_at, updated_at)
+            VALUES ($1, $2, now(), 'epoch')
+            ON CONFLICT (wallet_id, chain_id)
+            DO UPDATE SET last_polled_at = now()
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(chain_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // --- EVM deposit recording -------------------------------------------
+
+    /// A new EVM deposit to record (input to the idempotent insert).
+    ///
+    /// Deposits are recorded as `unconfirmed` — crediting is gated on confirmation depth (#222).
+    /// Recording as unconfirmed rather than confirmed ensures that merging the ingest worker
+    /// before the crediting layer (#222) lands cannot create spendable balances.
+    pub async fn record_evm_deposit(
+        &self,
+        d: &NewEvmDeposit<'_>,
+    ) -> Result<Option<Transaction>, StoreError> {
+        let result = sqlx::query_as::<_, Transaction>(
+            r#"
+            INSERT INTO transactions
+                (wallet_id, address_id, direction, asset_code, asset_issuer, amount_stroops,
+                 source_account, destination_account, stellar_tx_hash, operation_index,
+                 chain_id, evm_log_index, status)
+            VALUES ($1, $2, 'deposit', $3, $4, $5, $6, $7, $8, $9, $10, $11, 'unconfirmed')
+            RETURNING *
+            "#,
+        )
+        .bind(d.wallet_id)
+        .bind(d.address_id)
+        .bind(&d.token_symbol)
+        .bind(&d.token_contract)
+        .bind(d.amount_base_units)
+        .bind(&d.from_address)
+        .bind(&d.to_address)
+        .bind(&d.tx_hash)
+        .bind(d.log_index as i32)
+        .bind(&d.chain_id)
+        .bind(d.log_index as i32)
+        .fetch_one(&self.pool)
+        .await;
+
+        match result {
+            Ok(tx) => Ok(Some(tx)),
+            Err(e) => match StoreError::from_sqlx_conflict(e) {
+                StoreError::Conflict => Ok(None), // already recorded — benign dedup
+                other => Err(other),
+            },
+        }
+    }
+
+    /// Look up an EVM deposit address by its hex address string within a (wallet, chain) scope.
+    ///
+    /// EVM deposit addresses are stored in `addresses.muxed_address` (the column is repurposed as
+    /// a generic `deposit_address` until the multi-chain schema migration lands). The lookup is
+    /// case-insensitive because EIP-55 checksum addresses and all-lowercase addresses are the same
+    /// address.
+    pub async fn evm_address_by_hex(
+        &self,
+        wallet_id: Uuid,
+        hex_address: &str,
+    ) -> Result<Option<Address>, StoreError> {
+        let row = sqlx::query_as::<_, Address>(
+            "SELECT * FROM addresses WHERE wallet_id = $1 AND lower(muxed_address) = lower($2)",
+        )
+        .bind(wallet_id)
+        .bind(hex_address)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+}
+
+/// A new EVM deposit to record via [`Store::record_evm_deposit`].
+///
+/// Amounts are stored as `i64` here for compatibility with the current `amount_stroops BIGINT`
+/// column. ERC-20 stablecoins (USDC = 6 decimals, DAI = 18 decimals) transfer amounts fit
+/// in `i64` for any realistic transaction value. Full `uint256` support will land with #215.
+///
+/// **Status:** EVM deposits are recorded as `unconfirmed`. They must NOT be treated as spendable
+/// until the confirmation-depth check in #222 promotes them to `confirmed`. This status is
+/// enforced at the DB level (`record_evm_deposit` always inserts `status = 'unconfirmed'`).
+#[derive(Debug, Clone)]
+pub struct NewEvmDeposit<'a> {
+    /// The wallet that owns the deposit address.
+    pub wallet_id: Uuid,
+    /// The attributed deposit address, if the `to` address was a known customer address.
+    /// `None` for quarantined deposits (unknown deposit address, or unregistered token).
+    pub address_id: Option<Uuid>,
+    /// CAIP-2 chain identifier (e.g. `"eip155:1"`, `"eip155:11155111"`).
+    pub chain_id: &'a str,
+    /// ERC-20 token symbol (e.g. `"USDC"`). Stored in `asset_code`.
+    pub token_symbol: &'a str,
+    /// Token contract address (EIP-55 checksummed hex). Stored in `asset_issuer` — the issuer
+    /// concept maps naturally: the contract is the authority for the token.
+    pub token_contract: &'a str,
+    /// Transfer amount in the token's base units (i.e. wei-equivalents, not human-readable).
+    /// For USDC (6 decimals) this is micro-USDC; for DAI (18 decimals) this is attoDAI.
+    pub amount_base_units: i64,
+    /// `from` field of the Transfer event (the sender).
+    pub from_address: &'a str,
+    /// `to` field of the Transfer event (the recipient — our deposit address).
+    pub to_address: &'a str,
+    /// Transaction hash (`0x`-prefixed hex). Stored in `stellar_tx_hash` until column rename.
+    pub tx_hash: &'a str,
+    /// Index of this log entry within the transaction (0-based). Used for per-chain dedup.
+    pub log_index: u32,
 }
