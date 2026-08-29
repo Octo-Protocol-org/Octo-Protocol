@@ -22,23 +22,35 @@ fn database_url() -> Option<String> {
     std::env::var("DATABASE_URL").ok()
 }
 
-const BASE: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
+/// A fresh, syntactically-valid `G...` base account, distinct on every call.
+///
+/// Every wallet in this file needs its own real base account rather than sharing one fixed
+/// constant: `octo_store`'s multi-chain schema (#214) enforces `UNIQUE(chain_id,
+/// deposit_address)` across *all* wallets on a chain (previously only `UNIQUE(wallet_id,
+/// muxed_id)` was enforced), and `encode_muxed(base, id)` is a pure function of the base account —
+/// two wallets sharing one base account would derive identical muxed addresses for the same id
+/// and collide against that constraint. Real Stellar accounts never share a base key, so this
+/// also makes the fixture more realistic, not just constraint-satisfying.
+///
+/// The bytes don't need to correspond to a real keypair — `stellar_strkey` only checks the
+/// checksum/format, which is all `encode_muxed`'s decode step verifies.
+fn fresh_base_account() -> String {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    format!("{}", stellar_strkey::ed25519::PublicKey(bytes))
+}
 
-async fn setup() -> Option<(Store, Ingestor, Uuid)> {
+async fn setup() -> Option<(Store, Ingestor, Uuid, String)> {
     let url = database_url()?;
     let store = Store::connect(&url).await.expect("connect");
     store.migrate().await.expect("migrate");
 
-    // A wallet whose base account is BASE, but with a unique stored account string per test run so
-    // rows don't collide. We use a unique muxed_address per allocation; BASE is what the ingestor
-    // matches against, so set the wallet's stored account to BASE-with-suffix is not possible (the
-    // ingestor compares to account_g we pass in). So create the wallet, then drive the Ingestor
-    // with account_g = the wallet's stored G... value.
-    let acct = BASE; // ingestor matches rec.to == account_g; allocate uses real encode_muxed(BASE)
+    let base_account = fresh_base_account();
     let wallet = store
         .create_wallet(NewWallet {
             network: "testnet",
-            stellar_account_g: &format!("{acct}-{}", Uuid::new_v4().simple()),
+            stellar_account_g: &base_account,
             sealed_ciphertext: b"ct",
             sealed_nonce: b"nonce",
             sealed_salt: b"salt",
@@ -50,11 +62,16 @@ async fn setup() -> Option<(Store, Ingestor, Uuid)> {
         .await
         .expect("wallet");
 
-    let ingestor = Ingestor::new(store.clone(), "http://unused", wallet.id, BASE.to_string());
-    Some((store, ingestor, wallet.id))
+    let ingestor = Ingestor::new(
+        store.clone(),
+        "http://unused",
+        wallet.id,
+        base_account.clone(),
+    );
+    Some((store, ingestor, wallet.id, base_account))
 }
 
-fn base_record(id: &str) -> PaymentRecord {
+fn base_record(id: &str, base_account: &str) -> PaymentRecord {
     // Deposits dedup on the Horizon operation id, which is globally unique and persists in the
     // DB. A fixed literal here made every one of these tests a `Duplicate` on the second run
     // against the same database, so they only passed on a fresh DB. Suffix a per-run uuid to
@@ -68,7 +85,7 @@ fn base_record(id: &str) -> PaymentRecord {
         transaction_hash: Some(format!("hash-{id}")),
         transaction_successful: true,
         from: Some("Gsender".into()),
-        to: Some(BASE.into()),
+        to: Some(base_account.into()),
         to_muxed: None,
         to_muxed_id: None,
         asset_type: Some("native".into()),
@@ -82,7 +99,7 @@ fn base_record(id: &str) -> PaymentRecord {
 
 #[tokio::test]
 async fn deposit_to_muxed_address_is_attributed() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         eprintln!("SKIPPED: set DATABASE_URL");
         return;
     };
@@ -91,7 +108,7 @@ async fn deposit_to_muxed_address_is_attributed() {
     let addr = store
         .allocate_address(
             wallet_id,
-            |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+            |id| encode_muxed(&base_account, id as u64).map_err(|_| ()),
             Some("cust-1"),
             serde_json::json!({}),
         )
@@ -99,8 +116,8 @@ async fn deposit_to_muxed_address_is_attributed() {
         .unwrap();
 
     // A payment sent to that customer's muxed address.
-    let mut rec = base_record("op-muxed-1");
-    rec.to_muxed = addr.muxed_address.clone();
+    let mut rec = base_record("op-muxed-1", &base_account);
+    rec.to_muxed = Some(addr.muxed_address.clone());
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: true });
@@ -114,14 +131,14 @@ async fn deposit_to_muxed_address_is_attributed() {
 
 #[tokio::test]
 async fn deposit_with_memo_id_is_attributed() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
     let addr = store
         .allocate_address(
             wallet_id,
-            |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+            |id| encode_muxed(&base_account, id as u64).map_err(|_| ()),
             Some("cust-memo"),
             serde_json::json!({}),
         )
@@ -129,7 +146,7 @@ async fn deposit_with_memo_id_is_attributed() {
         .unwrap();
 
     // Sent to the base account with a numeric memo equal to the muxed id.
-    let mut rec = base_record("op-memo-1");
+    let mut rec = base_record("op-memo-1", &base_account);
     rec.transaction = Some(TransactionRecord {
         memo_type: Some("id".into()),
         memo: Some(addr.muxed_id.expect("stellar address").to_string()),
@@ -145,12 +162,12 @@ async fn deposit_with_memo_id_is_attributed() {
 
 #[tokio::test]
 async fn unattributed_deposit_is_quarantined() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
     // Plain payment to the base account, no muxed, no memo → recorded but not attributed.
-    let rec = base_record("op-plain-1");
+    let rec = base_record("op-plain-1", &base_account);
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: false });
 
@@ -161,11 +178,11 @@ async fn unattributed_deposit_is_quarantined() {
 
 #[tokio::test]
 async fn duplicate_operation_is_idempotent() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
-    let rec = base_record("op-dup-1");
+    let rec = base_record("op-dup-1", &base_account);
     assert_eq!(
         ingestor.process(&rec).await.unwrap(),
         Processed::Recorded { attributed: false }
@@ -185,11 +202,11 @@ async fn duplicate_operation_is_idempotent() {
 
 #[tokio::test]
 async fn failed_tx_is_skipped() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
-    let mut rec = base_record("op-failed-1");
+    let mut rec = base_record("op-failed-1", &base_account);
     rec.transaction_successful = false;
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
     assert_eq!(
@@ -204,11 +221,11 @@ async fn failed_tx_is_skipped() {
 
 #[tokio::test]
 async fn payment_to_other_account_is_skipped() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
-    let mut rec = base_record("op-other-1");
+    let mut rec = base_record("op-other-1", &base_account);
     rec.to = Some("GSOMEOTHERACCOUNT".into());
     assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
     assert_eq!(
@@ -223,13 +240,13 @@ async fn payment_to_other_account_is_skipped() {
 
 #[tokio::test]
 async fn missing_amount_and_starting_balance_is_skipped() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
     // Neither `amount` nor `starting_balance` present: amount_str falls back to "", and
     // amount::to_stroops("") must return None, so process() must skip cleanly rather than panic.
-    let mut rec = base_record("op-no-amount-1");
+    let mut rec = base_record("op-no-amount-1", &base_account);
     rec.amount = None;
     rec.starting_balance = None;
 
@@ -247,13 +264,13 @@ async fn missing_amount_and_starting_balance_is_skipped() {
 
 #[tokio::test]
 async fn credit_asset_with_missing_code_falls_back_to_unknown() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
     // A non-native asset_type with no asset_code must fall back to the literal "unknown" rather
     // than panicking or leaving the field empty.
-    let mut rec = base_record("op-credit-no-code-1");
+    let mut rec = base_record("op-credit-no-code-1", &base_account);
     rec.asset_type = Some("credit_alphanum4".into());
     rec.asset_code = None;
 
@@ -267,13 +284,13 @@ async fn credit_asset_with_missing_code_falls_back_to_unknown() {
 
 #[tokio::test]
 async fn missing_transaction_field_yields_no_memo_and_no_panic() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
     // No joined `transaction` at all: memo_id()'s `self.transaction.as_ref()?` must short-circuit
     // to None without panicking, and the recorded deposit must carry no memo/ledger.
-    let mut rec = base_record("op-no-tx-1");
+    let mut rec = base_record("op-no-tx-1", &base_account);
     rec.transaction = None;
 
     let outcome = ingestor.process(&rec).await.unwrap();
@@ -288,12 +305,13 @@ async fn missing_transaction_field_yields_no_memo_and_no_panic() {
 async fn make_usdc_payment_link(
     store: &Store,
     wallet_id: Uuid,
+    base_account: &str,
     amount_usdc_stroops: i64,
 ) -> (String, Uuid, Uuid) {
     let addr = store
         .allocate_address(
             wallet_id,
-            |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+            |id| encode_muxed(base_account, id as u64).map_err(|_| ()),
             None,
             serde_json::json!({}),
         )
@@ -323,8 +341,8 @@ async fn make_usdc_payment_link(
     )
 }
 
-fn usdc_record(id: &str, to_muxed: String, amount: &str) -> PaymentRecord {
-    let mut rec = base_record(id);
+fn usdc_record(id: &str, base_account: &str, to_muxed: String, amount: &str) -> PaymentRecord {
+    let mut rec = base_record(id, base_account);
     rec.to_muxed = Some(to_muxed);
     rec.asset_type = Some("credit_alphanum4".into());
     rec.asset_code = Some("USDC".into());
@@ -335,12 +353,13 @@ fn usdc_record(id: &str, to_muxed: String, amount: &str) -> PaymentRecord {
 
 #[tokio::test]
 async fn underpaid_payment_link_deposit_is_recorded_but_left_unconfirmed() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
-    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
-    let rec = usdc_record("op-underpaid-1", muxed, "5.0000000");
+    let (muxed, link_id, intent_id) =
+        make_usdc_payment_link(&store, wallet_id, &base_account, 100_000_000).await;
+    let rec = usdc_record("op-underpaid-1", &base_account, muxed, "5.0000000");
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: true });
@@ -358,12 +377,13 @@ async fn underpaid_payment_link_deposit_is_recorded_but_left_unconfirmed() {
 
 #[tokio::test]
 async fn overpaid_payment_link_deposit_is_recorded_but_left_unconfirmed() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
-    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
-    let rec = usdc_record("op-overpaid-1", muxed, "15.0000000");
+    let (muxed, link_id, intent_id) =
+        make_usdc_payment_link(&store, wallet_id, &base_account, 100_000_000).await;
+    let rec = usdc_record("op-overpaid-1", &base_account, muxed, "15.0000000");
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: true });
@@ -378,12 +398,13 @@ async fn overpaid_payment_link_deposit_is_recorded_but_left_unconfirmed() {
 
 #[tokio::test]
 async fn exact_payment_link_deposit_confirms() {
-    let Some((store, ingestor, wallet_id)) = setup().await else {
+    let Some((store, ingestor, wallet_id, base_account)) = setup().await else {
         return;
     };
 
-    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
-    let rec = usdc_record("op-exact-1", muxed, "10.0000000");
+    let (muxed, link_id, intent_id) =
+        make_usdc_payment_link(&store, wallet_id, &base_account, 100_000_000).await;
+    let rec = usdc_record("op-exact-1", &base_account, muxed, "10.0000000");
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: true });

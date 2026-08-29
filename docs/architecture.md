@@ -81,54 +81,106 @@ server, and it is confined to one crate:
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
 
-## The ChainAdapter boundary
+## Data model: multi-chain (#214)
 
-octo started Stellar-only, which let chain-specific concepts leak directly to callers:
-`crates/api/src/state.rs` imports `StellarNetwork`, `crates/ingest/src/lib.rs` calls
-`decode_muxed`, and route handlers reason about XDR. That's fine for one chain; it does not scale
-to a second one (see `docs/ethereum-expansion-issues.md`) without a `match` on chain kind spreading
-into every call site. `octo-chain` is the fix: a `ChainAdapter` trait that `octo-api` and
-`octo-ingest` are meant to depend on instead of any one chain's crate or wire format.
+The schema used to hard-code Stellar into column names, constraints, and unique indexes —
+`wallets.network CHECK (network IN ('mainnet','testnet'))` had no chain dimension at all, and the
+anti-double-credit guard was `UNIQUE(stellar_tx_hash, operation_index)` with no chain scoping,
+which silently assumed a tx hash is globally unique (true for one Stellar network, false once a
+second chain exists). `migrations/0021_chains_registry.sql` onward generalizes this to a `chains`
+registry plus a `chain_id` column threaded through `wallets`, `addresses`, and `transactions`.
 
-**What belongs in an adapter:**
-- Chain identity (`ChainId`, CAIP-2 — see AD-1 in `docs/ethereum-expansion-issues.md`) and what
-  the chain can do (`ChainCapabilities`: memos, muxed addresses, reorgs, native decimals).
-- Address grammar: validating a string is a well-formed address, and normalizing the different
-  valid forms of "the same" address to one canonical form.
-- Shaping a customer deposit address for that chain (`DepositAddress`): a single muxed-style
-  address for chains that support it, or the seam where a chain without that capability must
-  instead derive a distinct on-chain address per customer.
-- Translating a chain-native failure/result code into a sentence a merchant dashboard can show.
-- Calling out to that chain's own signing/derivation crate (for Stellar, `octo-wallet-core`) to do
-  the above — never reimplementing chain logic that already exists elsewhere.
+```mermaid
+erDiagram
+    chains ||--o{ wallets : "chain_id"
+    wallets ||--o{ addresses : "wallet_id"
+    wallets ||--o{ transactions : "wallet_id"
+    addresses |o--o{ transactions : "address_id"
+    chains ||--o{ addresses : "chain_id"
+    chains ||--o{ transactions : "chain_id"
 
-**What belongs in business logic (`octo-api`, `octo-ingest`), not an adapter:**
-- What to *do* with a validated address or a derived deposit address: allocating a customer id,
-  persisting a row, firing a webhook, deciding when a deposit is safe to credit. None of that
-  varies by chain in a way the adapter needs to know about.
-- Anything involving Octo's own store, webhooks, or email — an adapter never touches `octo-store`
-  directly.
+    chains {
+        text chain_id PK "CAIP-2-shaped slug, e.g. stellar:pubnet"
+        text kind "stellar | evm"
+        text native_symbol
+        smallint native_decimals
+        integer confirmation_depth
+        boolean enabled
+    }
+    wallets {
+        uuid id PK
+        text network "legacy: mainnet | testnet"
+        text chain_id FK "NOT NULL, derived from network"
+        text stellar_account_g
+        bigint next_muxed_id
+    }
+    addresses {
+        uuid id PK
+        uuid wallet_id FK
+        text chain_id FK "NOT NULL, = parent wallet's chain_id"
+        bigint muxed_id "Stellar off-chain routing id"
+        text muxed_address "legacy"
+        text deposit_address "NOT NULL, generic; = muxed_address for Stellar"
+        bigint derivation_index "EVM HD index; null for Stellar"
+    }
+    transactions {
+        uuid id PK
+        uuid wallet_id FK
+        uuid address_id FK "nullable"
+        text chain_id FK "NOT NULL, = parent wallet's chain_id"
+        text stellar_tx_hash "legacy, nullable"
+        text tx_hash "generic, nullable, mirrors stellar_tx_hash"
+        integer operation_index "op index (Stellar) or log index (EVM)"
+    }
+```
 
-**What must never be in `octo-chain`:** raw key material, or a dependency on `octo-crypto`. An
-adapter holds secrets the same way business logic would — by delegating to a chain's own signing
-crate — never by embedding key handling in this crate. `octo-chain` defines shapes; adapters
-supply behaviour.
+### Backward-compatibility strategy: additive columns, not a rename
 
-The trait is a small required core plus a capability description
-(`fn capabilities(&self) -> ChainCapabilities`), not the union of every field Stellar and EVM need
-— Stellar has muxed addresses and no reorgs, EVM has reorgs and no memos, and a trait that unions
-both would rot as more chains are added. It is `Send + Sync + 'static` and object-safe
-(`Arc<dyn ChainAdapter>`), since `AppState` is cloned across every Axum handler and
-`octo-ingest`'s supervisor spawns one task per wallet. A `ChainRegistry` maps each configured
-`ChainId` to its adapter, returning `ChainError::UnsupportedChain` rather than panicking on an
-unconfigured chain.
+Renaming `stellar_tx_hash` → `tx_hash` (etc.) in place would break the currently-running old
+binary mid-deploy — it still selects/binds the old column name. The two ways to avoid that are (a)
+rename across two releases behind a compatibility view/generated column, or (b) keep every legacy
+column and add generic ones alongside, backfilled from the legacy ones. This migration takes **(b)**:
+`network`/`stellar_tx_hash`/`muxed_address` all still exist; `chain_id`/`tx_hash`/`deposit_address`
+are new columns kept in lockstep by every `Store` write path (see
+`octo_store::stellar_chain_id_for_network`). This was chosen over (a) because a view/generated-column
+indirection adds a layer that complicates `SELECT *` / `RETURNING *` (what `sqlx::FromRow` relies on
+throughout this crate) for comparatively little benefit at this schema's size, and because keeping
+both names live is simpler to reason about during the transition than sequencing two coordinated
+releases. The cost is some duplicated data (`tx_hash` == `stellar_tx_hash` for every Stellar row
+today) — acceptable for a schema still under active expansion; a future cleanup migration can drop
+the legacy columns once every caller has moved off `network`/`stellar_tx_hash`/`muxed_address` (that
+work belongs to the `octo-chain` adapter rollout, #213/#215/#220/#223, not this migration).
 
-`crates/chain/src/conformance.rs` is a reusable test harness (`chain_conformance_suite`) that
-checks an adapter behaves consistently with its own declared capabilities — deterministic
-derivation, idempotent normalization, no panics on garbage input. Every adapter, including the
-future EVM one, is expected to pass it.
+### Migration shape: additive → backfill → validate → enforce → swap indexes
 
-This issue lands the trait and the Stellar adapter only, as a pure refactor — `octo-api` and
-`octo-ingest` still call `octo-wallet-core` directly today. Wiring `AppState` and the ingest
-supervisor through a `ChainRegistry` is follow-up work once a second adapter exists to prove the
-boundary is right, not something to guess at with only one chain implemented.
+Every step is designed to avoid a long `ACCESS EXCLUSIVE` lock on `transactions` and to never let
+the anti-double-credit invariant lapse:
+
+1. **Additive** (`0021`-`0022`): create `chains`, seeded with the two existing Stellar networks;
+   add every new column as nullable with no default (fast, metadata-only on PG11+).
+2. **Backfill** (`0023`-`0025`): `wallets` (small) backfills in one `UPDATE`; `addresses` and
+   `transactions` backfill in batches of 5,000 rows, each batch committed independently (these
+   migration files are marked `-- no-transaction` specifically so a bare `COMMIT` inside the
+   backfill loop is legal) — no single transaction holds locks or accumulates WAL for the whole
+   table, and the loop resumes from the first still-`NULL` row if interrupted.
+3. **Validate** (`0026`-`0028`): `chain_id`/`deposit_address` NOT NULL is added as `CHECK (...)
+   NOT VALID` (instant), validated in a separate migration/transaction under a lock that doesn't
+   block reads/writes (`VALIDATE CONSTRAINT`), then promoted to real `NOT NULL` — which, on
+   PG12+, reuses the now-validated CHECK to skip its own table scan.
+4. **New indexes, built `CONCURRENTLY`** (`0029`-`0032`): including `uq_tx_onchain_chain` on
+   `(chain_id, tx_hash, operation_index)` — the re-scoped anti-double-credit guard — and
+   `uq_addresses_chain_deposit` on `(chain_id, deposit_address)` (generalizing the old
+   `UNIQUE(muxed_address)`, which is wrong for EVM: a deposit address is only unique *within* a
+   chain).
+5. **Drop the legacy index** (`0033`), `DROP INDEX CONCURRENTLY`, only once `uq_tx_onchain_chain`
+   is confirmed built — so the anti-double-credit guarantee is never unenforced, even briefly:
+   the new chain-scoped index is live before the old global one goes away.
+
+**Caveat for real multi-replica deploys:** `CREATE INDEX CONCURRENTLY` and `VALIDATE CONSTRAINT`
+each wait for every other in-flight transaction on the server to finish, including one that's
+merely blocked acquiring sqlx's own migration advisory lock — so two processes calling
+`store.migrate()` at the same moment while one of these migrations is pending can deadlock
+(`octo_store::Store::migrate` serializes same-process callers against this, which is what a
+parallel `cargo test` run exercises, but it cannot serialize across independent OS processes).
+Apply this migration set once (`just migrate`) before rolling out new `bin/server` replicas,
+rather than relying on every replica's own boot-time `store.migrate()` call to race it out.

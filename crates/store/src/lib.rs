@@ -1,14 +1,17 @@
 //! Postgres persistence for octo (sqlx).
 //!
-//! Tables: `wallets`, `addresses`, `transactions`, `withdrawals`, `webhook_endpoints`,
-//! `webhook_deliveries`, `ingest_cursor` — see `migrations/0001_init.sql`.
+//! Tables: `chains`, `wallets`, `addresses`, `transactions`, `withdrawals`, `webhook_endpoints`,
+//! `webhook_deliveries`, `ingest_cursor` — see `migrations/0001_init.sql` and, for the multi-chain
+//! generalization, `migrations/0021_chains_registry.sql` onward.
 //!
 //! Security-relevant guarantees implemented here (see `docs/threat-model.md`):
 //! - All queries are parameterized (no string-built SQL) → no SQL injection.
 //! - [`Store::allocate_address`] increments the per-wallet muxed-id counter **atomically** inside a
 //!   transaction, so concurrent address creation can't collide or reuse an id.
-//! - [`Store::record_deposit`] is **idempotent** on the immutable `(tx_hash, operation_index)`
-//!   unique index, so a replayed/reorged Horizon event cannot double-credit.
+//! - [`Store::record_deposit`] is **idempotent** on the immutable `(chain_id, tx_hash,
+//!   operation_index)` unique index, so a replayed/reorged Horizon event cannot double-credit —
+//!   and, since #214, a legitimate deposit on one chain can never collide with one on another
+//!   chain that happens to reuse the same `(tx_hash, operation_index)` pair.
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
 #![forbid(unsafe_code)]
 
@@ -28,6 +31,26 @@ use uuid::Uuid;
 
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Process-wide serialization for [`Store::migrate`] calls. See the doc comment on `migrate` for
+/// why this exists.
+static MIGRATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Bridge from the legacy Stellar-only `network` column to a `chain_id` in the `chains` registry
+/// (see `migrations/0021_chains_registry.sql`).
+///
+/// Every `Store` write path that inserts or updates a `wallets`/`addresses`/`transactions` row
+/// still takes `network` (or derives from a wallet that carries one) rather than a `chain_id`
+/// directly — callers throughout `octo-api`/`octo-ingest` are not multi-chain-aware yet, and
+/// making them pass a chain id explicitly is the job of the `octo-chain` adapter trait (#213) and
+/// the EVM issues it unblocks (#215/#220/#223), not this schema migration. Until that lands, this
+/// is the single place that maps one to the other, so every row stays internally consistent.
+pub fn stellar_chain_id_for_network(network: &str) -> &'static str {
+    match network {
+        "mainnet" => "stellar:pubnet",
+        _ => "stellar:testnet",
+    }
+}
 
 /// A handle to the database (cloneable; wraps a connection pool).
 #[derive(Clone)]
@@ -120,6 +143,27 @@ impl Store {
 
     /// Apply all pending migrations.
     pub async fn migrate(&self) -> Result<(), StoreError> {
+        // Serialize concurrent `migrate()` calls *within this process* before they even reach
+        // sqlx's own cross-process advisory lock.
+        //
+        // sqlx already guards concurrent migrators with a session-held `pg_advisory_lock`, which
+        // is normally enough on its own. But migrations that use `CREATE INDEX CONCURRENTLY` /
+        // `VALIDATE CONSTRAINT` (see migrations/0027, 0029-0033) wait for *every* other
+        // in-progress transaction on the server to finish — including a second caller that is
+        // merely blocked waiting to acquire sqlx's advisory lock, since that wait itself counts
+        // as an open transaction. That produces a genuine deadlock: the blocked waiter holds a
+        // transaction the CONCURRENTLY/VALIDATE statement must wait out, while that statement
+        // holds the advisory lock the waiter needs. Observed directly in this crate's own test
+        // suite, where many `#[tokio::test]`s each call `Store::connect(..).migrate()`
+        // concurrently against one shared database.
+        //
+        // This lock only protects same-process callers (e.g. many parallel tests, or multiple
+        // Store handles in one binary) — it cannot serialize independent OS processes. A
+        // multi-replica rolling deploy that lets every replica call `migrate()` at boot has the
+        // same underlying hazard whenever a CONCURRENTLY/VALIDATE migration is pending; the
+        // operational fix there is to apply migrations once (`just migrate`) before scaling up
+        // new replicas, same as any other zero-downtime CONCURRENTLY rollout.
+        let _guard = MIGRATE_LOCK.lock().await;
         MIGRATOR.run(&self.pool).await?;
         Ok(())
     }
@@ -382,13 +426,14 @@ impl Store {
         sqlx::query_as::<_, Wallet>(
             r#"
             INSERT INTO wallets
-                (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
-                 sealed_scheme, label, user_id, description, custody)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'server')
+                (network, chain_id, stellar_account_g, sealed_ciphertext, sealed_nonce,
+                 sealed_salt, sealed_scheme, label, user_id, description, custody)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'server')
             RETURNING *
             "#,
         )
         .bind(new.network)
+        .bind(stellar_chain_id_for_network(new.network))
         .bind(new.stellar_account_g)
         .bind(new.sealed_ciphertext)
         .bind(new.sealed_nonce)
@@ -474,13 +519,14 @@ impl Store {
         sqlx::query_as::<_, Wallet>(
             r#"
             INSERT INTO wallets
-                (network, stellar_account_g, label, user_id, description, custody,
+                (network, chain_id, stellar_account_g, label, user_id, description, custody,
                  encrypted_backup)
-            VALUES ($1, $2, $3, $4, $5, 'client', $6)
+            VALUES ($1, $2, $3, $4, $5, $6, 'client', $7)
             RETURNING *
             "#,
         )
         .bind(new.network)
+        .bind(stellar_chain_id_for_network(new.network))
         .bind(new.stellar_account_g)
         .bind(new.label)
         .bind(new.user_id)
@@ -774,9 +820,10 @@ impl Store {
     ) -> Result<Address, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        // Lock the wallet row and read+bump the counter.
-        let next_id: i64 =
-            sqlx::query_scalar("SELECT next_muxed_id FROM wallets WHERE id = $1 FOR UPDATE")
+        // Lock the wallet row and read+bump the counter (also grabbing chain_id, so the new
+        // address row is always consistent with its parent wallet's chain).
+        let (next_id, chain_id): (i64, String) =
+            sqlx::query_as("SELECT next_muxed_id, chain_id FROM wallets WHERE id = $1 FOR UPDATE")
                 .bind(wallet_id)
                 .fetch_optional(&mut *tx)
                 .await?
@@ -792,12 +839,15 @@ impl Store {
 
         let address = sqlx::query_as::<_, Address>(
             r#"
-            INSERT INTO addresses (wallet_id, muxed_id, muxed_address, customer_ref, metadata)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO addresses
+                (wallet_id, chain_id, muxed_id, muxed_address, deposit_address, customer_ref,
+                 metadata)
+            VALUES ($1, $2, $3, $4, $4, $5, $6)
             RETURNING *
             "#,
         )
         .bind(wallet_id)
+        .bind(chain_id)
         .bind(next_id)
         .bind(&muxed_address)
         .bind(customer_ref)
@@ -982,10 +1032,12 @@ impl Store {
         let result = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
-                (wallet_id, address_id, direction, asset_code, asset_issuer, amount_stroops,
-                 source_account, destination_account, stellar_tx_hash, operation_index,
-                 horizon_op_id, ledger, memo_id, status)
-            VALUES ($1, $2, 'deposit', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'confirmed')
+                (wallet_id, chain_id, address_id, direction, asset_code, asset_issuer,
+                 amount_stroops, source_account, destination_account, stellar_tx_hash, tx_hash,
+                 operation_index, horizon_op_id, ledger, memo_id, status)
+            VALUES
+                ($1, (SELECT chain_id FROM wallets WHERE id = $1), $2, 'deposit', $3, $4, $5, $6,
+                 $7, $8, $8, $9, $10, $11, $12, 'confirmed')
             RETURNING *
             "#,
         )
@@ -1363,9 +1415,11 @@ impl Store {
         let row = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
-                (wallet_id, direction, asset_code, asset_issuer, amount_stroops,
-                 source_account, destination_account, stellar_tx_hash, status)
-            VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8)
+                (wallet_id, chain_id, direction, asset_code, asset_issuer, amount_stroops,
+                 source_account, destination_account, stellar_tx_hash, tx_hash, status)
+            VALUES
+                ($1, (SELECT chain_id FROM wallets WHERE id = $1), 'withdrawal', $2, $3, $4, $5,
+                 $6, $7, $7, $8)
             RETURNING *
             "#,
         )
