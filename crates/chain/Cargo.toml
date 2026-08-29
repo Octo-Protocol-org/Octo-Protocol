@@ -1,0 +1,15 @@
+[package]
+name = "octo-chain"
+description = "Minimal ChainAdapter boundary for deposit-address derivation (Stellar muxed vs EVM HD). Scoped to issue #220; the full trait (capabilities, registry, CAIP-2 identity) belongs to the chain-abstraction issue."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+octo-crypto.workspace = true
+octo-wallet-core.workspace = true
+octo-evm-core.workspace = true
+thiserror.workspace = true

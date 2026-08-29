@@ -29,6 +29,12 @@ pub enum StoreError {
     /// An OTP was wrong, expired, already used, over the attempt limit, or tx-hash mismatched.
     #[error("invalid or expired code")]
     InvalidOtp,
+
+    /// An EVM wallet's `next_derivation_index` exceeded BIP-44's non-hardened index space
+    /// (`2^31 - 1`). Allocating a further address for this wallet requires a new account branch,
+    /// which is out of scope for automatic handling.
+    #[error("derivation index space exhausted")]
+    DerivationIndexExhausted,
 }
 
 impl StoreError {
