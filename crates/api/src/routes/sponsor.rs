@@ -117,7 +117,11 @@ pub async fn sponsor(
     let scheme = wallet
         .sealed_scheme
         .unwrap_or(octo_crypto::SCHEME_V1 as i16);
-    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
+    // `sealed_scheme` is `i16` in the DB but the scheme tag is always a small non-negative value
+    // (0 or SCHEME_V1) — a value that doesn't fit `u8` indicates corrupt row data, not a case to
+    // silently truncate into some other scheme.
+    let scheme_u8 = u8::try_from(scheme).map_err(|_| ApiError::Internal)?;
+    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme_u8)
         .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {
         inner_xdr: &inner_xdr,
@@ -254,11 +258,15 @@ pub async fn list_sponsored_transactions(
         .list_sponsored_transactions(wallet_id, limit + 1, status.as_deref(), q.before)
         .await?;
 
-    let has_more = rows.len() > limit as usize;
+    // `limit` is already bounded to 1..=200 above, so this conversion cannot truncate or flip
+    // sign in practice; `try_from` is used rather than `as` regardless so a future change to that
+    // bound can't silently reintroduce a lossy cast here.
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let has_more = rows.len() > limit_usize;
     let mut data = rows;
     if has_more {
         // Drop the sentinel extra row; we only fetched it to detect `has_more`.
-        data.truncate(limit as usize);
+        data.truncate(limit_usize);
     }
     // The cursor is the LAST row actually returned, so the next page starts strictly after it.
     let next_cursor = if has_more {

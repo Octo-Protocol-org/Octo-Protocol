@@ -12,6 +12,10 @@
 //! - The cursor is advanced and persisted only after a record is processed, so a crash resumes
 //!   without missing or double-processing.
 #![forbid(unsafe_code)]
+// This crate parses on-chain amounts (issue #215): a lossy `as i64`/`as u32`/etc. cast on a
+// monetary value is a fund-loss bug, not a style issue. Mirrors the lint wall in wallet-core/crypto.
+#![deny(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![cfg_attr(test, allow(clippy::cast_possible_truncation, clippy::cast_sign_loss))]
 
 pub mod amount;
 pub mod confirmation;
