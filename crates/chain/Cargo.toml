@@ -1,0 +1,20 @@
+[package]
+name = "octo-chain"
+description = "Chain-agnostic boundary between Octo's business logic and any specific blockchain: the ChainAdapter trait, CAIP-2 chain identity, and a capability model."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Stellar is the first adapter; it forwards to wallet-core, never reimplements it.
+octo-wallet-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
