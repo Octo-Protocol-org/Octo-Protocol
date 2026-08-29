@@ -146,6 +146,73 @@ lowercase form (a generated column, `evm_address_lower`), so a client that sends
 lowercase, uppercase, or checksummed — still resolves to the same row. See
 `migrations/0021_evm_deposit_addresses.sql`.
 
+## Confirmation depth and reorg handling (EVM only)
+
+Stellar deposits are credited (`status = 'confirmed'`) the instant they're seen, because Stellar
+consensus has instant finality — a `transaction_successful` payment cannot later be reorged away.
+EVM blocks can and routinely do reorg (1–2 blocks is common on both L1 and L2s; deeper reorgs
+happen on L2 sequencer failover), so crediting an EVM deposit on sight would let an attacker
+deposit, get credited, force or exploit a reorg, and withdraw against a balance that no longer
+exists.
+
+Instead, an EVM deposit moves through explicit states, tracked in `transactions.confirmation_state`:
+
+```
+detected → confirming → confirmed          (spendable only from here)
+                      ↘
+                        orphaned            (reorg reversed it — terminal, never deleted)
+```
+
+`status` (the column every balance/aggregate query filters on) only ever becomes `'confirmed'` at
+the same moment `confirmation_state` does — see `Store::progress_evm_confirmation` — so an
+unconfirmed EVM deposit is invisible to every existing balance query with zero changes to those
+queries. `orphaned` is a distinct terminal `status`, never reusing `'failed'`: an orphaned deposit
+once existed and was later reversed (audit-relevant), whereas `'failed'` never existed as a credit
+at all.
+
+**Why depth is per-wallet, not a constant.** `wallets.confirmation_depth` and
+`wallets.reorg_rewind_bound` are set at wallet-provisioning time, not hard-coded, because
+different `eip155:*` chains carry very different reorg risk:
+
+| Chain type | Suggested `confirmation_depth` | Why |
+|---|---|---|
+| Ethereum L1 | ~12 | Standard "high-value deposit" depth; covers ordinary 1–2 block reorgs with a wide margin |
+| L2 with a centralized sequencer | Deeper (chain-specific) | A sequencer failover can reorg much further back than an L1 block-producer ever would; use the chain's own finality guidance, not the L1 number |
+| Any chain, `reorg_rewind_bound` | `≥ 2 × confirmation_depth` (this repo's default) | The bound is how far the tracker will search for a common ancestor before giving up — it must comfortably exceed the depth an ordinary reorg could reach, or every confirmed-then-reorged deposit would also blow the bound |
+
+Where a provider supports post-Merge `finalized`/`safe` block tags, those are a **stronger**
+signal than depth-counting (the tag itself encodes finality, rather than an operator's estimate of
+it) — `EvmRpcClient::block_by_tag` exposes this, though the tracker itself currently drives off
+depth-counting only; switching a chain to tag-based finality is a config-level follow-on, not a
+schema change.
+
+**Reorg detection.** A cursor that only remembers a block *number* cannot detect a same-height,
+different-hash reorg — the number looks identical either way. The tracker instead chains blocks by
+*hash*: `evm_block_headers` stores `(block_number, block_hash, parent_hash)` for every block it has
+verified, and each tick re-checks that the cursor's on-chain hash still matches what was recorded
+before trusting anything newer. A mismatch (at the cursor, or discovered mid-walk-forward)
+triggers a **bounded** backward search — comparing recorded vs. on-chain hash one block at a time
+— for the last common ancestor, capped at `reorg_rewind_bound`. Finding one: every deposit at or
+after `ancestor + 1` is marked `orphaned` (never deleted — the ledger stays append-only and the
+reversal stays visible for audit) and a `deposit.orphaned` webhook fires per row. Not finding one
+within the bound: the tracker alerts (`tracing::error!`, surfaced as `TickOutcome::DeepReorgAlert`)
+and leaves state untouched rather than guessing at or looping past a malicious/misbehaving RPC —
+see `docs/threat-model.md`'s reorg rows for the reasoning.
+
+**Can an already-withdrawn deposit be reorged away?** No — this is the property the whole
+confirmation-depth mechanism exists to guarantee. Withdrawal eligibility and reorg reversal are
+gated on the exact same `status = 'confirmed'`, which is only ever set after `confirmation_depth`
+confirmations elapsed. A deposit an attacker could withdraw against by definition already survived
+that depth of reorg risk; the residual risk is only a reorg *deeper than the configured depth*,
+which is a policy choice (see `docs/threat-model.md`'s "Known limitations"), not a gap in the
+mechanism itself.
+
+Implementation: `crates/ingest/src/confirmation.rs` (`ConfirmationTracker`, one per EVM wallet;
+`EvmSupervisor` fans this out the same way `Supervisor` does for Stellar Horizon polling) and
+`crates/ingest/src/evm_rpc.rs` (a minimal `eth_getBlockByNumber`-only JSON-RPC client — no
+alloy/ethers dependency, per this workspace's narrow-primitives ADR). Migration:
+`crates/store/migrations/0022_evm_confirmation_and_reorg.sql`.
+
 ## API shape
 
 `POST /v1/wallets/{id}/addresses` and `GET /v1/wallets/{id}/addresses` return a chain-appropriate
