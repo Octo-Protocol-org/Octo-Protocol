@@ -382,16 +382,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bs58"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
-dependencies = [
- "sha2",
- "tinyvec",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1569,6 +1559,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -1901,15 +1892,14 @@ dependencies = [
 name = "octo-evm-core"
 version = "0.1.0"
 dependencies = [
- "bs58",
  "hex",
  "hmac",
  "k256",
  "octo-crypto",
  "proptest",
+ "serde",
  "sha2",
  "sha3",
- "subtle",
  "thiserror 1.0.69",
  "tiny-bip39",
  "zeroize",

@@ -1,6 +1,6 @@
 [package]
 name = "octo-evm-core"
-description = "secp256k1 BIP-44 derivation, EIP-55 addresses, and low-s normalised signing for EVM chains."
+description = "BIP-32/BIP-44 secp256k1 derivation and EIP-55 addresses. The EVM sibling of octo-wallet-core; handles secret key material."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,24 +8,17 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[features]
-# chain_conformance_suite is a test helper (asserts invariants with unwrap/assert!, which this
-# crate's lint wall denies outside test code) meant to be reusable by other ChainAdapter impls'
-# own test suites, not just this crate's. Mirrors octo-wallet-core's test-fixtures pattern.
-test-fixtures = []
-
 [dependencies]
 octo-crypto.workspace = true
-tiny-bip39.workspace = true
 k256.workspace = true
 sha3.workspace = true
-hmac.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+tiny-bip39.workspace = true
 zeroize.workspace = true
-subtle.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-bs58.workspace = true

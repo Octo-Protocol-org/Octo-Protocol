@@ -8,17 +8,14 @@ octo is a Cargo workspace. The guiding rule: **secret material is confined to on
 ```
 crates/
   crypto/       AES-256-GCM seal/open of a gas-tank seed (random nonce + salt). No Stellar knowledge.
-  wallet-core/  The only code that touches Stellar secret keys (server-side: gas tank only):
+  wallet-core/  The only code that touches secret keys (server-side: gas tank only):
                   - SEP-0005 (SLIP-0010 ed25519) derivation: m/44'/148'/<index>'
                   - muxed address (M...) encode/decode
                   - build + sign fee-bump envelopes, then zeroize
-  evm-core/     The EVM counterpart of wallet-core — secp256k1 keys for EIP-155 chains:
-                  - BIP-44 derivation: m/44'/60'/0'/0/<index> (note: non-hardened tail, unlike
-                    wallet-core's all-hardened path — see the ADR below and the crate's own
-                    module docs for why that matters)
-                  - keccak-256 address derivation + EIP-55 mixed-case checksum
-                  - low-s normalised (EIP-2) digest signing + signer-address recovery
-  resilience/   Retry with backoff + circuit breaker for outbound Horizon / JSON-RPC calls.
+  chain/        Chain-agnostic boundary: the ChainAdapter trait, CAIP-2 ChainId, and a capability
+                model. Stellar is the first adapter — a thin forwarding layer over wallet-core.
+                See "The ChainAdapter boundary" below.
+  resilience/   Retry with backoff + circuit breaker for outbound Horizon calls.
   store/        Postgres models + migrations (sqlx).
   webhooks/     HMAC-SHA256 signed outbound webhooks with retry + delivery log.
   ingest/       Horizon payment streaming + durable cursor → deposit detection & attribution.
@@ -84,58 +81,106 @@ server, and it is confined to one crate:
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
 
-## ADR: EVM crypto crate selection (k256 + sha3 + hand-rolled BIP-32, not alloy-primitives)
+## Data model: multi-chain (#214)
 
-**Context.** `crates/evm-core` (#217) needs secp256k1 BIP-32/BIP-44 key derivation, keccak-256
-EIP-55 addressing, and ECDSA signing with low-s (EIP-2) normalisation. Two realistic paths:
+The schema used to hard-code Stellar into column names, constraints, and unique indexes —
+`wallets.network CHECK (network IN ('mainnet','testnet'))` had no chain dimension at all, and the
+anti-double-credit guard was `UNIQUE(stellar_tx_hash, operation_index)` with no chain scoping,
+which silently assumed a tx hash is globally unique (true for one Stellar network, false once a
+second chain exists). `migrations/0021_chains_registry.sql` onward generalizes this to a `chains`
+registry plus a `chain_id` column threaded through `wallets`, `addresses`, and `transactions`.
 
-1. `k256` (arithmetic/ecdsa) + `sha3` (Keccak-256) + `hmac`/`sha2` (already workspace
-   dependencies, reused for the BIP-32 `HMAC-SHA512` step) + `subtle` (constant-time comparisons),
-   with the BIP-32 CKD-priv/CKD-pub walk written directly against `k256`'s `Scalar`/`SecretKey`
-   types.
-2. `alloy-primitives`/`alloy-signer` (or `coins-bip32` + `ethers`-family crates), which bundle
-   address types, RLP, and higher-level signer abstractions on top of the same underlying curve
-   arithmetic.
+```mermaid
+erDiagram
+    chains ||--o{ wallets : "chain_id"
+    wallets ||--o{ addresses : "wallet_id"
+    wallets ||--o{ transactions : "wallet_id"
+    addresses |o--o{ transactions : "address_id"
+    chains ||--o{ addresses : "chain_id"
+    chains ||--o{ transactions : "chain_id"
 
-**Decision: (1) — `k256` + `sha3` + a from-scratch BIP-32 implementation.**
+    chains {
+        text chain_id PK "CAIP-2-shaped slug, e.g. stellar:pubnet"
+        text kind "stellar | evm"
+        text native_symbol
+        smallint native_decimals
+        integer confirmation_depth
+        boolean enabled
+    }
+    wallets {
+        uuid id PK
+        text network "legacy: mainnet | testnet"
+        text chain_id FK "NOT NULL, derived from network"
+        text stellar_account_g
+        bigint next_muxed_id
+    }
+    addresses {
+        uuid id PK
+        uuid wallet_id FK
+        text chain_id FK "NOT NULL, = parent wallet's chain_id"
+        bigint muxed_id "Stellar off-chain routing id"
+        text muxed_address "legacy"
+        text deposit_address "NOT NULL, generic; = muxed_address for Stellar"
+        bigint derivation_index "EVM HD index; null for Stellar"
+    }
+    transactions {
+        uuid id PK
+        uuid wallet_id FK
+        uuid address_id FK "nullable"
+        text chain_id FK "NOT NULL, = parent wallet's chain_id"
+        text stellar_tx_hash "legacy, nullable"
+        text tx_hash "generic, nullable, mirrors stellar_tx_hash"
+        integer operation_index "op index (Stellar) or log index (EVM)"
+    }
+```
 
-**Why.**
-- **MSRV.** The workspace pins `rust-version = "1.84.1"` (`Cargo.toml`) with the MSRV-aware
-  resolver (`.cargo/config.toml: incompatible-rust-versions = "fallback"`) keeping the whole tree
-  on 1.84-compatible dependency versions. `alloy`'s workspace crates track a materially newer
-  MSRV than 1.84 (the alloy project moves its floor forward aggressively, tracking recent stable
-  releases) and pulls in a large, fast-moving dependency graph (RLP, ABI encoding, multiple signer
-  backends, `alloy-consensus`, etc.) most of which this crate does not need — `evm-core` only
-  needs derivation, addressing, and raw digest signing, not transaction encoding or provider
-  plumbing. `k256`, `sha3`, and `subtle` are individually-versioned RustCrypto crates with a much
-  lower, slower-moving MSRV floor that fits 1.84.1 today without pinning transitive versions by
-  hand.
-- **`cargo deny` surface.** `deny.toml` allows a fixed, small set of permissive licenses and warns
-  on multiple-versions/wildcards. `k256`/`sha3`/`hmac`/`sha2`/`subtle` are RustCrypto-ecosystem
-  crates already partially present in the tree (`hmac`, `sha2` are workspace deps of
-  `wallet-core`'s SEP-0005 path already; `k256`'s own dependency graph — `elliptic-curve`,
-  `ecdsa`, `ff`, `group` — is the same family already vetted for `wallet-core`'s ed25519 stack in
-  spirit) and license MIT/Apache-2.0, both allowed. Pulling in `alloy-primitives`'s graph would add
-  a much larger number of net-new crates (and net-new maintainers/publishers) to audit for the
-  same `deny.toml` policy, for functionality (RLP, typed transactions, provider traits) this crate
-  does not use.
-- **No signing-oracle surface.** `alloy-signer`'s `Signer` trait is designed around signing
-  `alloy`'s typed transaction/message types. Taking a dependency on it would pull the crate's
-  public API toward "hand me a transaction, I'll sign it" — the opposite of the "no raw-XDR
-  oracle" posture `wallet-core/src/signer.rs` established and this crate's `signer.rs` explicitly
-  mirrors (sign a caller-supplied 32-byte digest, nothing else; the caller builds whatever
-  domain-specific hash it needs).
-- **Auditability.** BIP-32 CKD-priv is ~40 lines of scalar arithmetic over `k256::Scalar`
-  (`crates/evm-core/src/derive.rs`). Writing it directly against `k256` keeps every step —
-  including the "must not be transparently retried" analogue for key derivation, i.e. the
-  constant-time invalid-scalar/zero-key rejection required by the BIP-32 spec — visible and
-  testable against the spec's own test vectors, rather than trusting an external crate's
-  derivation path parser to have the same constant-time discipline this codebase requires
-  elsewhere (see `crates/crypto` and `wallet-core`'s zeroize-on-drop conventions).
+### Backward-compatibility strategy: additive columns, not a rename
 
-**Consequence.** `evm-core` carries slightly more from-scratch cryptographic code (the BIP-32 walk)
-than it would with a higher-level SDK, in exchange for a materially smaller, MSRV-compatible,
-easier-to-audit dependency graph and an API shape consistent with the rest of the codebase's
-signing-oracle posture. If a future issue needs RLP/typed-transaction encoding (e.g. building and
-broadcasting a legacy or EIP-1559 transaction), that belongs in a higher-level crate that depends
-on `evm-core` for keys/signing — not a reason to pull `alloy-primitives` into this one.
+Renaming `stellar_tx_hash` → `tx_hash` (etc.) in place would break the currently-running old
+binary mid-deploy — it still selects/binds the old column name. The two ways to avoid that are (a)
+rename across two releases behind a compatibility view/generated column, or (b) keep every legacy
+column and add generic ones alongside, backfilled from the legacy ones. This migration takes **(b)**:
+`network`/`stellar_tx_hash`/`muxed_address` all still exist; `chain_id`/`tx_hash`/`deposit_address`
+are new columns kept in lockstep by every `Store` write path (see
+`octo_store::stellar_chain_id_for_network`). This was chosen over (a) because a view/generated-column
+indirection adds a layer that complicates `SELECT *` / `RETURNING *` (what `sqlx::FromRow` relies on
+throughout this crate) for comparatively little benefit at this schema's size, and because keeping
+both names live is simpler to reason about during the transition than sequencing two coordinated
+releases. The cost is some duplicated data (`tx_hash` == `stellar_tx_hash` for every Stellar row
+today) — acceptable for a schema still under active expansion; a future cleanup migration can drop
+the legacy columns once every caller has moved off `network`/`stellar_tx_hash`/`muxed_address` (that
+work belongs to the `octo-chain` adapter rollout, #213/#215/#220/#223, not this migration).
+
+### Migration shape: additive → backfill → validate → enforce → swap indexes
+
+Every step is designed to avoid a long `ACCESS EXCLUSIVE` lock on `transactions` and to never let
+the anti-double-credit invariant lapse:
+
+1. **Additive** (`0021`-`0022`): create `chains`, seeded with the two existing Stellar networks;
+   add every new column as nullable with no default (fast, metadata-only on PG11+).
+2. **Backfill** (`0023`-`0025`): `wallets` (small) backfills in one `UPDATE`; `addresses` and
+   `transactions` backfill in batches of 5,000 rows, each batch committed independently (these
+   migration files are marked `-- no-transaction` specifically so a bare `COMMIT` inside the
+   backfill loop is legal) — no single transaction holds locks or accumulates WAL for the whole
+   table, and the loop resumes from the first still-`NULL` row if interrupted.
+3. **Validate** (`0026`-`0028`): `chain_id`/`deposit_address` NOT NULL is added as `CHECK (...)
+   NOT VALID` (instant), validated in a separate migration/transaction under a lock that doesn't
+   block reads/writes (`VALIDATE CONSTRAINT`), then promoted to real `NOT NULL` — which, on
+   PG12+, reuses the now-validated CHECK to skip its own table scan.
+4. **New indexes, built `CONCURRENTLY`** (`0029`-`0032`): including `uq_tx_onchain_chain` on
+   `(chain_id, tx_hash, operation_index)` — the re-scoped anti-double-credit guard — and
+   `uq_addresses_chain_deposit` on `(chain_id, deposit_address)` (generalizing the old
+   `UNIQUE(muxed_address)`, which is wrong for EVM: a deposit address is only unique *within* a
+   chain).
+5. **Drop the legacy index** (`0033`), `DROP INDEX CONCURRENTLY`, only once `uq_tx_onchain_chain`
+   is confirmed built — so the anti-double-credit guarantee is never unenforced, even briefly:
+   the new chain-scoped index is live before the old global one goes away.
+
+**Caveat for real multi-replica deploys:** `CREATE INDEX CONCURRENTLY` and `VALIDATE CONSTRAINT`
+each wait for every other in-flight transaction on the server to finish, including one that's
+merely blocked acquiring sqlx's own migration advisory lock — so two processes calling
+`store.migrate()` at the same moment while one of these migrations is pending can deadlock
+(`octo_store::Store::migrate` serializes same-process callers against this, which is what a
+parallel `cargo test` run exercises, but it cannot serialize across independent OS processes).
+Apply this migration set once (`just migrate`) before rolling out new `bin/server` replicas,
+rather than relying on every replica's own boot-time `store.migrate()` call to race it out.
