@@ -122,14 +122,6 @@ so it cannot escalate or revoke itself.
   keyset pagination. They return `{ "data": [...], "next_cursor": <uuid|null> }` — note this
   sits *inside* the response envelope, so the full shape is
   `{ statusCode, message, data: { data: [...], next_cursor } }`.
-- **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats. Internally,
-  as of issue #215, storage also carries an arbitrary-precision `amount_base_units NUMERIC(78,0)`
-  column (dual-written alongside `amount_stroops`) so a future chain whose amounts don't fit a
-  64-bit integer — e.g. an 18-decimal EVM token, where `1 token = 10^18` base units and
-  `i64::MAX ≈ 9.22 × 10^18` — can be represented exactly. **This does not change the public API
-  yet**: response bodies still return `amount_stroops` as a JSON number, unchanged. The full
-  cutover to a string-typed amount field across the public API is a separate, versioned breaking
-  change (tracked in issue #227) — watch for that version bump before relying on amounts staying
-  numeric.
+- **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
 - **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
   custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.

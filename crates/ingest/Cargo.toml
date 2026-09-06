@@ -26,7 +26,6 @@ tokio.workspace = true
 dotenvy = "0.15"
 axum.workspace = true
 octo-webhooks.workspace = true
-octo-chain.workspace = true
 proptest.workspace = true
 sqlx.workspace = true
 stellar-strkey.workspace = true

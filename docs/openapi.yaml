@@ -2,17 +2,7 @@ openapi: 3.1.0
 info:
   title: Octo Protocol API
   version: 1.0.0
-  description: >
-    OpenAPI contract for the /v1 Octo Protocol routes.
-
-
-    Every `amount_stroops` field below is a JSON `integer` and stays that way in this version —
-    that is unchanged by issue #215. Storage now also carries an arbitrary-precision
-    `amount_base_units NUMERIC(78,0)` column internally (needed so a future, non-Stellar chain
-    whose amounts don't fit 64 bits can be represented exactly), but nothing about that is exposed
-    on these schemas yet. The public cutover to a string-typed amount field is a separate,
-    versioned breaking change tracked in issue #227 — do not assume `amount_stroops` stays numeric
-    across a future major version.
+  description: OpenAPI contract for the /v1 Octo Protocol routes.
 servers:
   - url: /
 paths:

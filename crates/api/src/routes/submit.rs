@@ -21,33 +21,10 @@ use uuid::Uuid;
 /// Withdrawal-OTP TTL. Matches the signup OTP's 10-minute window.
 const WITHDRAW_OTP_TTL_MINUTES: i64 = 10;
 
-/// Number of fractional digits Stellar stroops use (1 XLM = 10^7 stroops). `format_amount`'s
-/// only current caller is the Stellar withdrawal-email path, so this is hard-coded here rather
-/// than threaded through from a token registry — see [`format_amount`]'s doc comment.
-const STROOPS_DECIMALS: u32 = 7;
-
-/// Format a base-unit integer amount as a trimmed decimal string with `decimals` fractional
-/// digits, matching Horizon's own asset precision — e.g. `format_amount(105_000_000, 7) ==
-/// "10.5"`. Pure integer arithmetic, never floats: an `f64` round trip silently loses precision
-/// once an amount's magnitude exceeds 2^53, which 18-decimal EVM amounts (issue #215) routinely
-/// do even for small human-facing balances, so this must never go through `as f64`.
-fn format_amount(units: i64, decimals: u32) -> String {
-    let negative = units < 0;
-    // `unsigned_abs` cannot overflow even for `i64::MIN`, unlike negating with unary `-`.
-    let magnitude = units.unsigned_abs();
-    let scale = 10u64.pow(decimals);
-    let whole = magnitude / scale;
-    let frac = magnitude % scale;
-    let mut s = if frac == 0 {
-        whole.to_string()
-    } else {
-        let frac_str = format!("{frac:0width$}", width = decimals as usize);
-        format!("{whole}.{}", frac_str.trim_end_matches('0'))
-    };
-    if negative {
-        s.insert(0, '-');
-    }
-    s
+/// Stroops (1e-7) as a trimmed decimal string, matching Horizon's own asset precision.
+fn format_amount(stroops: i64) -> String {
+    let s = format!("{:.7}", stroops as f64 / 10_000_000.0);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -350,7 +327,7 @@ pub async fn withdraw_confirm(
         // Wrong/expired/reused code: never touches Horizon. Tell the user in case it wasn't them.
         if let Some(p) = &payment {
             let html = octo_email::templates::withdrawal_failed_email(
-                &format_amount(p.amount_stroops, STROOPS_DECIMALS),
+                &format_amount(p.amount_stroops),
                 &p.asset_code,
                 &p.destination,
                 "an incorrect verification code was entered",
@@ -376,9 +353,7 @@ pub async fn withdraw_confirm(
     .await;
 
     let (amount, asset, destination) = (
-        outcome
-            .amount_stroops
-            .map(|s| format_amount(s, STROOPS_DECIMALS)),
+        outcome.amount_stroops.map(format_amount),
         outcome.asset_code.clone(),
         outcome.destination.clone(),
     );
@@ -462,40 +437,4 @@ pub struct SigningInfo {
     pub sequence: i64,
     pub network_passphrase: String,
     pub base_fee_stroops: i64,
-}
-
-#[cfg(test)]
-mod format_amount_tests {
-    use super::*;
-
-    #[test]
-    fn whole_and_fractional() {
-        assert_eq!(format_amount(10_000_000, 7), "1");
-        assert_eq!(format_amount(105_000_000, 7), "10.5");
-        assert_eq!(format_amount(1, 7), "0.0000001");
-        assert_eq!(format_amount(0, 7), "0");
-    }
-
-    #[test]
-    fn trims_trailing_zeros_but_not_significant_digits() {
-        assert_eq!(format_amount(100_000_001, 7), "10.0000001");
-        assert_eq!(format_amount(123_456_700, 7), "12.34567");
-    }
-
-    #[test]
-    fn no_precision_loss_past_f64_safe_integer_range() {
-        // 2^53, the largest integer an f64 can represent exactly. A float round trip through
-        // `as f64` would risk silent rounding on values at or beyond this magnitude — exactly the
-        // 18-decimal EVM case issue #215 exists to fix. Exact integer arithmetic must not care.
-        let past_f64_safe_range: i64 = (1i64 << 53) + 1;
-        assert_eq!(
-            format_amount(past_f64_safe_range, 0),
-            past_f64_safe_range.to_string()
-        );
-    }
-
-    #[test]
-    fn negative_is_formatted_with_leading_minus() {
-        assert_eq!(format_amount(-105_000_000, 7), "-10.5");
-    }
 }

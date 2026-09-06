@@ -1,13 +1,8 @@
 //! Typed row models mirroring the schema in `migrations/0001_init.sql`.
 //!
-//! Amounts are `i64` stroops throughout (never floating point), plus (since `migrations/
-//! 0021_numeric_amounts.sql`) an arbitrary-precision `amount_base_units` `NUMERIC(78,0)` column on
-//! `transactions` and `withdrawals` for EVM compatibility (see `octo_chain::Amount`). The two
-//! columns are dual-written; `amount_stroops` remains the column of record for at least one
-//! release (see the migration for the rollback rationale). Sealed-seed bytes are stored as
+//! Amounts are `i64` stroops throughout (never floating point). Sealed-seed bytes are stored as
 //! `Vec<u8>` and only ever decrypted inside `octo-wallet-core`.
 
-use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -129,10 +124,6 @@ pub struct Transaction {
     pub asset_code: String,
     pub asset_issuer: Option<String>,
     pub amount_stroops: i64,
-    /// Arbitrary-precision base-unit amount (see `octo_chain::Amount`). `None` only for rows
-    /// written before `migrations/0021_numeric_amounts.sql`'s backfill ran; the store always
-    /// populates this on new writes going forward.
-    pub amount_base_units: Option<BigDecimal>,
     pub source_account: Option<String>,
     pub destination_account: Option<String>,
     pub stellar_tx_hash: Option<String>,
@@ -180,10 +171,6 @@ pub struct Withdrawal {
     pub asset_code: String,
     pub asset_issuer: Option<String>,
     pub amount_stroops: i64,
-    /// Arbitrary-precision base-unit amount (see `octo_chain::Amount`). `None` only for rows
-    /// written before `migrations/0021_numeric_amounts.sql`'s backfill ran; the store always
-    /// populates this on new writes going forward.
-    pub amount_base_units: Option<BigDecimal>,
     pub memo_id: Option<i64>,
     pub status: String,
     pub stellar_tx_hash: Option<String>,

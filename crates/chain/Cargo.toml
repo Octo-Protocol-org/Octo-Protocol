@@ -1,6 +1,6 @@
 [package]
 name = "octo-chain"
-description = "Chain-agnostic value types shared across octo — starting with Amount, an arbitrary-precision base-unit integer safe for both Stellar stroops and EVM uint256."
+description = "Minimal ChainAdapter boundary for deposit-address derivation (Stellar muxed vs EVM HD). Scoped to issue #220; the full trait (capabilities, registry, CAIP-2 identity) belongs to the chain-abstraction issue."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-primitive-types.workspace = true
-bigdecimal.workspace = true
-serde.workspace = true
+octo-crypto.workspace = true
+octo-wallet-core.workspace = true
+octo-evm-core.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-proptest.workspace = true
-serde_json.workspace = true

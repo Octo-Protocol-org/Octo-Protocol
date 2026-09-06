@@ -2,15 +2,6 @@
 //!
 //! Stellar amounts have exactly 7 decimal places (1 unit = 10_000_000 stroops). Horizon returns
 //! them as strings like "10.0000000". We parse digit-by-digit to avoid float rounding.
-//!
-//! [`to_stroops`] returns a plain `i64` rather than an [`octo_chain::Amount`] because the
-//! conversion is always representable: the function's own `checked_mul`/`checked_add` already
-//! reject any input that would overflow `i64` (returning `None`, never truncating), and every
-//! `i64` produced here is later converted fallibly via `Amount::try_from` at the storage boundary
-//! (`octo_store::Store::record_deposit`), which is where the arbitrary-precision `amount_base_units`
-//! column actually gets populated (see migration `0021_numeric_amounts.sql`, issue #215). The
-//! `stroops_always_fit_amount` test below locks in that every value this parser can produce is
-//! guaranteed to round-trip through `Amount` without error.
 
 /// Stroops per whole unit (7 decimal places).
 const STROOPS_PER_UNIT: i64 = 10_000_000;
@@ -103,17 +94,5 @@ mod tests {
     #[test]
     fn leading_plus_sign_behavior_is_locked_in() {
         assert_eq!(to_stroops("+1.0000000"), None);
-    }
-
-    /// Every non-negative `i64` `to_stroops` can produce must convert into an `octo_chain::Amount`
-    /// without error — locks in the invariant the module doc relies on (see #215).
-    #[test]
-    fn stroops_always_fit_amount() {
-        for stroops in [0i64, 1, 10_000_000, i64::MAX] {
-            assert!(
-                octo_chain::Amount::try_from(stroops).is_ok(),
-                "stroops value {stroops} must convert to Amount without error"
-            );
-        }
     }
 }

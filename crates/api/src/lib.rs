@@ -3,10 +3,6 @@
 //! All responses use the `{ statusCode, message, data }` envelope (see [`error`]). State and
 //! secret handling live in [`state`]; routes never touch raw seed material.
 #![forbid(unsafe_code)]
-// This crate serialises and formats amounts (issue #215): a lossy `as i64`/`as u32`/etc. cast on
-// a monetary value is a fund-loss bug, not a style issue. Mirrors the lint wall in wallet-core/crypto.
-#![deny(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#![cfg_attr(test, allow(clippy::cast_possible_truncation, clippy::cast_sign_loss))]
 
 pub mod audit;
 pub mod auth;

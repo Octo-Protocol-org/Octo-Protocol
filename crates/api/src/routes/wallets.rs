@@ -386,14 +386,10 @@ pub async fn list_transactions(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    // `limit` is already bounded to 1..=200 by `validated_limit`, so this conversion cannot
-    // truncate or flip sign in practice; `try_from` is used rather than `as` regardless so a
-    // future change to that bound can't silently reintroduce a lossy cast here.
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let has_more = rows.len() > limit_usize;
+    let has_more = rows.len() > limit as usize;
     let mut data = rows;
     if has_more {
-        data.truncate(limit_usize);
+        data.truncate(limit as usize);
     }
     let next_cursor = if has_more {
         data.last().map(|r| r.id)
@@ -447,14 +443,10 @@ pub async fn list_wallets(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    // `limit` is already bounded to 1..=200 by `validated_limit`, so this conversion cannot
-    // truncate or flip sign in practice; `try_from` is used rather than `as` regardless so a
-    // future change to that bound can't silently reintroduce a lossy cast here.
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let has_more = rows.len() > limit_usize;
+    let has_more = rows.len() > limit as usize;
     let mut wallets = rows;
     if has_more {
-        wallets.truncate(limit_usize);
+        wallets.truncate(limit as usize);
     }
     let next_cursor = if has_more {
         wallets.last().map(|w| w.id)

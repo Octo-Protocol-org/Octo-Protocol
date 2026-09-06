@@ -1202,13 +1202,16 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0033.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-        "expected exactly the twenty-one known migrations to be recorded as applied"
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32, 33
+        ],
+        "expected exactly the thirty-three known migrations to be recorded as applied"
     );
 }
 
@@ -1553,130 +1556,413 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
     );
 }
 
-// --- arbitrary-precision amounts (issue #215) --------------------------
+// --- multi-chain migration round-trip (#214) -------------------------------------------------
+//
+// The tests below don't use the shared `store()` database (that one is already fully migrated
+// through 0033 by the time any test runs). Instead they bootstrap a *fresh, scratch* database,
+// apply only the pre-#214 migrations (0001..0020) to reproduce the exact schema shape that exists
+// in production today, seed it with representative Stellar rows, then apply 0021..0033 and assert
+// every row survived intact and every invariant now holds — the "zero data loss" and "every
+// invariant still holds" deliverable called out in #214.
 
-/// The exact case a `NUMERIC`-backed `i64` schema alone would still handle, but a JSON *number*
-/// could not: `10^18` (1 ETH in wei) exceeds `2^53 - 1`, the largest integer a JS double can
-/// represent exactly. `record_deposit` dual-writes `amount_base_units`; this asserts the value
-/// that comes back out of Postgres converts to the exact same `Amount`, and that `Amount`
-/// serializes as a JSON string bit-identical to the source value — the full store round trip
-/// described in the issue.
-#[tokio::test]
-async fn one_eth_in_wei_round_trips_through_store_and_json_bit_identically() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_wallet(&store).await;
-    let tx_hash = Uuid::new_v4().to_string();
+/// Legacy (pre-#214) migrations, in order — the schema shape live in production today.
+const LEGACY_MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_horizon_op_id.sql"),
+    include_str!("../migrations/0003_users.sql"),
+    include_str!("../migrations/0004_wallet_owner.sql"),
+    include_str!("../migrations/0005_api_keys.sql"),
+    include_str!("../migrations/0006_audit_logs.sql"),
+    include_str!("../migrations/0007_gas_sponsorship.sql"),
+    include_str!("../migrations/0008_scheme_version.sql"),
+    include_str!("../migrations/0009_token_denylist.sql"),
+    include_str!("../migrations/0010_sponsored_tx_status_index.sql"),
+    include_str!("../migrations/0011_sponsored_and_audit_indexing.sql"),
+    include_str!("../migrations/0012_client_custody.sql"),
+    include_str!("../migrations/0013_withdrawal_allowlist.sql"),
+    include_str!("../migrations/0014_payment_links.sql"),
+    include_str!("../migrations/0015_payment_intent_address.sql"),
+    include_str!("../migrations/0016_ingest_last_polled.sql"),
+    include_str!("../migrations/0017_payment_link_redirect_url.sql"),
+    include_str!("../migrations/0018_payment_status_expansion.sql"),
+    include_str!("../migrations/0019_email_otp.sql"),
+    include_str!("../migrations/0020_username.sql"),
+];
 
-    let one_eth_wei: i64 = 1_000_000_000_000_000_000; // 10^18, fits i64 but not a JS-safe double.
+/// The #214 multi-chain migrations, in order.
+const MULTI_CHAIN_MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0021_chains_registry.sql"),
+    include_str!("../migrations/0022_chain_scoped_columns.sql"),
+    include_str!("../migrations/0023_backfill_wallets_chain_id.sql"),
+    include_str!("../migrations/0024_backfill_addresses_chain_id.sql"),
+    include_str!("../migrations/0025_backfill_transactions_chain_id.sql"),
+    include_str!("../migrations/0026_chain_id_not_null_check.sql"),
+    include_str!("../migrations/0027_validate_chain_id_not_null.sql"),
+    include_str!("../migrations/0028_chain_id_set_not_null.sql"),
+    include_str!("../migrations/0029_idx_addresses_chain_concurrent.sql"),
+    include_str!("../migrations/0030_uq_addresses_chain_deposit_concurrent.sql"),
+    include_str!("../migrations/0031_idx_tx_chain_concurrent.sql"),
+    include_str!("../migrations/0032_uq_tx_onchain_chain_concurrent.sql"),
+    include_str!("../migrations/0033_drop_legacy_uq_tx_onchain_concurrent.sql"),
+];
 
-    let dep = NewDeposit {
-        wallet_id,
-        address_id: None,
-        asset_code: "native".into(),
-        asset_issuer: None,
-        amount_stroops: one_eth_wei,
-        source_account: Some("Gsender".into()),
-        destination_account: Some("Gmaster".into()),
-        stellar_tx_hash: tx_hash.clone(),
-        operation_index: 0,
-        horizon_op_id: format!("{tx_hash}-0"),
-        ledger: Some(123),
-        memo_id: None,
-    };
+/// Create a throwaway scratch database on the same server as `DATABASE_URL` and return
+/// `(admin_url pointed at the `postgres` maintenance db, scratch db's own URL, scratch db name)`.
+async fn create_scratch_database(base_url: &str) -> (String, String, String) {
+    let scratch_db = format!("octo_migration_rt_{}", Uuid::new_v4().simple());
+    let last_slash = base_url
+        .rfind('/')
+        .expect("DATABASE_URL must contain a path");
+    let server_url = &base_url[..last_slash];
+    let admin_url = format!("{server_url}/postgres");
+    let scratch_url = format!("{server_url}/{scratch_db}");
 
-    let tx = store
-        .record_deposit(&dep)
+    let mut admin_conn = sqlx::PgConnection::connect(&admin_url)
         .await
-        .expect("record deposit")
-        .expect("first insert is not a duplicate");
-
-    let stored_base_units = tx
-        .amount_base_units
-        .clone()
-        .expect("amount_base_units is populated on every new write");
-
-    // Read the row back fresh from Postgres (not just the RETURNING clause) to prove this is a
-    // genuine round trip through NUMERIC(78,0), not just an in-memory echo.
-    let reloaded = store
-        .get_transaction(tx.id)
+        .expect("connect to maintenance db");
+    sqlx::raw_sql(&format!("CREATE DATABASE {scratch_db}"))
+        .execute(&mut admin_conn)
         .await
-        .expect("get_transaction")
-        .expect("transaction exists");
-    let reloaded_base_units = reloaded
-        .amount_base_units
-        .expect("amount_base_units survives a fresh read");
-    assert_eq!(
-        reloaded_base_units, stored_base_units,
-        "NUMERIC(78,0) round trip must be exact"
-    );
+        .expect("create scratch database");
 
-    let amount =
-        octo_chain::Amount::try_from(reloaded_base_units).expect("valid non-negative integer");
-    let expected = octo_chain::Amount::try_from(one_eth_wei).expect("i64 -> Amount");
-    assert_eq!(amount, expected, "DB round trip must be bit-identical");
-
-    // The client-facing half: this Amount, once wired into a response type (issue #227 does the
-    // full API cutover), must serialize as a JSON string, not a bare number that would lose
-    // precision in every JS client.
-    let json = serde_json::to_string(&amount).expect("serialize");
-    assert_eq!(json, "\"1000000000000000000\"");
-    let back: octo_chain::Amount = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back, amount);
+    (admin_url, scratch_url, scratch_db)
 }
 
-/// `i64::MAX` stroops is the largest value the legacy Stellar path can produce; it must survive
-/// the new column without loss.
-#[tokio::test]
-async fn i64_max_stroops_round_trips_through_amount_base_units() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_wallet(&store).await;
-    let tx_hash = Uuid::new_v4().to_string();
+/// Best-effort teardown: closes the pool, then drops the scratch database. Failures here don't
+/// fail the test — leaked scratch databases are a local dev/CI-runner cleanup concern, not a
+/// correctness one.
+async fn drop_scratch_database(pool: sqlx::PgPool, admin_url: &str, scratch_db: &str) {
+    pool.close().await;
+    if let Ok(mut admin_conn) = sqlx::PgConnection::connect(admin_url).await {
+        let _ = sqlx::raw_sql(&format!(
+            "DROP DATABASE IF EXISTS {scratch_db} WITH (FORCE)"
+        ))
+        .execute(&mut admin_conn)
+        .await;
+    }
+}
 
-    let dep = NewDeposit {
-        wallet_id,
-        address_id: None,
+#[tokio::test]
+async fn migration_round_trip_preserves_pre_migration_stellar_data_and_invariants() {
+    let Some(base_url) = database_url() else {
+        eprintln!("SKIPPED: DATABASE_URL is not set.");
+        return;
+    };
+
+    let (admin_url, scratch_url, scratch_db) = create_scratch_database(&base_url).await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&scratch_url)
+        .await
+        .expect("connect to scratch database");
+
+    // --- Phase 1: reproduce the exact pre-#214 production schema. ---
+    for migration in LEGACY_MIGRATIONS {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("apply legacy migration");
+    }
+
+    // --- Phase 2: seed representative pre-migration Stellar rows. ---
+    // A server-custody mainnet wallet and a client-custody testnet wallet (covering both the
+    // NOT NULL sealed_* path and the nullable client-custody path), each with addresses and a mix
+    // of confirmed deposits, a null-hash pending withdrawal row, and null asset_issuer/ledger
+    // fields — the kinds of rows that actually exist in a production `transactions` table.
+    let mainnet_wallet: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO wallets
+            (network, stellar_account_g, sealed_ciphertext, sealed_nonce, sealed_salt,
+             sealed_scheme, next_muxed_id, label)
+        VALUES ('mainnet', $1, 'ct', 'n', 's', 1, 3, 'legacy mainnet wallet')
+        RETURNING id
+        "#,
+    )
+    .bind(format!("G{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed mainnet wallet");
+
+    let testnet_wallet: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO wallets
+            (network, stellar_account_g, custody, encrypted_backup, next_muxed_id, label)
+        VALUES ('testnet', $1, 'client', 'opaque-blob', 2, 'legacy client wallet')
+        RETURNING id
+        "#,
+    )
+    .bind(format!("G{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed testnet wallet");
+
+    let addr_a1: Uuid = sqlx::query_scalar(
+        "INSERT INTO addresses (wallet_id, muxed_id, muxed_address, customer_ref)
+         VALUES ($1, 1, $2, 'cust-a') RETURNING id",
+    )
+    .bind(mainnet_wallet)
+    .bind(format!("M{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed address a1");
+
+    let addr_a2: Uuid = sqlx::query_scalar(
+        "INSERT INTO addresses (wallet_id, muxed_id, muxed_address, customer_ref)
+         VALUES ($1, 2, $2, 'cust-b') RETURNING id",
+    )
+    .bind(mainnet_wallet)
+    .bind(format!("M{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed address a2");
+
+    let addr_b1: Uuid = sqlx::query_scalar(
+        "INSERT INTO addresses (wallet_id, muxed_id, muxed_address, customer_ref)
+         VALUES ($1, 1, $2, 'cust-c') RETURNING id",
+    )
+    .bind(testnet_wallet)
+    .bind(format!("M{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed address b1");
+
+    let hash_1 = format!("hash-{}", Uuid::new_v4().simple());
+    let hash_2 = format!("hash-{}", Uuid::new_v4().simple());
+    let hash_3 = format!("hash-{}", Uuid::new_v4().simple());
+
+    sqlx::query(
+        r#"
+        INSERT INTO transactions
+            (wallet_id, address_id, direction, asset_code, amount_stroops, stellar_tx_hash,
+             operation_index, horizon_op_id, ledger, status)
+        VALUES ($1, $2, 'deposit', 'native', 10000000, $3, 0, $4, 100, 'confirmed')
+        "#,
+    )
+    .bind(mainnet_wallet)
+    .bind(addr_a1)
+    .bind(&hash_1)
+    .bind(format!("{hash_1}-0"))
+    .execute(&pool)
+    .await
+    .expect("seed deposit 1");
+
+    sqlx::query(
+        r#"
+        INSERT INTO transactions
+            (wallet_id, address_id, direction, asset_code, asset_issuer, amount_stroops,
+             stellar_tx_hash, operation_index, horizon_op_id, status)
+        VALUES ($1, $2, 'deposit', 'USDC', 'GISSUER', 5000000, $3, 1, $4, 'confirmed')
+        "#,
+    )
+    .bind(mainnet_wallet)
+    .bind(addr_a2)
+    .bind(&hash_2)
+    .bind(format!("{hash_2}-1"))
+    .execute(&pool)
+    .await
+    .expect("seed deposit 2");
+
+    sqlx::query(
+        r#"
+        INSERT INTO transactions
+            (wallet_id, address_id, direction, asset_code, amount_stroops, stellar_tx_hash,
+             operation_index, horizon_op_id, status)
+        VALUES ($1, $2, 'deposit', 'native', 2500000, $3, 0, $4, 'confirmed')
+        "#,
+    )
+    .bind(testnet_wallet)
+    .bind(addr_b1)
+    .bind(&hash_3)
+    .bind(format!("{hash_3}-0"))
+    .execute(&pool)
+    .await
+    .expect("seed deposit 3");
+
+    // A withdrawal-only row: no tx hash yet (mirrors a pending payout before submission).
+    sqlx::query(
+        "INSERT INTO transactions (wallet_id, direction, asset_code, amount_stroops, status)
+         VALUES ($1, 'withdrawal', 'native', 1000000, 'pending')",
+    )
+    .bind(mainnet_wallet)
+    .execute(&pool)
+    .await
+    .expect("seed pending withdrawal");
+
+    let pre_wallet_count: i64 = sqlx::query_scalar("SELECT count(*) FROM wallets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let pre_address_count: i64 = sqlx::query_scalar("SELECT count(*) FROM addresses")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let pre_tx_count: i64 = sqlx::query_scalar("SELECT count(*) FROM transactions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // --- Phase 3: apply the #214 multi-chain migrations. ---
+    for migration in MULTI_CHAIN_MIGRATIONS {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("apply multi-chain migration");
+    }
+
+    // --- Phase 4: zero data loss. ---
+    let post_wallet_count: i64 = sqlx::query_scalar("SELECT count(*) FROM wallets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let post_address_count: i64 = sqlx::query_scalar("SELECT count(*) FROM addresses")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let post_tx_count: i64 = sqlx::query_scalar("SELECT count(*) FROM transactions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pre_wallet_count, post_wallet_count, "no wallets lost");
+    assert_eq!(pre_address_count, post_address_count, "no addresses lost");
+    assert_eq!(pre_tx_count, post_tx_count, "no transactions lost");
+
+    // --- Phase 5: every row backfilled correctly. ---
+    let (mainnet_chain, testnet_chain): (String, String) = (
+        sqlx::query_scalar("SELECT chain_id FROM wallets WHERE id = $1")
+            .bind(mainnet_wallet)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT chain_id FROM wallets WHERE id = $1")
+            .bind(testnet_wallet)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(mainnet_chain, "stellar:pubnet");
+    assert_eq!(testnet_chain, "stellar:testnet");
+
+    let address_rows: Vec<(Uuid, String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, chain_id, muxed_address, deposit_address, derivation_index FROM addresses",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(address_rows.len(), 3);
+    for (id, chain_id, muxed_address, deposit_address, derivation_index) in &address_rows {
+        let expected_chain = if [addr_a1, addr_a2].contains(id) {
+            &mainnet_chain
+        } else {
+            &testnet_chain
+        };
+        assert_eq!(
+            chain_id, expected_chain,
+            "address chain_id must match its wallet's"
+        );
+        assert_eq!(
+            deposit_address, muxed_address,
+            "deposit_address must mirror muxed_address for backfilled Stellar rows"
+        );
+        assert!(derivation_index.is_none());
+    }
+
+    let tx_rows: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT chain_id, stellar_tx_hash, tx_hash FROM transactions")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(tx_rows.len(), 4);
+    for (chain_id, stellar_tx_hash, tx_hash) in &tx_rows {
+        assert!(
+            chain_id == &mainnet_chain || chain_id == &testnet_chain,
+            "every transaction must have a real chain_id"
+        );
+        assert_eq!(
+            tx_hash, stellar_tx_hash,
+            "tx_hash must mirror stellar_tx_hash, including the NULL withdrawal row"
+        );
+    }
+    assert!(
+        tx_rows.iter().any(|(_, hash, _)| hash.is_none()),
+        "the pending withdrawal's NULL hash must be preserved, not coerced to a value"
+    );
+
+    // --- Phase 6: NOT NULL is really enforced (not just true by coincidence of the seed data). ---
+    let non_nullable: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT table_name, column_name FROM information_schema.columns
+        WHERE (table_name, column_name) IN (
+            ('wallets', 'chain_id'), ('addresses', 'chain_id'),
+            ('addresses', 'deposit_address'), ('transactions', 'chain_id')
+        ) AND is_nullable = 'NO'
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        non_nullable.len(),
+        4,
+        "all four chain-scoping columns must be NOT NULL after the migration set: {non_nullable:?}"
+    );
+
+    // --- Phase 7: the new chain-scoped unique indexes exist; the old global one is gone. ---
+    let index_names: Vec<String> =
+        sqlx::query_scalar("SELECT indexname FROM pg_indexes WHERE tablename = 'transactions'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(index_names.contains(&"uq_tx_onchain_chain".to_string()));
+    assert!(
+        !index_names.contains(&"uq_tx_onchain".to_string()),
+        "the old non-chain-scoped index must be dropped once the new one is live"
+    );
+    let addr_index_names: Vec<String> =
+        sqlx::query_scalar("SELECT indexname FROM pg_indexes WHERE tablename = 'addresses'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(addr_index_names.contains(&"uq_addresses_chain_deposit".to_string()));
+
+    // --- Phase 8: the live Store API still works end-to-end against the migrated-in-place schema
+    // (not just a from-scratch one) — allocate a new address and record a new deposit.
+    let store = Store::from_pool(pool.clone());
+    let wid = mainnet_wallet.simple();
+    let new_address = store
+        .allocate_address(
+            mainnet_wallet,
+            |id| Ok(format!("M{wid}-{id}")),
+            Some("post-migration-customer"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("allocate address on migrated-in-place wallet");
+    assert_eq!(new_address.chain_id, mainnet_chain);
+    assert_eq!(
+        new_address.muxed_id, 3,
+        "counter continued from the legacy next_muxed_id"
+    );
+
+    let new_dep = NewDeposit {
+        wallet_id: mainnet_wallet,
+        address_id: Some(new_address.id),
         asset_code: "native".into(),
         asset_issuer: None,
-        amount_stroops: i64::MAX,
+        amount_stroops: 42,
         source_account: None,
         destination_account: None,
-        stellar_tx_hash: tx_hash.clone(),
+        stellar_tx_hash: format!("post-migration-{}", Uuid::new_v4().simple()),
         operation_index: 0,
-        horizon_op_id: format!("{tx_hash}-0"),
+        horizon_op_id: format!("post-migration-{}", Uuid::new_v4().simple()),
         ledger: None,
         memo_id: None,
     };
-
-    let tx = store
-        .record_deposit(&dep)
+    let recorded = store
+        .record_deposit(&new_dep)
         .await
-        .expect("record deposit")
-        .expect("first insert");
-    let base_units = tx.amount_base_units.expect("populated");
-    let amount = octo_chain::Amount::try_from(base_units).expect("valid");
-    assert_eq!(amount.to_i64(), Ok(i64::MAX));
-}
+        .expect("record deposit on migrated-in-place wallet");
+    assert!(recorded.is_some());
+    assert_eq!(recorded.unwrap().chain_id, mainnet_chain);
 
-/// `create_withdrawal` must dual-write `amount_base_units` too, not just deposits.
-#[tokio::test]
-async fn withdrawal_dual_writes_amount_base_units() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_wallet(&store).await;
-
-    let w = store
-        .create_withdrawal(NewWithdrawal {
-            wallet_id,
-            idempotency_key: &Uuid::new_v4().to_string(),
-            destination_account: "Gdest",
-            asset_code: "native",
-            asset_issuer: None,
-            amount_stroops: 42_000_000,
-            memo_id: None,
-        })
-        .await
-        .expect("create withdrawal");
-
-    let base_units = w.amount_base_units.expect("populated");
-    let amount = octo_chain::Amount::try_from(base_units).expect("valid");
-    assert_eq!(amount.to_i64(), Ok(42_000_000));
+    drop_scratch_database(pool, &admin_url, &scratch_db).await;
 }
