@@ -17,10 +17,6 @@ test:
 test-live:
     OCTO_LIVE_TESTS=1 cargo test --workspace
 
-# Run EVM integration tests against a local Anvil (Foundry). Requires `anvil` on PATH.
-test-evm:
-    OCTO_EVM_TESTS=1 cargo test -p octo-evm-test-support
-
 # Format the code.
 fmt:
     cargo fmt --all

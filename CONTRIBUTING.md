@@ -14,20 +14,6 @@ cp .env.example .env
 just build && just test
 ```
 
-### Optional: EVM tests (Foundry)
-
-The `octo-evm-test-support` crate drives a local [Anvil](https://getfoundry.sh) devnet for EVM
-integration tests — the same "run against a local node, not a public testnet" story
-`StellarNetwork::Standalone` gives Stellar work. These tests are skipped by default (`just test`
-stays green with no Foundry installed); install Foundry and opt in with `just test-evm` if you're
-working on EVM code:
-
-```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
-just test-evm
-```
-
 ## Before opening a PR
 
 Run the same checks CI runs:
