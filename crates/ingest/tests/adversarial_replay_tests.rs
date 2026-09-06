@@ -127,7 +127,7 @@ async fn build_pool(store: &Store, wallet_id: Uuid, n: usize) -> Vec<PaymentReco
             transaction_successful: true,
             from: Some("Gsender".into()),
             to: Some(BASE.into()),
-            to_muxed: addr.muxed_address.clone(),
+            to_muxed: Some(addr.muxed_address.clone()),
             to_muxed_id: None,
             asset_type: Some("native".into()),
             asset_code: None,

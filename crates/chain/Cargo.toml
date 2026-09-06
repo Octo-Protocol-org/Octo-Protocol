@@ -1,6 +1,6 @@
 [package]
 name = "octo-chain"
-description = "Minimal ChainAdapter boundary for deposit-address derivation (Stellar muxed vs EVM HD). Scoped to issue #220; the full trait (capabilities, registry, CAIP-2 identity) belongs to the chain-abstraction issue."
+description = "Chain-agnostic boundary between Octo's business logic and any specific blockchain: the ChainAdapter trait, CAIP-2 chain identity, and a capability model."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-octo-crypto.workspace = true
+# Stellar is the first adapter; it forwards to wallet-core, never reimplements it.
 octo-wallet-core.workspace = true
-octo-evm-core.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+

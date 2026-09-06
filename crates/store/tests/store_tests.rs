@@ -8,8 +8,7 @@
 //! green). If a URL is found but the DB is unreachable, the test fails loudly with the reason.
 
 use octo_store::{
-    NewDeposit, NewEvmDeposit, NewEvmWallet, NewPaymentLink, NewSponsoredTx, NewWallet,
-    NewWithdrawal, Store, StoreError,
+    NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
 };
 use std::sync::Once;
 use uuid::Uuid;
@@ -97,8 +96,8 @@ async fn allocate_address_increments_atomically() {
         .await
         .expect("alloc b");
 
-    assert_eq!(a.muxed_id, Some(1));
-    assert_eq!(b.muxed_id, Some(2));
+    assert_eq!(a.muxed_id, 1);
+    assert_eq!(b.muxed_id, 2);
     assert_ne!(a.muxed_address, b.muxed_address);
 
     let list = store
@@ -106,203 +105,6 @@ async fn allocate_address_increments_atomically() {
         .await
         .expect("list");
     assert_eq!(list.len(), 2);
-}
-
-// --- EVM deposit addresses (issue #220) ------------------------------------------------------
-//
-// These tests deliberately do NOT depend on octo-evm-core (store never depends on wallet-core
-// either — see fresh_wallet's fake muxed encoding above), so the derive closure just returns a
-// fake-but-validly-shaped `0x...` string. Real BIP-44/EIP-55 correctness is covered in
-// crates/evm-core's own test suite (BIP-32 spec vectors, EIP-55 spec vectors, and cross-checks
-// against an independent implementation); what belongs here is the STORE's contract: atomic
-// index allocation and case-insensitive lookup.
-
-/// Create a throwaway EVM wallet with a unique identity address (so tests don't collide).
-async fn fresh_evm_wallet(store: &Store) -> Uuid {
-    fresh_evm_wallet_with_depth(store, 6).await
-}
-
-/// Like [`fresh_evm_wallet`], with an explicit confirmation depth (rewind bound defaults to 2x,
-/// the issue's suggested default) — for tests that exercise confirmation/reorg behavior.
-async fn fresh_evm_wallet_with_depth(store: &Store, confirmation_depth: i32) -> Uuid {
-    let identity = format!("0x{:040x}", Uuid::new_v4().as_u128());
-    let w = store
-        .create_evm_wallet(NewEvmWallet {
-            network: "testnet",
-            chain_id: "eip155:31337", // anvil's default chain id
-            identity_address: &identity,
-            sealed_ciphertext: b"ciphertext",
-            sealed_nonce: b"nonce12bytes",
-            sealed_salt: b"saltsaltsaltsalt",
-            sealed_scheme: 1,
-            confirmation_depth,
-            reorg_rewind_bound: confirmation_depth * 2,
-            label: Some("test-evm"),
-            user_id: None,
-            description: None,
-        })
-        .await
-        .expect("create evm wallet");
-    w.id
-}
-
-/// A fake-but-validly-shaped EIP-55-style address for a given index, unique per (wallet, index)
-/// via a random prefix — good enough for exercising store-level allocation/lookup, not real
-/// derivation.
-fn fake_evm_address(salt: u128, index: u32) -> String {
-    format!("0x{salt:032x}{index:08x}")
-}
-
-#[tokio::test]
-async fn allocate_evm_address_increments_atomically() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_evm_wallet(&store).await;
-    let salt = Uuid::new_v4().as_u128();
-
-    let a = store
-        .allocate_evm_address(
-            wallet_id,
-            |index| Ok(fake_evm_address(salt, index)),
-            Some("user-a"),
-            serde_json::json!({}),
-        )
-        .await
-        .expect("alloc a");
-    let b = store
-        .allocate_evm_address(
-            wallet_id,
-            |index| Ok(fake_evm_address(salt, index)),
-            Some("user-b"),
-            serde_json::json!({}),
-        )
-        .await
-        .expect("alloc b");
-
-    assert_eq!(a.derivation_index, Some(0));
-    assert_eq!(b.derivation_index, Some(1));
-    assert_ne!(a.evm_address, b.evm_address);
-    // The EVM shape, not the Stellar shape.
-    assert_eq!(a.muxed_id, None);
-    assert_eq!(a.muxed_address, None);
-
-    let list = store
-        .list_addresses(wallet_id, 100, None)
-        .await
-        .expect("list");
-    assert_eq!(list.len(), 2);
-}
-
-/// N concurrent allocations on ONE evm wallet must yield N distinct, gap-free indexes and N
-/// distinct addresses — the atomicity guarantee `allocate_address` already gives Stellar, carried
-/// over to the EVM sibling. Modeled on the row-lock pattern exercised by
-/// `crates/ingest/tests/supervisor_concurrency_tests.rs`.
-#[tokio::test]
-async fn allocate_evm_address_concurrent_allocations_are_gap_free_and_unique() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_evm_wallet(&store).await;
-    let salt = Uuid::new_v4().as_u128();
-
-    const N: usize = 25;
-    let mut handles = Vec::with_capacity(N);
-    for _ in 0..N {
-        let store = store.clone();
-        handles.push(tokio::spawn(async move {
-            store
-                .allocate_evm_address(
-                    wallet_id,
-                    move |index| Ok(fake_evm_address(salt, index)),
-                    None,
-                    serde_json::json!({}),
-                )
-                .await
-                .expect("concurrent alloc")
-        }));
-    }
-
-    let mut indexes: Vec<i64> = Vec::with_capacity(N);
-    let mut addresses = std::collections::HashSet::with_capacity(N);
-    for h in handles {
-        let addr = h.await.expect("task join");
-        indexes.push(addr.derivation_index.expect("evm address"));
-        addresses.insert(addr.evm_address.expect("evm address"));
-    }
-
-    indexes.sort_unstable();
-    let expected: Vec<i64> = (0..N as i64).collect();
-    assert_eq!(
-        indexes, expected,
-        "expected exactly 0..{N} with no gaps or duplicates"
-    );
-    assert_eq!(addresses.len(), N, "expected N distinct addresses");
-}
-
-/// Looking up a deposit address by its lowercase, uppercase, and original-cased forms all
-/// resolve to the same row (the `evm_address_lower` generated column backs this).
-#[tokio::test]
-async fn evm_address_lookup_is_case_insensitive() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_evm_wallet(&store).await;
-    let salt = Uuid::new_v4().as_u128();
-
-    let allocated = store
-        .allocate_evm_address(
-            wallet_id,
-            |index| Ok(fake_evm_address(salt, index)),
-            None,
-            serde_json::json!({}),
-        )
-        .await
-        .expect("alloc");
-    let original = allocated.evm_address.clone().expect("evm address");
-
-    let by_lower = store
-        .address_by_evm_address(&original.to_ascii_lowercase())
-        .await
-        .expect("lookup lower")
-        .expect("found by lowercase");
-    let by_upper = store
-        .address_by_evm_address(&original.to_ascii_uppercase())
-        .await
-        .expect("lookup upper")
-        .expect("found by uppercase");
-    let by_original = store
-        .address_by_evm_address(&original)
-        .await
-        .expect("lookup original")
-        .expect("found by original casing");
-
-    assert_eq!(by_lower.id, allocated.id);
-    assert_eq!(by_upper.id, allocated.id);
-    assert_eq!(by_original.id, allocated.id);
-}
-
-/// A Stellar wallet's allocation behaviour is completely unchanged by any of the above: it still
-/// gets muxed_id/muxed_address, never touches the EVM columns, and defaults to chain_kind =
-/// "stellar".
-#[tokio::test]
-async fn stellar_wallet_allocation_is_unaffected_by_evm_support() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_wallet(&store).await;
-    let wallet = store.get_wallet(wallet_id).await.expect("get wallet");
-    assert_eq!(wallet.chain_kind, "stellar");
-    assert_eq!(wallet.chain_id, None);
-    assert!(!wallet.is_evm());
-
-    let wid = wallet_id.simple();
-    let addr = store
-        .allocate_address(
-            wallet_id,
-            |id| Ok(format!("M{wid}-{id}")),
-            Some("user-a"),
-            serde_json::json!({}),
-        )
-        .await
-        .expect("alloc");
-
-    assert_eq!(addr.muxed_id, Some(1));
-    assert!(addr.muxed_address.is_some());
-    assert_eq!(addr.derivation_index, None);
-    assert_eq!(addr.evm_address, None);
 }
 
 #[tokio::test]
@@ -342,52 +144,6 @@ async fn record_deposit_is_idempotent() {
         .await
         .expect("list");
     assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain op");
-}
-
-/// Mirrors `record_deposit_is_idempotent`, but for EVM: dedup on `(evm_tx_hash, log_index)`
-/// rather than the Horizon op id. This is what makes a post-reorg rescan safe — if a
-/// transaction the reorg carried away survives (re-included, same hash, in a later block), the
-/// scanner re-detecting it must not credit it a second time.
-#[tokio::test]
-async fn record_evm_deposit_is_idempotent_on_rescan() {
-    let Some(store) = store().await else { return };
-    let wallet_id = fresh_evm_wallet(&store).await;
-    let evm_tx_hash = format!("0x{}", Uuid::new_v4().simple());
-
-    let dep = NewEvmDeposit {
-        wallet_id,
-        address_id: None,
-        asset_code: "ETH".into(),
-        asset_issuer: None,
-        amount_stroops: 1_000_000,
-        source_account: Some("0xsender".into()),
-        destination_account: Some("0xreceiver".into()),
-        evm_tx_hash: evm_tx_hash.clone(),
-        log_index: 0,
-        block_number: 100,
-        block_hash: "0xblock100".into(),
-    };
-
-    // First detection records it — pending/detected, not yet spendable.
-    let first = store.record_evm_deposit(&dep).await.expect("first");
-    assert_eq!(
-        first.expect("first detection must be recorded").status,
-        "pending"
-    );
-
-    // A rescan re-detecting the SAME (evm_tx_hash, log_index) must be a no-op, never a second
-    // credit — regardless of whether the row it collides with is detected/confirming/orphaned.
-    let second = store.record_evm_deposit(&dep).await.expect("second");
-    assert!(
-        second.is_none(),
-        "rescanning an already-recorded transaction must not double-credit it"
-    );
-
-    let txs = store
-        .list_transactions(wallet_id, 100, None)
-        .await
-        .expect("list");
-    assert_eq!(txs.len(), 1, "exactly one ledger entry for one on-chain deposit");
 }
 
 #[tokio::test]
@@ -1094,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0022.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
-        "expected exactly the twenty-two known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        "expected exactly the twenty known migrations to be recorded as applied"
     );
 }
 

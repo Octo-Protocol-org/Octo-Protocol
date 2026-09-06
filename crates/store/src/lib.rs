@@ -18,9 +18,9 @@ mod models;
 pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
-    NewEvmDeposit, NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment,
-    SponsoredTransaction, Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint,
-    WhitelistedAddress, Withdrawal, WithdrawalAllowlistConfig,
+    NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, SponsoredTransaction,
+    Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint, WhitelistedAddress, Withdrawal,
+    WithdrawalAllowlistConfig,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -45,36 +45,6 @@ pub struct NewWallet<'a> {
     pub sealed_salt: &'a [u8],
     /// Scheme version tag for the sealed seed. Use `octo_crypto::SCHEME_V1`.
     pub sealed_scheme: i16,
-    pub label: Option<&'a str>,
-    pub user_id: Option<Uuid>,
-    pub description: Option<&'a str>,
-}
-
-/// Parameters for creating an EVM HD wallet (see `migrations/0021_evm_deposit_addresses.sql`).
-///
-/// Always server-custody: deriving (and later sweeping) customer deposit addresses requires the
-/// sealed HD seed to live on this row — see `docs/threat-model.md` for the exception this is to
-/// octo's normal non-custodial posture.
-pub struct NewEvmWallet<'a> {
-    pub network: &'a str,
-    /// CAIP-2 chain id, e.g. `"eip155:11155111"`.
-    pub chain_id: &'a str,
-    /// The wallet's own identity address (`m/44'/60'/0'/1/0`) — reuses the `stellar_account_g`
-    /// column's existing NOT NULL + UNIQUE constraints as a chain-agnostic "wallet identity"
-    /// slot. Never a customer deposit address (those come only from the `0` branch). A proper
-    /// rename belongs to a full multi-chain schema migration; see `docs/deposit-model.md`.
-    pub identity_address: &'a str,
-    pub sealed_ciphertext: &'a [u8],
-    pub sealed_nonce: &'a [u8],
-    pub sealed_salt: &'a [u8],
-    /// Scheme version tag for the sealed seed. Use `octo_crypto::SCHEME_V1`.
-    pub sealed_scheme: i16,
-    /// Confirmations required before a deposit on this wallet is spendable. Chain-specific, not
-    /// hard-coded anywhere in application code — see `migrations/0022_evm_confirmation_and_reorg.sql`.
-    pub confirmation_depth: i32,
-    /// How far the reorg detector may walk back before alerting instead of continuing. Must be
-    /// `>= confirmation_depth`; the issue's suggested default is `2 * confirmation_depth`.
-    pub reorg_rewind_bound: i32,
     pub label: Option<&'a str>,
     pub user_id: Option<Uuid>,
     pub description: Option<&'a str>,
@@ -402,36 +372,6 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
-    /// Create a server-custody EVM HD wallet. See [`NewEvmWallet`] for why this is always
-    /// server-custody.
-    pub async fn create_evm_wallet(&self, new: NewEvmWallet<'_>) -> Result<Wallet, StoreError> {
-        sqlx::query_as::<_, Wallet>(
-            r#"
-            INSERT INTO wallets
-                (network, stellar_account_g, chain_kind, chain_id, sealed_ciphertext,
-                 sealed_nonce, sealed_salt, sealed_scheme, confirmation_depth, reorg_rewind_bound,
-                 label, user_id, description, custody)
-            VALUES ($1, $2, 'evm', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'server')
-            RETURNING *
-            "#,
-        )
-        .bind(new.network)
-        .bind(new.identity_address)
-        .bind(new.chain_id)
-        .bind(new.sealed_ciphertext)
-        .bind(new.sealed_nonce)
-        .bind(new.sealed_salt)
-        .bind(new.sealed_scheme)
-        .bind(new.confirmation_depth)
-        .bind(new.reorg_rewind_bound)
-        .bind(new.label)
-        .bind(new.user_id)
-        .bind(new.description)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(StoreError::from_sqlx_conflict)
-    }
-
     /// Attach a gas-tank fee account to a client-custody wallet: stores the tank's sealed seed
     /// and public account. The tank only ever holds fee float — never customer funds.
     ///
@@ -568,12 +508,6 @@ impl Store {
     ///   `dormant_interval_secs`
     ///
     /// A wallet with no cursor row has never been polled, so it is always due.
-    ///
-    /// Restricted to `chain_kind = 'stellar'` — an EVM wallet's `stellar_account_g` column holds
-    /// its identity address (see `NewEvmWallet`), not a Stellar `G...` account, so handing one to
-    /// the Horizon-based [`Ingestor`](crate) would be a silent no-op at best (Horizon 404s on a
-    /// `0x...` address) and a wasted poll at worst. EVM wallets are polled by
-    /// [`Store::evm_wallets_due_for_poll`] instead.
     pub async fn wallets_due_for_poll(
         &self,
         network: &str,
@@ -587,7 +521,6 @@ impl Store {
             SELECT w.* FROM wallets w
             LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
             WHERE w.network = $1
-              AND w.chain_kind = 'stellar'
               -- Never polled, or never saw activity => always due.
               AND (
                 c.last_polled_at IS NULL
@@ -599,47 +532,6 @@ impl Store {
                        -- Dormant: longest wait between polls.
                        WHEN c.updated_at <= now() - make_interval(secs => $4) THEN $5
                        -- Idle: in between.
-                       ELSE $3
-                     END)
-              )
-            ORDER BY w.created_at
-            "#,
-        )
-        .bind(network)
-        .bind(active_after_secs as f64)
-        .bind(idle_interval_secs as f64)
-        .bind(dormant_after_secs as f64)
-        .bind(dormant_interval_secs as f64)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// EVM analogue of [`Store::wallets_due_for_poll`]: `chain_kind = 'evm'` wallets on `network`
-    /// due for a confirmation-tracker tick, under the same activity-based backoff tiers. Activity
-    /// is measured the same way (`ingest_cursor.updated_at`), which the EVM tracker bumps via
-    /// [`Store::set_evm_cursor`] only when the chain tip actually advances.
-    pub async fn evm_wallets_due_for_poll(
-        &self,
-        network: &str,
-        active_after_secs: i64,
-        idle_interval_secs: i64,
-        dormant_after_secs: i64,
-        dormant_interval_secs: i64,
-    ) -> Result<Vec<Wallet>, StoreError> {
-        let rows = sqlx::query_as::<_, Wallet>(
-            r#"
-            SELECT w.* FROM wallets w
-            LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
-            WHERE w.network = $1
-              AND w.chain_kind = 'evm'
-              AND (
-                c.last_polled_at IS NULL
-                OR c.updated_at IS NULL
-                OR c.last_polled_at < now() - make_interval(secs =>
-                     CASE
-                       WHEN c.updated_at > now() - make_interval(secs => $2) THEN 0
-                       WHEN c.updated_at <= now() - make_interval(secs => $4) THEN $5
                        ELSE $3
                      END)
               )
@@ -810,73 +702,6 @@ impl Store {
         Ok(address)
     }
 
-    /// Atomically allocate the next BIP-44 derivation index for an EVM `wallet_id` and insert the
-    /// address row.
-    ///
-    /// Mirrors [`allocate_address`](Self::allocate_address) exactly — same transaction + row-lock
-    /// pattern, bumping `next_derivation_index` instead of `next_muxed_id` — so two concurrent
-    /// callers always get distinct indexes and never collide. `evm_address_for` receives the
-    /// index and returns the EIP-55 checksummed address (e.g. via `octo_evm_core`); the
-    /// lowercased lookup form is derived by the database, not passed in, so it can never drift.
-    pub async fn allocate_evm_address(
-        &self,
-        wallet_id: Uuid,
-        evm_address_for: impl FnOnce(u32) -> Result<String, ()>,
-        customer_ref: Option<&str>,
-        metadata: serde_json::Value,
-    ) -> Result<Address, StoreError> {
-        let mut tx = self.pool.begin().await?;
-
-        // Lock the wallet row and read+bump the counter.
-        let next_index: i64 = sqlx::query_scalar(
-            "SELECT next_derivation_index FROM wallets WHERE id = $1 FOR UPDATE",
-        )
-        .bind(wallet_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-
-        // BIP-44's non-hardened index level is bounded at 2^31 - 1; the schema CHECK on
-        // addresses.derivation_index enforces the same bound, but we surface a specific error
-        // here rather than letting an out-of-range wallet fail obscurely on the INSERT. (Store
-        // deliberately does not depend on octo-evm-core — same separation as the Stellar path,
-        // which never depends on octo-wallet-core — so this bound is restated, not imported.)
-        const MAX_NON_HARDENED_INDEX: u32 = 0x7fff_ffff;
-        let index_u32 = u32::try_from(next_index)
-            .ok()
-            .filter(|&i| i <= MAX_NON_HARDENED_INDEX)
-            .ok_or(StoreError::DerivationIndexExhausted)?;
-
-        sqlx::query(
-            "UPDATE wallets SET next_derivation_index = next_derivation_index + 1, \
-             updated_at = now() WHERE id = $1",
-        )
-        .bind(wallet_id)
-        .execute(&mut *tx)
-        .await?;
-
-        let evm_address = evm_address_for(index_u32).map_err(|_| StoreError::NotFound)?;
-
-        let address = sqlx::query_as::<_, Address>(
-            r#"
-            INSERT INTO addresses (wallet_id, derivation_index, evm_address, customer_ref, metadata)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(next_index)
-        .bind(&evm_address)
-        .bind(customer_ref)
-        .bind(metadata)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(StoreError::from_sqlx_conflict)?;
-
-        tx.commit().await?;
-        Ok(address)
-    }
-
     /// List addresses for a wallet (most recent first), with optional cursor-based pagination.
     pub async fn list_addresses(
         &self,
@@ -955,22 +780,6 @@ impl Store {
         Ok(row)
     }
 
-    /// Find the address for a given EVM address, matching case-insensitively (the caller may
-    /// send any casing — lowercase, uppercase, or EIP-55 checksummed — and all resolve to the
-    /// same row via the `evm_address_lower` generated column).
-    pub async fn address_by_evm_address(
-        &self,
-        address: &str,
-    ) -> Result<Option<Address>, StoreError> {
-        let row = sqlx::query_as::<_, Address>(
-            "SELECT * FROM addresses WHERE evm_address_lower = lower($1)",
-        )
-        .bind(address)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
-    }
-
     // --- transactions (deposits) ------------------------------------------
 
     /// Idempotently record a confirmed deposit.
@@ -1011,254 +820,6 @@ impl Store {
                 other => Err(other),
             },
         }
-    }
-
-    /// Idempotently record a newly-**detected** (not yet confirmed) EVM deposit.
-    ///
-    /// Unlike [`record_deposit`](Self::record_deposit) (which inserts Stellar deposits already
-    /// `status = 'confirmed'`, correct for Stellar's instant finality), this inserts
-    /// `status = 'pending'` / `confirmation_state = 'detected'` — every existing balance query
-    /// already filters on `status = 'confirmed'`, so an unconfirmed EVM deposit is invisible to
-    /// them for free. It only becomes spendable via
-    /// [`progress_evm_confirmation`](Self::progress_evm_confirmation).
-    ///
-    /// Idempotent on `(evm_tx_hash, log_index)`, mirroring `record_deposit`'s dedup: a re-scan
-    /// that re-detects a transaction it already recorded is a benign no-op, never a double-credit.
-    pub async fn record_evm_deposit(
-        &self,
-        d: &NewEvmDeposit,
-    ) -> Result<Option<Transaction>, StoreError> {
-        let result = sqlx::query_as::<_, Transaction>(
-            r#"
-            INSERT INTO transactions
-                (wallet_id, address_id, direction, asset_code, asset_issuer, amount_stroops,
-                 source_account, destination_account, evm_tx_hash, log_index, block_number,
-                 block_hash, confirmations, status, confirmation_state)
-            VALUES ($1, $2, 'deposit', $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'pending', 'detected')
-            RETURNING *
-            "#,
-        )
-        .bind(d.wallet_id)
-        .bind(d.address_id)
-        .bind(&d.asset_code)
-        .bind(&d.asset_issuer)
-        .bind(d.amount_stroops)
-        .bind(&d.source_account)
-        .bind(&d.destination_account)
-        .bind(&d.evm_tx_hash)
-        .bind(d.log_index)
-        .bind(d.block_number)
-        .bind(&d.block_hash)
-        .fetch_one(&self.pool)
-        .await;
-
-        match result {
-            Ok(tx) => Ok(Some(tx)),
-            Err(e) => match StoreError::from_sqlx_conflict(e) {
-                StoreError::Conflict => Ok(None), // already recorded — benign
-                other => Err(other),
-            },
-        }
-    }
-
-    /// All of a wallet's EVM deposits still accumulating confirmations (`detected` or
-    /// `confirming`) — the confirmation tracker's per-tick working set. Backed by the partial
-    /// index `idx_tx_confirming`.
-    pub async fn confirming_evm_transactions(
-        &self,
-        wallet_id: Uuid,
-    ) -> Result<Vec<Transaction>, StoreError> {
-        let rows = sqlx::query_as::<_, Transaction>(
-            r#"
-            SELECT * FROM transactions
-            WHERE wallet_id = $1 AND confirmation_state IN ('detected', 'confirming')
-            ORDER BY block_number
-            "#,
-        )
-        .bind(wallet_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// Update a deposit's confirmation count and, in the same atomic statement, promote it to
-    /// `confirmed` (and `status = 'confirmed'`, making it spendable) if `confirmations >= depth`.
-    ///
-    /// The `WHERE confirmation_state IN ('detected','confirming')` guard means this only ever
-    /// matches rows that were *not already* confirmed, so the caller (octo-ingest's confirmation
-    /// tracker) can tell "just became confirmed" from "still confirming" from the returned row's
-    /// `confirmation_state`, and fires the `deposit.confirmed` webhook exactly then.
-    pub async fn progress_evm_confirmation(
-        &self,
-        tx_id: Uuid,
-        confirmations: i32,
-        depth: i32,
-    ) -> Result<Option<Transaction>, StoreError> {
-        let row = sqlx::query_as::<_, Transaction>(
-            r#"
-            UPDATE transactions
-            SET confirmations = $2,
-                confirmation_state = CASE
-                    WHEN $2 >= $3 THEN 'confirmed'
-                    WHEN confirmation_state = 'detected' THEN 'confirming'
-                    ELSE confirmation_state
-                END,
-                status = CASE WHEN $2 >= $3 THEN 'confirmed' ELSE status END
-            WHERE id = $1 AND confirmation_state IN ('detected', 'confirming')
-            RETURNING *
-            "#,
-        )
-        .bind(tx_id)
-        .bind(confirmations)
-        .bind(depth)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
-    }
-
-    /// Reorg reversal: mark every one of a wallet's EVM deposits at or after `from_block` as
-    /// `orphaned` (terminal — never deleted, so the reversal stays visible for audit) and return
-    /// the affected rows, so the caller can emit a `deposit.orphaned` webhook per row and adjust
-    /// any cached balance. A row already `orphaned` is left alone (idempotent under a repeated or
-    /// overlapping reorg check).
-    pub async fn orphan_evm_deposits_from_block(
-        &self,
-        wallet_id: Uuid,
-        from_block: i64,
-    ) -> Result<Vec<Transaction>, StoreError> {
-        let rows = sqlx::query_as::<_, Transaction>(
-            r#"
-            UPDATE transactions
-            SET confirmation_state = 'orphaned', status = 'orphaned', orphaned_at = now()
-            WHERE wallet_id = $1
-              AND block_number >= $2
-              AND confirmation_state IS NOT NULL
-              AND confirmation_state <> 'orphaned'
-            RETURNING *
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(from_block)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    // --- EVM block headers (reorg detection) -------------------------------
-
-    /// Record (or update) the hash chain for a block this wallet's tracker has verified.
-    /// Upserted rather than insert-only because a block re-observed after a reorg at a *later*
-    /// height still needs its (unchanged) hash on file.
-    pub async fn upsert_evm_block_header(
-        &self,
-        wallet_id: Uuid,
-        block_number: i64,
-        block_hash: &str,
-        parent_hash: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            INSERT INTO evm_block_headers (wallet_id, block_number, block_hash, parent_hash)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (wallet_id, block_number)
-            DO UPDATE SET block_hash = EXCLUDED.block_hash, parent_hash = EXCLUDED.parent_hash
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(block_number)
-        .bind(block_hash)
-        .bind(parent_hash)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// The hash previously recorded for `(wallet_id, block_number)`, if the tracker has seen it.
-    pub async fn evm_block_header_hash(
-        &self,
-        wallet_id: Uuid,
-        block_number: i64,
-    ) -> Result<Option<String>, StoreError> {
-        let hash: Option<String> = sqlx::query_scalar(
-            "SELECT block_hash FROM evm_block_headers WHERE wallet_id = $1 AND block_number = $2",
-        )
-        .bind(wallet_id)
-        .bind(block_number)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(hash)
-    }
-
-    /// Drop stored headers at or after `from_block` — called when a reorg is confirmed, so a
-    /// stale (pre-reorg) hash can't be mistaken for current on a later tick.
-    pub async fn delete_evm_block_headers_from(
-        &self,
-        wallet_id: Uuid,
-        from_block: i64,
-    ) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM evm_block_headers WHERE wallet_id = $1 AND block_number >= $2")
-            .bind(wallet_id)
-            .bind(from_block)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Drop headers older than `before_block` — bounds table growth to roughly the rewind window,
-    /// called once per tick after a successful (non-reorg) scan.
-    pub async fn prune_evm_block_headers_before(
-        &self,
-        wallet_id: Uuid,
-        before_block: i64,
-    ) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM evm_block_headers WHERE wallet_id = $1 AND block_number < $2")
-            .bind(wallet_id)
-            .bind(before_block)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    // --- EVM ingest cursor --------------------------------------------------
-
-    /// The last block this wallet's tracker verified as chained: `(block_number, block_hash)`.
-    /// `None` if this wallet has never been scanned.
-    pub async fn evm_cursor(&self, wallet_id: Uuid) -> Result<Option<(i64, String)>, StoreError> {
-        let row: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT evm_last_block_number, evm_last_block_hash FROM ingest_cursor WHERE wallet_id = $1",
-        )
-        .bind(wallet_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.and_then(|(n, h)| match (n, h) {
-            (Some(n), Some(h)) => Some((n, h)),
-            _ => None,
-        }))
-    }
-
-    /// Upsert the EVM cursor (durable resume point for the confirmation tracker's block scan).
-    pub async fn set_evm_cursor(
-        &self,
-        wallet_id: Uuid,
-        block_number: i64,
-        block_hash: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            INSERT INTO ingest_cursor (wallet_id, evm_last_block_number, evm_last_block_hash, updated_at)
-            VALUES ($1, $2, $3, now())
-            ON CONFLICT (wallet_id)
-            DO UPDATE SET evm_last_block_number = EXCLUDED.evm_last_block_number,
-                          evm_last_block_hash = EXCLUDED.evm_last_block_hash,
-                          updated_at = now()
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(block_number)
-        .bind(block_hash)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     /// List transactions for a wallet (most recent first), with optional cursor-based pagination.

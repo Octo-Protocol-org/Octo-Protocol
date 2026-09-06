@@ -555,42 +555,6 @@ components:
               type: string
             balance_stroops:
               type: integer
-    AddressView:
-      type: object
-      description: >-
-        Response shape depends on chain_kind (see docs/deposit-model.md). Stellar responses carry
-        muxed_address/base_address/memo_id; EVM responses carry address instead and OMIT
-        memo_id entirely (not null) — EVM has nowhere for a memo to go.
-      required:
-        - id
-        - chain_kind
-        - metadata
-        - received_stroops
-      properties:
-        id:
-          type: string
-          format: uuid
-        customer_ref:
-          type: string
-        chain_kind:
-          type: string
-          enum: [stellar, evm]
-        muxed_address:
-          type: string
-          description: Stellar only.
-        base_address:
-          type: string
-          description: Stellar only.
-        memo_id:
-          type: integer
-          description: Stellar only. Never present on an EVM response.
-        address:
-          type: string
-          description: EVM only. EIP-55 checksummed deposit address.
-        metadata:
-          type: object
-        received_stroops:
-          type: integer
     CreateAddressResponse:
       type: object
       required:
@@ -603,7 +567,24 @@ components:
         message:
           type: string
         data:
-          $ref: '#/components/schemas/AddressView'
+          type: object
+          required:
+            - id
+            - muxed_address
+            - base_address
+            - memo_id
+          properties:
+            id:
+              type: string
+              format: uuid
+            customer_ref:
+              type: string
+            muxed_address:
+              type: string
+            base_address:
+              type: string
+            memo_id:
+              type: integer
     ListAddressesResponse:
       type: object
       required:
@@ -618,7 +599,24 @@ components:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/AddressView'
+            type: object
+            required:
+              - id
+              - muxed_address
+              - base_address
+              - memo_id
+            properties:
+              id:
+                type: string
+                format: uuid
+              customer_ref:
+                type: string
+              muxed_address:
+                type: string
+              base_address:
+                type: string
+              memo_id:
+                type: integer
     WithdrawResponse:
       type: object
       required:

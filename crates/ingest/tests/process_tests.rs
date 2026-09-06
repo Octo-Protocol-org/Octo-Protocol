@@ -100,7 +100,7 @@ async fn deposit_to_muxed_address_is_attributed() {
 
     // A payment sent to that customer's muxed address.
     let mut rec = base_record("op-muxed-1");
-    rec.to_muxed = addr.muxed_address.clone();
+    rec.to_muxed = Some(addr.muxed_address.clone());
 
     let outcome = ingestor.process(&rec).await.unwrap();
     assert_eq!(outcome, Processed::Recorded { attributed: true });
@@ -132,7 +132,7 @@ async fn deposit_with_memo_id_is_attributed() {
     let mut rec = base_record("op-memo-1");
     rec.transaction = Some(TransactionRecord {
         memo_type: Some("id".into()),
-        memo: Some(addr.muxed_id.expect("stellar address").to_string()),
+        memo: Some(addr.muxed_id.to_string()),
         ledger: Some(99),
     });
 
@@ -140,7 +140,7 @@ async fn deposit_with_memo_id_is_attributed() {
     assert_eq!(outcome, Processed::Recorded { attributed: true });
     let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
     assert_eq!(txs[0].address_id, Some(addr.id));
-    assert_eq!(txs[0].memo_id, addr.muxed_id);
+    assert_eq!(txs[0].memo_id, Some(addr.muxed_id));
 }
 
 #[tokio::test]
@@ -316,11 +316,7 @@ async fn make_usdc_payment_link(
         .record_payment_link_intent(link.id, None, None, amount_usdc_stroops, Some(addr.id))
         .await
         .unwrap();
-    (
-        addr.muxed_address.expect("stellar address"),
-        link.id,
-        intent.id,
-    )
+    (addr.muxed_address, link.id, intent.id)
 }
 
 fn usdc_record(id: &str, to_muxed: String, amount: &str) -> PaymentRecord {

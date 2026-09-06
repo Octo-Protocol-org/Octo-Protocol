@@ -357,17 +357,13 @@ pub async fn get_public_payment_link(
         .get_address(link.address_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // Payment links are a Stellar-only (USDC) feature today, so this address is always
-    // muxed-shaped; a None here would mean the link's address was somehow allocated on an EVM
-    // wallet, which nothing in this codebase does.
-    let deposit_address = address.muxed_address.ok_or(ApiError::Internal)?;
     Ok(Envelope::ok(PublicPaymentLinkView {
         name: link.name,
         description: link.description,
         image_url: link.image_url,
         redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
-        deposit_address,
+        deposit_address: address.muxed_address,
         asset_code: USDC_ASSET_CODE.into(),
     }))
 }
@@ -438,11 +434,9 @@ pub async fn create_payment_intent(
         )
         .await?;
 
-    // Allocated via allocate_address (the Stellar/muxed path) above, so this is always Some.
-    let deposit_address = address.muxed_address.ok_or(ApiError::Internal)?;
     let (code, json) = Envelope::created(PaymentIntentView {
         payment_id: payment.id,
-        deposit_address,
+        deposit_address: address.muxed_address,
         amount_usdc_stroops: amount,
     });
     Ok((code, json))
@@ -611,8 +605,7 @@ pub async fn submit_payment(
         let OperationBody::Payment(p) = &op.body else {
             return false;
         };
-        if Some(crate::submit_validation::muxed_to_string(&p.destination)) != address.muxed_address
-        {
+        if crate::submit_validation::muxed_to_string(&p.destination) != address.muxed_address {
             return false;
         }
         let (asset_code, asset_issuer) = crate::submit_validation::asset_parts(&p.asset);

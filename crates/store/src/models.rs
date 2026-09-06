@@ -35,24 +35,6 @@ pub struct Wallet {
     pub custody: String,
     pub encrypted_backup: Option<String>,
     pub gas_tank_account_g: Option<String>,
-    /// `"stellar"` or `"evm"` (see `migrations/0021_evm_deposit_addresses.sql`). Determines which
-    /// half of `Store::allocate_address` / `allocate_evm_address` this wallet uses.
-    pub chain_kind: String,
-    /// CAIP-2 chain id (e.g. `"eip155:11155111"`). `None` for Stellar wallets; always `Some` for
-    /// `chain_kind == "evm"` (enforced by `wallets_evm_has_chain_id`).
-    pub chain_id: Option<String>,
-    /// Next non-hardened BIP-44 index to hand out at `m/44'/60'/0'/0/{index}`. The EVM analogue
-    /// of `next_muxed_id`; meaningless for Stellar wallets.
-    pub next_derivation_index: i64,
-    /// Confirmations required before an EVM deposit becomes spendable (see
-    /// `migrations/0022_evm_confirmation_and_reorg.sql`). Deliberately per-wallet, not hard-coded —
-    /// an L1 and an L2 with a centralised sequencer carry very different reorg risk. `None` for
-    /// Stellar wallets, always `Some` for `chain_kind == "evm"`.
-    pub confirmation_depth: Option<i32>,
-    /// How many blocks the reorg detector may walk back looking for a common ancestor before
-    /// giving up and alerting, rather than looping unbounded against a malicious/misbehaving RPC.
-    /// Always `>= confirmation_depth`. `None` for Stellar wallets.
-    pub reorg_rewind_bound: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -62,51 +44,21 @@ impl Wallet {
     pub fn is_client_custody(&self) -> bool {
         self.custody == "client"
     }
-
-    /// True for an EVM (HD-derived-EOA) wallet, false for Stellar (muxed-address) wallets.
-    pub fn is_evm(&self) -> bool {
-        self.chain_kind == "evm"
-    }
 }
 
 /// A per-customer deposit address (off-chain row).
-///
-/// Exactly one of the two shapes below is populated, never both and never neither — enforced by
-/// the `addresses_chain_shape` CHECK constraint:
-/// - Stellar: `muxed_id` + `muxed_address` (see `docs/deposit-model.md`'s muxed model).
-/// - EVM: `derivation_index` + `evm_address` (+ generated `evm_address_lower`) — a real HD-derived
-///   EOA (see `docs/deposit-model.md`'s EVM model).
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Address {
     pub id: Uuid,
     pub wallet_id: Uuid,
-    pub muxed_id: Option<i64>,
-    pub muxed_address: Option<String>,
-    /// BIP-44 non-hardened index (`0..=2^31-1`) this address was derived at. `None` for Stellar
-    /// rows. Stored (not just the address) so the address is re-derivable from seed + index alone
-    /// for disaster recovery.
-    pub derivation_index: Option<i64>,
-    /// EIP-55 checksummed form, for display. `None` for Stellar rows.
-    pub evm_address: Option<String>,
-    /// Lowercased form of `evm_address` — a generated column, so it can never drift. Lookups key
-    /// off this, not `evm_address`, so a client sending any casing still resolves to this row.
-    pub evm_address_lower: Option<String>,
+    pub muxed_id: i64,
+    pub muxed_address: String,
     pub customer_ref: Option<String>,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
 }
 
 /// A deposit or withdrawal ledger entry.
-///
-/// `status` is the coarse spendability gate every balance/aggregate query already filters on
-/// (`status = 'confirmed'`) — see `Store::sum_deposits_for_address(es)`. An EVM deposit is
-/// inserted `status = 'pending'` and stays that way until the confirmation tracker promotes it,
-/// so those existing queries are correct for EVM with no changes: an unconfirmed or orphaned
-/// row simply never matches `status = 'confirmed'`.
-///
-/// `confirmation_state` is the finer-grained EVM-only progression the tracker operates on
-/// (`detected -> confirming -> confirmed`, or `-> orphaned` on reorg). `None` for Stellar deposits
-/// and all withdrawals — those chains/directions don't go through this state machine at all.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Transaction {
     pub id: Uuid,
@@ -126,25 +78,6 @@ pub struct Transaction {
     pub status: String,
     pub reference: Option<String>,
     pub metadata: serde_json::Value,
-    /// `detected` | `confirming` | `confirmed` | `orphaned`. `None` for non-EVM rows.
-    pub confirmation_state: Option<String>,
-    /// The EVM transaction hash. `None` for non-EVM rows.
-    pub evm_tx_hash: Option<String>,
-    /// The `Transfer` event's log index within its transaction — the EVM analogue of
-    /// `operation_index`, and (with `evm_tx_hash`) the anti-double-credit dedup key.
-    pub log_index: Option<i32>,
-    /// The block this deposit was seen in. Distinct from `ledger` (Stellar's ledger sequence) —
-    /// kept as its own column since only EVM rows are read/written by the confirmation tracker.
-    pub block_number: Option<i64>,
-    /// The hash of `block_number` at the time this row was recorded/last verified. Compared
-    /// against the chain's current hash at that height to detect a reorg.
-    pub block_hash: Option<String>,
-    /// Running confirmation count (`chain tip - block_number`), updated each tracker tick.
-    pub confirmations: Option<i32>,
-    /// When a reorg reversed this deposit. Implies `confirmation_state = 'orphaned'` and vice
-    /// versa (`transactions_orphaned_at_matches_state` CHECK). The row is never deleted — this is
-    /// the audit trail of the reversal.
-    pub orphaned_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -318,25 +251,6 @@ pub struct NewDeposit {
     pub horizon_op_id: String,
     pub ledger: Option<i64>,
     pub memo_id: Option<i64>,
-}
-
-/// Parameters for recording a newly-detected (not yet confirmed) EVM deposit.
-///
-/// Inserted with `status = 'pending'` and `confirmation_state = 'detected'` — it only becomes
-/// spendable once `Store::promote_or_progress_evm_confirmation` advances it to `confirmed` at
-/// `wallets.confirmation_depth`.
-pub struct NewEvmDeposit {
-    pub wallet_id: Uuid,
-    pub address_id: Option<Uuid>,
-    pub asset_code: String,
-    pub asset_issuer: Option<String>,
-    pub amount_stroops: i64,
-    pub source_account: Option<String>,
-    pub destination_account: Option<String>,
-    pub evm_tx_hash: String,
-    pub log_index: i32,
-    pub block_number: i64,
-    pub block_hash: String,
 }
 
 /// A shareable payment link, backed by a dedicated deposit address.

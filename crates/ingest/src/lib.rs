@@ -14,8 +14,6 @@
 #![forbid(unsafe_code)]
 
 pub mod amount;
-pub mod confirmation;
-pub mod evm_rpc;
 pub mod horizon;
 
 #[cfg(test)]
