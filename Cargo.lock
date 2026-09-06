@@ -1916,24 +1916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "octo-evm-rpc"
-version = "0.1.0"
-dependencies = [
- "axum",
- "ethnum",
- "futures-util",
- "octo-resilience",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
 name = "octo-ingest"
 version = "0.1.0"
 dependencies = [

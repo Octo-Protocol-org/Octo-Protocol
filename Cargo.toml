@@ -12,7 +12,6 @@ members = [
     "crates/api",
     "crates/resilience",
     "crates/evm-core",
-    "crates/evm-rpc",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
@@ -59,15 +58,6 @@ subtle = "2.6"
 bs58 = { version = "0.5", features = ["check"] }
 # Note: the MSRV-aware resolver (.cargo/config.toml: incompatible-rust-versions = "fallback")
 # keeps the whole tree on Rust-1.84-compatible versions, so no manual transitive pins are needed.
-# --- EVM / JSON-RPC ---
-# ethnum::U256 is the quantity type for crates/evm-rpc's JSON-RPC hex fields (block numbers,
-# balances, gas, nonces, ...) — never u64/f64, which silently truncate/lose-precision on-chain
-# values above 2^64. It was already present transitively (a proptest dependency) and is a single
-# small, permissively-licensed crate, in keeping with "don't pull in a full EVM SDK for this".
-ethnum = "1.5"
-# Lets crates/evm-rpc enforce a hard response-body size cap while streaming a JSON-RPC reply, so a
-# malicious/compromised RPC endpoint returning a multi-GB body can't OOM the worker.
-futures-util = "0.3"
 
 # --- async runtime / web ---
 tokio = { version = "1", features = ["full"] }
@@ -104,7 +94,6 @@ octo-ingest = { path = "crates/ingest" }
 octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
 octo-evm-core = { path = "crates/evm-core" }
-octo-evm-rpc = { path = "crates/evm-rpc" }
 
 [profile.release]
 lto = "thin"
