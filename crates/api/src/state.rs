@@ -1,6 +1,5 @@
-//! Shared application state: DB handle, master key, and the per-chain registry.
+//! Shared application state: DB handle, master key, network, and Horizon config.
 
-use crate::chain_registry::ChainRegistry;
 use crate::error::ApiError;
 use crate::horizon::Horizon;
 use base64::Engine;
@@ -28,8 +27,10 @@ struct Inner {
     /// When set, the server tries this key first (for already-migrated rows) and falls back to
     /// `master_key` for rows not yet re-sealed by `octo-migrate-keys`.
     master_key_next: Option<Zeroizing<[u8; MASTER_KEY_LEN]>>,
-    /// Per-chain config + resilience state. Holds "the" Stellar chain today; ready to hold more.
-    chains: Arc<ChainRegistry>,
+    network: StellarNetwork,
+    horizon: Horizon,
+    horizon_url: String,
+    friendbot_url: Option<String>,
     /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
     /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
     public_app_url: String,
@@ -161,59 +162,7 @@ impl AppState {
         retry: RetryPolicy,
         circuit: CircuitBreaker,
     ) -> Self {
-        let chains = Arc::new(crate::chain_registry::ChainRegistry::single_stellar(
-            network.as_str(),
-            network,
-            horizon_url,
-            friendbot_url,
-            retry,
-            circuit,
-        ));
-        Self::from_parts(
-            store,
-            master_key,
-            master_key_next,
-            chains,
-            public_app_url,
-            email,
-            jwt_secret,
-        )
-    }
-
-    /// Build state from an already-resolved, potentially multi-chain [`ChainRegistry`]. This is
-    /// the real production construction path (`bin/server`); `new`/`new_with_resilience` above
-    /// wrap it with a single implicit Stellar chain so existing single-chain call sites and tests
-    /// don't need to change.
-    pub fn from_chain_registry(
-        store: Store,
-        master_key: [u8; MASTER_KEY_LEN],
-        chains: Arc<ChainRegistry>,
-        public_app_url: String,
-        email: EmailSender,
-    ) -> Self {
-        let mut secret = vec![0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-        Self::from_parts(
-            store,
-            master_key,
-            None,
-            chains,
-            public_app_url,
-            email,
-            secret,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts(
-        store: Store,
-        master_key: [u8; MASTER_KEY_LEN],
-        master_key_next: Option<[u8; MASTER_KEY_LEN]>,
-        chains: Arc<ChainRegistry>,
-        public_app_url: String,
-        email: EmailSender,
-        jwt_secret: Vec<u8>,
-    ) -> Self {
+        let horizon = Horizon::with_resilience(horizon_url.clone(), retry, circuit);
         let webhooks = WebhookSender::new(store.clone());
         Self {
             inner: Arc::new(Inner {
@@ -222,7 +171,10 @@ impl AppState {
                 store,
                 master_key: Zeroizing::new(master_key),
                 master_key_next: master_key_next.map(Zeroizing::new),
-                chains,
+                network,
+                horizon,
+                horizon_url,
+                friendbot_url,
                 public_app_url,
                 jwt_secret,
                 webhooks,
@@ -281,14 +233,12 @@ impl AppState {
         &self.inner.jwt_secret
     }
 
-    /// The Stellar network of the primary configured Stellar chain. Route handlers written
-    /// against "the" Stellar network (pre-multi-chain) use this unchanged.
     pub fn network(&self) -> StellarNetwork {
-        self.inner.chains.stellar_network()
+        self.inner.network
     }
 
     pub fn horizon(&self) -> &Horizon {
-        self.inner.chains.stellar_horizon()
+        &self.inner.horizon
     }
 
     pub fn webhooks(&self) -> &WebhookSender {
@@ -300,17 +250,11 @@ impl AppState {
     }
 
     pub fn horizon_url(&self) -> &str {
-        self.inner.chains.stellar_horizon_url()
+        &self.inner.horizon_url
     }
 
     pub fn friendbot_url(&self) -> Option<&str> {
-        self.inner.chains.stellar_friendbot_url()
-    }
-
-    /// The full per-chain registry — config, resilience state, and poll-health for every
-    /// configured chain (used by the `/health/chains` route and, later, multi-chain routes).
-    pub fn chains(&self) -> &Arc<ChainRegistry> {
-        &self.inner.chains
+        self.inner.friendbot_url.as_deref()
     }
 
     /// Base URL of the hosted checkout frontend (no trailing slash).

@@ -84,44 +84,58 @@ server, and it is confined to one crate:
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
 
-## Deployment: per-chain configuration
+## ADR: EVM crypto crate selection (k256 + sha3 + hand-rolled BIP-32, not alloy-primitives)
 
-`bin/server` resolves its chain set into a `ChainRegistry` (`octo-api::chain_registry`) at
-startup — one entry per configured chain, each with its own RPC endpoint, confirmation depth,
-poll interval, and resilience state (`RetryPolicy` + `CircuitBreaker`). This is what makes a
-degraded RPC on one chain unable to open another chain's circuit breaker: each chain's breaker is
-a distinct instance, never a shared process-global one.
+**Context.** `crates/evm-core` (#217) needs secp256k1 BIP-32/BIP-44 key derivation, keccak-256
+EIP-55 addressing, and ECDSA signing with low-s (EIP-2) normalisation. Two realistic paths:
 
-Configuration precedence, resolved by `bin/server`'s `load_chain_config`:
+1. `k256` (arithmetic/ecdsa) + `sha3` (Keccak-256) + `hmac`/`sha2` (already workspace
+   dependencies, reused for the BIP-32 `HMAC-SHA512` step) + `subtle` (constant-time comparisons),
+   with the BIP-32 CKD-priv/CKD-pub walk written directly against `k256`'s `Scalar`/`SecretKey`
+   types.
+2. `alloy-primitives`/`alloy-signer` (or `coins-bip32` + `ethers`-family crates), which bundle
+   address types, RLP, and higher-level signer abstractions on top of the same underlying curve
+   arithmetic.
 
-1. **`CHAIN_CONFIG_PATH`**, if set, must name an existing TOML file — see
-   [`octo.chains.example.toml`](../octo.chains.example.toml) for a worked example with two
-   `[[chains]]` entries (one enabled Stellar testnet chain, one disabled placeholder). A path
-   that doesn't exist aborts boot rather than silently falling back.
-2. Else, `./octo.chains.toml` in the working directory, if present.
-3. Else, the legacy flat env vars (`NETWORK`, `HORIZON_URL`, `FRIENDBOT_URL`, `HORIZON_*`) build
-   a single implicit Stellar chain — today's single-chain deployments keep working unmodified.
+**Decision: (1) — `k256` + `sha3` + a from-scratch BIP-32 implementation.**
 
-Whichever source wins, each configured chain's `rpc_url` can additionally be overridden by
-`OCTO_CHAIN_<CHAIN_ID>_RPC_URL` (chain id upper-cased, non-alphanumeric characters replaced with
-`_`) — the one field most likely to carry a secret (Alchemy/Infura-style API keys) and most
-likely to differ per deploy environment.
+**Why.**
+- **MSRV.** The workspace pins `rust-version = "1.84.1"` (`Cargo.toml`) with the MSRV-aware
+  resolver (`.cargo/config.toml: incompatible-rust-versions = "fallback"`) keeping the whole tree
+  on 1.84-compatible dependency versions. `alloy`'s workspace crates track a materially newer
+  MSRV than 1.84 (the alloy project moves its floor forward aggressively, tracking recent stable
+  releases) and pulls in a large, fast-moving dependency graph (RLP, ABI encoding, multiple signer
+  backends, `alloy-consensus`, etc.) most of which this crate does not need — `evm-core` only
+  needs derivation, addressing, and raw digest signing, not transaction encoding or provider
+  plumbing. `k256`, `sha3`, and `subtle` are individually-versioned RustCrypto crates with a much
+  lower, slower-moving MSRV floor that fits 1.84.1 today without pinning transitive versions by
+  hand.
+- **`cargo deny` surface.** `deny.toml` allows a fixed, small set of permissive licenses and warns
+  on multiple-versions/wildcards. `k256`/`sha3`/`hmac`/`sha2`/`subtle` are RustCrypto-ecosystem
+  crates already partially present in the tree (`hmac`, `sha2` are workspace deps of
+  `wallet-core`'s SEP-0005 path already; `k256`'s own dependency graph — `elliptic-curve`,
+  `ecdsa`, `ff`, `group` — is the same family already vetted for `wallet-core`'s ed25519 stack in
+  spirit) and license MIT/Apache-2.0, both allowed. Pulling in `alloy-primitives`'s graph would add
+  a much larger number of net-new crates (and net-new maintainers/publishers) to audit for the
+  same `deny.toml` policy, for functionality (RLP, typed transactions, provider traits) this crate
+  does not use.
+- **No signing-oracle surface.** `alloy-signer`'s `Signer` trait is designed around signing
+  `alloy`'s typed transaction/message types. Taking a dependency on it would pull the crate's
+  public API toward "hand me a transaction, I'll sign it" — the opposite of the "no raw-XDR
+  oracle" posture `wallet-core/src/signer.rs` established and this crate's `signer.rs` explicitly
+  mirrors (sign a caller-supplied 32-byte digest, nothing else; the caller builds whatever
+  domain-specific hash it needs).
+- **Auditability.** BIP-32 CKD-priv is ~40 lines of scalar arithmetic over `k256::Scalar`
+  (`crates/evm-core/src/derive.rs`). Writing it directly against `k256` keeps every step —
+  including the "must not be transparently retried" analogue for key derivation, i.e. the
+  constant-time invalid-scalar/zero-key rejection required by the BIP-32 spec — visible and
+  testable against the spec's own test vectors, rather than trusting an external crate's
+  derivation path parser to have the same constant-time discipline this codebase requires
+  elsewhere (see `crates/crypto` and `wallet-core`'s zeroize-on-drop conventions).
 
-**Fail fast at startup.** After the registry is built, every *enabled* chain's RPC is probed with
-a short-timeout liveness check (`ChainRegistry::probe_liveness`); a bad endpoint aborts boot with
-a clear message instead of surfacing lazily on the first customer deposit. The probe's error path
-deliberately never includes the raw RPC URL or the underlying transport error's `Display` — both
-can embed the request URL, defeating the redaction below.
-
-**RPC URLs are redacted everywhere they might be logged.** `ChainConfig::rpc_url` is a
-`RedactedUrl`: its `Debug`/`Display` show only `scheme://host/***`, stripping path, query, and
-userinfo (where provider API keys live). Reaching the real value requires the deliberate
-`.expose_secret()` call used only where a request is actually made. `GET /health/chains` reports
-per-chain reachability (last successful ingest poll, derived from each chain's own poll loop) and
-never includes `rpc_url` at all.
-
-This registry is deliberately lightweight — config, a Horizon client for Stellar-kind chains, and
-resilience/poll-health state, not a trait-based chain-adapter abstraction. A more general
-trait-based registry (chain-agnostic address validation, deposit derivation, EVM adapters, ...)
-is expected to supersede or wrap it later without disturbing the config/validation/isolation work
-described here.
+**Consequence.** `evm-core` carries slightly more from-scratch cryptographic code (the BIP-32 walk)
+than it would with a higher-level SDK, in exchange for a materially smaller, MSRV-compatible,
+easier-to-audit dependency graph and an API shape consistent with the rest of the codebase's
+signing-oracle posture. If a future issue needs RLP/typed-transaction encoding (e.g. building and
+broadcasting a legacy or EIP-1559 transaction), that belongs in a higher-level crate that depends
+on `evm-core` for keys/signing — not a reason to pull `alloy-primitives` into this one.

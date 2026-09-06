@@ -104,12 +104,6 @@ curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/submit-signed \
 See [docs/non-custodial-flow.md](docs/non-custodial-flow.md) for the full
 build → sign → relay sequence.
 
-By default the server runs a single Stellar chain from `.env`. To run more than one chain (e.g.
-Stellar mainnet alongside a future EVM chain), point `CHAIN_CONFIG_PATH` at a TOML file like
-[`octo.chains.example.toml`](octo.chains.example.toml) instead — see the "Deployment: per-chain
-configuration" section of [docs/architecture.md](docs/architecture.md) for the full precedence
-rules and `GET /health/chains` for per-chain reachability.
-
 ## Security architecture
 
 octo is non-custodial: user wallet keys are generated and held **client-side** (browser/SDK), so

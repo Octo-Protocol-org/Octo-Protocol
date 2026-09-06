@@ -10,8 +10,6 @@
 
 pub mod audit;
 pub mod auth;
-pub mod chain_config;
-pub mod chain_registry;
 mod error;
 pub mod horizon;
 mod json;
@@ -21,16 +19,12 @@ pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
 
-pub use chain_config::{AppConfig, ChainConfig, ChainConfigError, ChainKind, RedactedUrl};
-pub use chain_registry::ChainRegistry;
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
-use axum::Json;
 use axum::Router;
-use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
@@ -52,7 +46,6 @@ pub fn build_router(state: AppState) -> Router {
     // together with the error handler that turns an oversized body into a 413 envelope.
     Router::new()
         .route("/health", get(health))
-        .route("/health/chains", get(health_chains))
         .route("/v1/auth/signup", post(auth::signup))
         .route("/v1/auth/verify-email", post(auth::verify_email))
         .route("/v1/auth/resend-otp", post(auth::resend_otp))
@@ -206,48 +199,6 @@ pub fn build_router(state: AppState) -> Router {
 /// Liveness probe.
 async fn health() -> &'static str {
     "ok"
-}
-
-/// Per-chain detail: reachability and last successful ingest poll, one entry per configured
-/// chain. Never includes the raw RPC URL — only `chain_id`, `kind`, `enabled`, and poll timing.
-#[derive(Serialize)]
-struct ChainHealth {
-    chain_id: String,
-    kind: &'static str,
-    enabled: bool,
-    last_poll_unix: Option<i64>,
-    seconds_since_last_poll: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct ChainsHealthResponse {
-    chains: Vec<ChainHealth>,
-}
-
-async fn health_chains(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Json<ChainsHealthResponse> {
-    let registry = state.chains();
-    let chains = registry
-        .chains()
-        .map(|c| {
-            let (last_poll_unix, seconds_since_last_poll) =
-                match registry.chain_poll_status(&c.chain_id) {
-                    Some((last, since)) => (Some(last), Some(since)),
-                    None => (None, None),
-                };
-            ChainHealth {
-                chain_id: c.chain_id.clone(),
-                kind: match c.kind {
-                    chain_config::ChainKind::Stellar => "stellar",
-                },
-                enabled: c.enabled,
-                last_poll_unix,
-                seconds_since_last_poll,
-            }
-        })
-        .collect();
-    Json(ChainsHealthResponse { chains })
 }
 
 // NOTE: a `handle_errors` HandleErrorLayer helper lived here to convert oversized-body errors

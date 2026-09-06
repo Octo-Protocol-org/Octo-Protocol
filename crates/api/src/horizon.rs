@@ -215,28 +215,6 @@ impl Horizon {
         }
     }
 
-    /// One-shot startup liveness check: does this base URL answer at all within `timeout`? Used
-    /// to fail server boot fast and loudly on a bad chain RPC endpoint, rather than discovering it
-    /// lazily on the first customer deposit.
-    ///
-    /// Deliberately bypasses the circuit breaker (a single boot-time probe, not ongoing traffic)
-    /// and never surfaces the raw `reqwest::Error` or the request URL in its error string —
-    /// `reqwest::Error`'s `Display` frequently embeds the request URL, which would defeat the
-    /// point of a redacted RPC URL the moment boot fails.
-    pub async fn liveness_probe(&self, timeout: Duration) -> Result<(), String> {
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
-            Ok(c) => c,
-            Err(_) => return Err("failed to build HTTP client".to_string()),
-        };
-        match client.get(&self.base_url).send().await {
-            Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => Err(format!("liveness probe returned HTTP {}", resp.status())),
-            Err(e) if e.is_timeout() => Err(format!("liveness probe timed out after {timeout:?}")),
-            Err(e) if e.is_connect() => Err("liveness probe: connection failed".to_string()),
-            Err(_) => Err("liveness probe: request failed".to_string()),
-        }
-    }
-
     /// Fetch an account's balances. Retried on transient failures (transport errors, 5xx).
     /// Returns `NotFound` if the account does not exist on-chain yet.
     pub async fn balances(&self, account_g: &str) -> Result<Vec<Balance>, ApiError> {
