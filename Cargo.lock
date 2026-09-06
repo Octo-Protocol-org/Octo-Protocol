@@ -1754,17 +1754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "octo-chain"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "octo-wallet-core",
- "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "octo-crypto"
 version = "0.1.0"
 dependencies = [
