@@ -26,6 +26,7 @@ use octo_webhooks::{Event, WebhookSender};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// The widely-used testnet USDC issuer — must match `crates/api/src/routes/payment_links.rs`'s
@@ -555,12 +556,31 @@ impl Supervisor {
 
     /// Run forever: every `interval`, poll all wallets on this network once.
     pub async fn run(self, interval: Duration, page_limit: u32) {
-        loop {
+        self.run_until_cancelled(interval, page_limit, CancellationToken::new()).await;
+    }
+
+    /// Like [`Supervisor::run`], but returns once `shutdown` is cancelled.
+    ///
+    /// Cancellation is only observed *between* ticks: an in-progress tick always finishes its
+    /// current page (deposit rows + cursor), so a rolling deploy never aborts a page halfway.
+    /// Bounding how long that may take is the caller's job (see `bin/server`'s drain timeout).
+    pub async fn run_until_cancelled(
+        self,
+        interval: Duration,
+        page_limit: u32,
+        shutdown: CancellationToken,
+    ) {
+        while !shutdown.is_cancelled() {
             if let Err(e) = self.tick(page_limit).await {
                 tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
             }
-            tokio::time::sleep(interval).await;
+            // Wake early on shutdown instead of sleeping out the full interval.
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = shutdown.cancelled() => {}
+            }
         }
+        tracing::info!("ingest supervisor stopped after finishing its current tick");
     }
 
     /// One supervision pass: poll every wallet on this network once.

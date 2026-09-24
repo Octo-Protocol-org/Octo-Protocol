@@ -210,6 +210,32 @@ Full mapping in **[docs/threat-model.md](docs/threat-model.md)**. Amounts are in
 end-to-end (never floats). Report vulnerabilities per **[SECURITY.md](SECURITY.md)** — **do not**
 open public issues for security reports.
 
+## Deployment
+
+`octo-server` runs the REST API and the deposit ingest worker in one process and is safe to
+roll (Kubernetes, ECS, systemd) behind a load balancer.
+
+### Graceful shutdown
+
+On `SIGTERM` (or `SIGINT`) the server:
+
+1. logs `shutdown signal received` and stops accepting new connections;
+2. logs `draining …` and lets in-flight HTTP requests complete, while the ingest supervisor
+   finishes its **current tick** (never aborting a page mid-processing) and then stops;
+3. logs `drained` then `exiting` — or, if the drain outlasts the timeout, logs
+   `drain timeout elapsed; forcing exit` and exits anyway. A page cut short this way is safe:
+   the ingest cursor is only advanced after processing and deposit inserts are idempotent, so
+   the next instance re-runs it without double-crediting.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Max seconds to drain before force-exiting |
+
+**Tuning:** keep `SHUTDOWN_DRAIN_TIMEOUT_SECS` a few seconds *below* the orchestrator's hard-kill
+deadline (Kubernetes `terminationGracePeriodSeconds`, default 30; ECS `stopTimeout`, default
+30), so the process exits on its own terms rather than being `SIGKILL`ed mid-drain. If ticks
+routinely run long (many wallets, slow Horizon), raise both values together.
+
 ## Roadmap
 
 - **Gas sponsorship** — *shipped.* App developers can sponsor their users' Stellar transactions

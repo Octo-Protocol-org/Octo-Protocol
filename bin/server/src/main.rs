@@ -13,7 +13,9 @@ use octo_resilience::ResilienceConfig;
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
+use std::future::IntoFuture;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,14 +78,13 @@ async fn main() -> Result<()> {
         ingest_retry,
         ingest_circuit,
     );
-    tokio::spawn(async move {
-        supervisor
-            .run(
-                Duration::from_secs(cfg.ingest_interval_secs),
-                cfg.ingest_page_limit,
-            )
-            .await;
-    });
+    // Cancelled on SIGTERM/SIGINT; both the ingest loop and the HTTP server drain on it.
+    let shutdown = CancellationToken::new();
+    let ingest = tokio::spawn(supervisor.run_until_cancelled(
+        Duration::from_secs(cfg.ingest_interval_secs),
+        cfg.ingest_page_limit,
+        shutdown.clone(),
+    ));
     tracing::info!(
         interval_secs = cfg.ingest_interval_secs,
         "deposit ingest supervisor started"
@@ -95,15 +96,92 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.bind_addr))?;
     tracing::info!(addr = %cfg.bind_addr, "API listening");
+    // Graceful shutdown stops accepting new connections and lets in-flight requests finish.
     // `into_make_service_with_connect_info` is what makes the peer address available to the
     // rate limiter's `ConnectInfo` extractor; without it every caller looks like one client.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .context("serve API")?;
+    let mut server = tokio::spawn(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future(),
+    );
+
+    // A server that dies on its own (not via a signal) is a hard failure, not a shutdown.
+    tokio::select! {
+        res = &mut server => {
+            shutdown.cancel();
+            return res.context("API task panicked")?.context("serve API");
+        }
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "shutdown signal received");
+        }
+    }
+
+    shutdown.cancel();
+    tracing::info!(
+        timeout_secs = cfg.shutdown_drain_timeout.as_secs(),
+        "draining in-flight HTTP requests and the current ingest tick"
+    );
+    let ingest_abort = ingest.abort_handle();
+    let server_abort = server.abort_handle();
+    let drain = async { tokio::join!(server, ingest) };
+    match tokio::time::timeout(cfg.shutdown_drain_timeout, drain).await {
+        Ok((http, ingest)) => {
+            let http = http
+                .context("API task panicked")
+                .and_then(|r| r.context("serve API"));
+            if let Err(e) = http {
+                tracing::error!(error = ?e, "API server errored while draining");
+            }
+            if let Err(e) = ingest {
+                tracing::error!(error = ?e, "ingest supervisor task panicked while draining");
+            }
+            tracing::info!("drained");
+        }
+        Err(_) => {
+            // Deposit inserts are deduplicated, so a page cut short here re-runs safely.
+            tracing::warn!(
+                timeout_secs = cfg.shutdown_drain_timeout.as_secs(),
+                "drain timeout elapsed; forcing exit"
+            );
+            ingest_abort.abort();
+            server_abort.abort();
+        }
+    }
+    tracing::info!("exiting");
     Ok(())
+}
+
+/// Resolve on SIGTERM (what Kubernetes/ECS send on a rolling deploy) or SIGINT (Ctrl-C).
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = ?e, "failed to listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => "SIGINT",
+        () = terminate => "SIGTERM",
+    }
 }
 
 fn init_tracing() {
@@ -134,6 +212,10 @@ struct Config {
     bind_addr: String,
     ingest_interval_secs: u64,
     ingest_page_limit: u32,
+    /// Upper bound on the graceful-shutdown drain (in-flight HTTP requests + the current ingest
+    /// tick) before the process force-exits. `SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 25 — keep it
+    /// below the orchestrator's kill deadline (Kubernetes `terminationGracePeriodSeconds`: 30).
+    shutdown_drain_timeout: Duration,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -201,6 +283,13 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(50);
 
+        let shutdown_drain_timeout = Duration::from_secs(
+            std::env::var("SHUTDOWN_DRAIN_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(25),
+        );
+
         let resilience = ResilienceConfig::from_env();
 
         Ok(Config {
@@ -217,6 +306,7 @@ impl Config {
             bind_addr,
             ingest_interval_secs,
             ingest_page_limit,
+            shutdown_drain_timeout,
             resilience,
         })
     }

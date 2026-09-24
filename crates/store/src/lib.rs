@@ -29,6 +29,20 @@ use uuid::Uuid;
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Compare a stored OTP hash with a candidate in constant time.
+///
+/// Both sides are already hashes, but they are derived from a secret code drawn from a small
+/// (6-digit) space, so a short-circuiting `!=` would leak how many leading bytes matched — a
+/// signal an attacker could combine with precomputed code→hash tables. `subtle::ConstantTimeEq`
+/// is the same primitive `hmac`'s `verify_slice` uses for the JWT and webhook signature checks.
+/// Only the length check short-circuits, and hash length is public (always 64 hex chars).
+/// The constant-time property is not unit-tested: timing tests are inherently flaky, so we rely
+/// on using a well-reviewed primitive correctly instead.
+fn otp_hash_matches(stored: &str, candidate: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    stored.as_bytes().ct_eq(candidate.as_bytes()).into()
+}
+
 /// A handle to the database (cloneable; wraps a connection pool).
 #[derive(Clone)]
 pub struct Store {
@@ -219,7 +233,7 @@ impl Store {
         {
             return Err(StoreError::InvalidOtp);
         }
-        if otp.code_hash != code_hash {
+        if !otp_hash_matches(&otp.code_hash, code_hash) {
             sqlx::query("UPDATE email_otps SET attempts = attempts + 1 WHERE id = $1")
                 .bind(otp.id)
                 .execute(&self.pool)

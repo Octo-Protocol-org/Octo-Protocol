@@ -39,11 +39,13 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 base64 = "0.22"
 argon2 = "0.5"
+subtle = "2.6"
 # Note: the MSRV-aware resolver (.cargo/config.toml: incompatible-rust-versions = "fallback")
 # keeps the whole tree on Rust-1.84-compatible versions, so no manual transitive pins are needed.
 
 # --- async runtime / web ---
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
