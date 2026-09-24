@@ -541,7 +541,12 @@ fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
 
 /// 3–20 chars, ASCII letters/digits/underscore/hyphen only. Case is preserved for display;
 /// uniqueness is enforced case-insensitively by `users_username_unique_idx`.
+/// Reserved usernames are blocked case-insensitively to prevent impersonation.
 fn validate_username(input: Option<String>) -> Result<String, ApiError> {
+    const RESERVED_USERNAMES: &[&str] = &[
+        "admin", "root", "support", "official", "octo", "system", "me", "api",
+    ];
+
     let username = input
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty())
@@ -557,6 +562,14 @@ fn validate_username(input: Option<String>) -> Result<String, ApiError> {
     {
         return Err(ApiError::BadRequest(
             "username may only contain letters, numbers, underscores, and hyphens".into(),
+        ));
+    }
+    if RESERVED_USERNAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(&username))
+    {
+        return Err(ApiError::BadRequest(
+            "this username is not available".into(),
         ));
     }
     Ok(username)
@@ -913,5 +926,44 @@ mod tests {
 
         let result = validate_jwt_secret(b"more-than-32-bytes-is-also-fine!!");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_username_rejects_reserved_names() {
+        let reserved = ["admin", "root", "support", "official", "octo", "system", "me", "api"];
+        for name in reserved.iter() {
+            let result = validate_username(Some(name.to_string()));
+            assert!(
+                result.is_err(),
+                "validate_username should reject reserved name: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn update_username_still_accepts_valid_non_reserved_names() {
+        let valid = ["alice", "bob123", "user_name", "test-user"];
+        for name in valid.iter() {
+            let result = validate_username(Some(name.to_string()));
+            assert!(
+                result.is_ok(),
+                "validate_username should accept valid name: {}",
+                name
+            );
+            assert_eq!(result.unwrap(), *name);
+        }
+    }
+
+    #[test]
+    fn update_username_reserved_check_is_case_insensitive() {
+        let result = validate_username(Some("AdMiN".to_string()));
+        assert!(result.is_err());
+
+        let result = validate_username(Some("SUPPORT".to_string()));
+        assert!(result.is_err());
+
+        let result = validate_username(Some("Root".to_string()));
+        assert!(result.is_err());
     }
 }
