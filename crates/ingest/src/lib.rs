@@ -316,12 +316,12 @@ impl Ingestor {
                 status,
                 "payment-link deposit does not match the intended amount"
             );
-            if self
+            // Only the call that actually flipped the row notifies; a no-op means already settled.
+            let flipped = self
                 .store
                 .mark_payment_link_payment_mismatched(payment.id, tx.id, status)
-                .await
-                .is_err()
-            {
+                .await;
+            if !matches!(flipped, Ok(true)) {
                 return;
             }
             if let Some(sender) = &self.webhooks {
@@ -344,12 +344,12 @@ impl Ingestor {
             return;
         }
 
-        if self
+        // Only the call that actually flipped the row notifies; a no-op means already settled.
+        let flipped = self
             .store
             .confirm_payment_link_payment(payment.id, tx.id)
-            .await
-            .is_err()
-        {
+            .await;
+        if !matches!(flipped, Ok(true)) {
             return;
         }
 
