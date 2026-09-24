@@ -10,6 +10,9 @@
 //! - [`Store::record_deposit`] is **idempotent** on the immutable `(tx_hash, operation_index)`
 //!   unique index, so a replayed/reorged Horizon event cannot double-credit.
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
+//! - Every `list_*` method clamps its `limit` to [`MAX_LIST_LIMIT`]. This is defense in depth
+//!   *beneath* the API layer's own validation (max 200), not a replacement for it: it only stops a
+//!   caller that bypasses the API (an internal tool, a script) from issuing an unbounded query.
 #![forbid(unsafe_code)]
 
 mod error;
@@ -28,6 +31,14 @@ use uuid::Uuid;
 
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Hard ceiling on any list query's `LIMIT`, well above the API's max page (200 + 1 look-ahead).
+pub const MAX_LIST_LIMIT: i64 = 1000;
+
+/// Clamp a caller-supplied `limit` into `0..=MAX_LIST_LIMIT` (a negative LIMIT is a SQL error).
+fn clamp_limit(limit: i64) -> i64 {
+    limit.clamp(0, MAX_LIST_LIMIT)
+}
 
 /// A handle to the database (cloneable; wraps a connection pool).
 #[derive(Clone)]
@@ -269,6 +280,7 @@ impl Store {
         search: Option<&str>,
         limit: i64,
     ) -> Result<Vec<AuditLog>, StoreError> {
+        let limit = clamp_limit(limit);
         // Build with optional filters; `$2`/`$3` are NULL when not provided.
         let rows = sqlx::query_as::<_, AuditLog>(
             r#"
@@ -291,6 +303,26 @@ impl Store {
     }
 
     // --- api keys ---------------------------------------------------------
+
+    /// Create the wallet's first API key. Stores only the hash + display prefix. Atomic on the
+    /// `wallet_id` unique key: [`StoreError::Conflict`] if one already exists, so a racing or
+    /// retried "create" can never silently rotate a live key — use [`Store::upsert_api_key`].
+    pub async fn create_api_key(
+        &self,
+        wallet_id: Uuid,
+        prefix: &str,
+        key_hash: &str,
+    ) -> Result<ApiKey, StoreError> {
+        sqlx::query_as::<_, ApiKey>(
+            "INSERT INTO api_keys (wallet_id, prefix, key_hash) VALUES ($1, $2, $3) RETURNING *",
+        )
+        .bind(wallet_id)
+        .bind(prefix)
+        .bind(key_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from_sqlx_conflict)
+    }
 
     /// Create or replace the wallet's API key (regenerate). Stores only the hash + display prefix.
     pub async fn upsert_api_key(
@@ -441,6 +473,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
@@ -468,6 +501,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
@@ -634,6 +668,7 @@ impl Store {
         batch_size: i64,
         after_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
+        let batch_size = clamp_limit(batch_size);
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
@@ -709,6 +744,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Address>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Address>(
             r#"
             SELECT * FROM addresses
@@ -736,6 +772,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Address>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Address>(
             r#"
             SELECT * FROM addresses
@@ -829,6 +866,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Transaction>(
             r#"
             SELECT * FROM transactions
@@ -856,6 +894,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Transaction>(
             r#"
             SELECT * FROM transactions
@@ -997,6 +1036,7 @@ impl Store {
         status_filter: Option<&str>,
         before_id: Option<Uuid>,
     ) -> Result<Vec<SponsoredTransaction>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, SponsoredTransaction>(
             r#"
             SELECT * FROM sponsored_transactions
@@ -1240,7 +1280,8 @@ impl Store {
 
     // --- payment links -------------------------------------------------------
 
-    /// Create a payment link backed by an already-allocated deposit address.
+    /// Create a payment link backed by an already-allocated deposit address. The slug is stored
+    /// lowercased; [`StoreError::Conflict`] if it collides case-insensitively with an existing one.
     pub async fn create_payment_link(
         &self,
         link: NewPaymentLink<'_>,
@@ -1249,7 +1290,7 @@ impl Store {
             r#"
             INSERT INTO payment_links
                 (wallet_id, address_id, slug, name, description, image_url, redirect_url, amount_usdc_stroops)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, lower($3), $4, $5, $6, $7, $8)
             RETURNING *
             "#,
         )
@@ -1283,13 +1324,16 @@ impl Store {
         .ok_or(StoreError::NotFound)
     }
 
-    /// Public lookup by slug — no wallet scoping, this is the pay-page entry point.
+    /// Public lookup by slug — no wallet scoping, this is the pay-page entry point. Matches
+    /// case-insensitively (via the `lower(slug)` unique index), since users treat URLs that way.
     pub async fn get_payment_link_by_slug(&self, slug: &str) -> Result<PaymentLink, StoreError> {
-        sqlx::query_as::<_, PaymentLink>("SELECT * FROM payment_links WHERE slug = $1")
-            .bind(slug)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::NotFound)
+        sqlx::query_as::<_, PaymentLink>(
+            "SELECT * FROM payment_links WHERE lower(slug) = lower($1)",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)
     }
 
     /// Unscoped lookup by id — for internal (non-owner-facing) callers that already know which
@@ -1324,6 +1368,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<PaymentLink>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, PaymentLink>(
             r#"
             SELECT * FROM payment_links
@@ -1444,40 +1489,50 @@ impl Store {
         Ok(row)
     }
 
+    /// Transition a payment from `pending` to `confirmed`, linking the matched deposit.
+    ///
+    /// **Idempotent:** guarded by `status = 'pending'`, so a repeat call (a reprocessed deposit, a
+    /// retry after a timeout, or a race with the expiry sweep) is a no-op rather than an error.
+    /// Returns `true` only when this call actually flipped the row — callers must dispatch the
+    /// `payment_link.paid` webhook only on `true`, so it fires at most once per payment.
     pub async fn confirm_payment_link_payment(
         &self,
         id: Uuid,
         transaction_id: Uuid,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
             r#"
             UPDATE payment_link_payments
             SET status = 'confirmed', transaction_id = $1
-            WHERE id = $2
+            WHERE id = $2 AND status = 'pending'
             "#,
         )
         .bind(transaction_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Record a deposit that landed on this payment's address but for the wrong amount.
     /// `status` must be `"underpaid"` or `"overpaid"` — the transaction is still linked (so the
     /// merchant/payer can see what actually arrived) but the payment is deliberately NOT marked
     /// `confirmed`.
+    ///
+    /// Same `status = 'pending'` idempotency guard as [`Store::confirm_payment_link_payment`]:
+    /// returns `true` only when this call flipped the row, so the mismatch webhook fires once and
+    /// a late deposit can't overwrite an already-settled payment.
     pub async fn mark_payment_link_payment_mismatched(
         &self,
         id: Uuid,
         transaction_id: Uuid,
         status: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
             r#"
             UPDATE payment_link_payments
             SET status = $1, transaction_id = $2
-            WHERE id = $3
+            WHERE id = $3 AND status = 'pending'
             "#,
         )
         .bind(status)
@@ -1485,7 +1540,7 @@ impl Store {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Mark payments still `pending` past a 1-hour deadline as `expired`, returning the rows that
@@ -1516,6 +1571,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<PaymentLinkPayment>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, PaymentLinkPayment>(
             r#"
             SELECT * FROM payment_link_payments
@@ -1861,6 +1917,7 @@ impl Store {
         endpoint_id: Uuid,
         limit: i64,
     ) -> Result<Vec<WebhookDelivery>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, WebhookDelivery>(
             r#"
             SELECT * FROM webhook_deliveries
