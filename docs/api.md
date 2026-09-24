@@ -100,8 +100,10 @@ loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 a
 All three require a **dashboard JWT** and wallet ownership — an API key can never manage keys,
 so it cannot escalate or revoke itself.
 
-- `POST   /v1/wallets/{id}/api-key` — generate/regenerate (the plaintext key is shown **once**;
-  only a SHA-256 hash is stored).
+- `POST   /v1/wallets/{id}/api-key` — generate (the plaintext key is shown **once**; only a
+  SHA-256 hash is stored). The first key needs no body. Once a key exists, rotating it requires
+  `{"confirm": true}` — otherwise `409` ("an API key already exists; pass confirm=true to rotate
+  it"). Rotation immediately invalidates the previous key.
 - `GET    /v1/wallets/{id}/api-key` — metadata (prefix, created_at) — never the key itself.
 - `DELETE /v1/wallets/{id}/api-key` — revoke.
 

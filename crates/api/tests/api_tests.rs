@@ -853,11 +853,12 @@ async fn regenerating_api_key_invalidates_the_previous_one() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Regenerate: POST again with the (dashboard) owner token.
+    // Regenerate: POST again with the (dashboard) owner token, explicitly confirming rotation.
     let resp = app
         .clone()
-        .oneshot(post_auth(
+        .oneshot(post_json_auth(
             &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            r#"{"confirm":true}"#,
             &token,
         ))
         .await
