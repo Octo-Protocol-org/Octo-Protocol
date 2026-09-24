@@ -738,6 +738,72 @@ mod tests_issue_252 {
     }
 }
 
+fn validate_redirect_url(url: &str) -> Result<(), ApiError> {
+    if url.is_empty() {
+        return Ok(());
+    }
+
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            let scheme = parsed.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err(ApiError::BadRequest(
+                    "redirect_url must use http:// or https:// scheme".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(_) => Err(ApiError::BadRequest(
+            "redirect_url must be a valid absolute URL".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests_issue_253 {
+    use super::*;
+
+    #[test]
+    fn validate_redirect_url_accepts_empty_url() {
+        assert!(validate_redirect_url("").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_https_url() {
+        assert!(validate_redirect_url("https://example.com").is_ok());
+        assert!(validate_redirect_url("https://example.com/path").is_ok());
+        assert!(validate_redirect_url("https://example.com:8080/path?query=1").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_http_url() {
+        assert!(validate_redirect_url("http://example.com").is_ok());
+        assert!(validate_redirect_url("http://localhost:8000").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_javascript_scheme() {
+        assert!(validate_redirect_url("javascript:alert('xss')").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_data_scheme() {
+        assert!(validate_redirect_url("data:text/html,<h1>xss</h1>").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_invalid_url() {
+        assert!(validate_redirect_url("not a url").is_err());
+        assert!(validate_redirect_url("ht!tp://invalid").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_relative_url() {
+        assert!(validate_redirect_url("/path/to/page").is_err());
+        assert!(validate_redirect_url("path/to/page").is_err());
+    }
+}
+
 fn validate_slug(input: &str) -> Result<String, ApiError> {
     let normalized = input.trim().to_lowercase();
 
