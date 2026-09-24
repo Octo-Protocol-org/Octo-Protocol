@@ -1052,4 +1052,51 @@ mod tests {
             "token TTL should be 7 days (within ±1 second for timing variance)"
         );
     }
+
+    #[test]
+    fn hash_token_produces_consistent_output() {
+        let token = "test.jwt.token";
+        let hash1 = hash_token(token);
+        let hash2 = hash_token(token);
+
+        assert_eq!(
+            hash1, hash2,
+            "hashing the same token should produce the same hash"
+        );
+        assert_eq!(
+            hash1.len(),
+            64,
+            "SHA-256 hex should be 64 characters"
+        );
+    }
+
+    #[test]
+    fn different_tokens_produce_different_hashes() {
+        let token1 = "test.jwt.token1";
+        let token2 = "test.jwt.token2";
+        let hash1 = hash_token(token1);
+        let hash2 = hash_token(token2);
+
+        assert_ne!(
+            hash1, hash2,
+            "different tokens should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn verify_token_rejects_malformed_tokens() {
+        assert!(verify_token(SECRET, "").is_none());
+        assert!(verify_token(SECRET, "not.a.token").is_none());
+        assert!(verify_token(SECRET, "a.b").is_none());
+        assert!(verify_token(SECRET, "a.b.c.d").is_none());
+    }
+
+    #[test]
+    fn verify_token_rejects_tokens_signed_with_different_secret() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+
+        let other_secret = b"different-secret-at-least-32-bytes-long!";
+        assert!(verify_token(other_secret, &token).is_none());
+    }
 }
