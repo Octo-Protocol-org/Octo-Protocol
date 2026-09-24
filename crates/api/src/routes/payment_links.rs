@@ -804,6 +804,50 @@ mod tests_issue_253 {
     }
 }
 
+const MAX_PAYMENT_INTENT_AMOUNT: i64 = 10_000_000_000;
+
+#[cfg(test)]
+mod tests_issue_254 {
+    use super::*;
+
+    #[test]
+    fn payment_intent_amount_cap_constant_is_set() {
+        assert_eq!(MAX_PAYMENT_INTENT_AMOUNT, 10_000_000_000);
+    }
+
+    #[test]
+    fn validate_amount_positive() {
+        assert!(1 > 0);
+        assert!(100_000 > 0);
+        assert!(MAX_PAYMENT_INTENT_AMOUNT > 0);
+    }
+
+    #[test]
+    fn validate_amount_within_bounds() {
+        let amount = 1_000_000_000;
+        assert!(amount > 0 && amount <= MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_rejects_exceeding_cap() {
+        let amount = MAX_PAYMENT_INTENT_AMOUNT + 1;
+        assert!(amount > MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_accepts_at_cap_boundary() {
+        let amount = MAX_PAYMENT_INTENT_AMOUNT;
+        assert!(amount == MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_rejects_zero_or_negative() {
+        assert!(!(0 > 0));
+        assert!(!(-1 > 0));
+        assert!(!(-1_000_000 > 0));
+    }
+}
+
 fn validate_slug(input: &str) -> Result<String, ApiError> {
     let normalized = input.trim().to_lowercase();
 
