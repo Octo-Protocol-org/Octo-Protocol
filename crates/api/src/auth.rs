@@ -562,6 +562,20 @@ fn validate_username(input: Option<String>) -> Result<String, ApiError> {
     Ok(username)
 }
 
+/// Validate that JWT_SECRET meets the minimum length requirement.
+/// HMAC-SHA256 silently accepts secrets of any length, but a short secret
+/// enables trivial token forgery. This enforces a 32-byte minimum at startup.
+pub fn validate_jwt_secret(secret: &[u8]) -> Result<(), String> {
+    const MIN_LENGTH: usize = 32;
+    if secret.len() < MIN_LENGTH {
+        return Err(format!(
+            "JWT_SECRET must be at least {MIN_LENGTH} bytes, got {}",
+            secret.len()
+        ));
+    }
+    Ok(())
+}
+
 fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
@@ -867,5 +881,37 @@ mod tests {
         assert!(verify_token(SECRET, &tampered).is_none());
 
         assert!(verify_token(SECRET, &token).is_some());
+    }
+
+    #[test]
+    fn validate_jwt_secret_rejects_empty_secret() {
+        let result = validate_jwt_secret(&[]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_lowercase()
+            .contains("minimum length"));
+    }
+
+    #[test]
+    fn validate_jwt_secret_rejects_secret_under_32_bytes() {
+        let result = validate_jwt_secret(b"too-short");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_lowercase()
+            .contains("minimum length"));
+
+        let result = validate_jwt_secret(b"31-byte-secret-still-too-shor");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_jwt_secret_accepts_32_byte_secret() {
+        let result = validate_jwt_secret(b"exactly-32-byte-secret-for-hmac");
+        assert!(result.is_ok());
+
+        let result = validate_jwt_secret(b"more-than-32-bytes-is-also-fine!!");
+        assert!(result.is_ok());
     }
 }
