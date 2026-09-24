@@ -966,4 +966,90 @@ mod tests {
         let result = validate_username(Some("Root".to_string()));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn validate_credentials_rejects_short_password() {
+        let creds = Credentials {
+            email: Some("test@example.com".to_string()),
+            password: Some("short".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .to_lowercase()
+            .contains("password must be"));
+    }
+
+    #[test]
+    fn validate_credentials_accepts_8_char_password() {
+        let creds = Credentials {
+            email: Some("test@example.com".to_string()),
+            password: Some("12345678".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_ok());
+        let (email, password) = result.unwrap();
+        assert_eq!(email, "test@example.com");
+        assert_eq!(password, "12345678");
+    }
+
+    #[test]
+    fn validate_credentials_requires_valid_email() {
+        let creds = Credentials {
+            email: Some("invalid-email".to_string()),
+            password: Some("validpassword".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .to_lowercase()
+            .contains("valid email"));
+
+        let creds = Credentials {
+            email: Some("a@b".to_string()),
+            password: Some("validpassword".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn token_includes_unique_jti_to_prevent_collision() {
+        let user_id = Uuid::new_v4();
+        let token1 = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token2 = issue_token(SECRET, user_id).expect("issue_token should succeed");
+
+        assert_ne!(token1, token2, "tokens for same user issued in quick succession should differ");
+
+        let claims1 = verify_token(SECRET, &token1).expect("token1 should verify");
+        let claims2 = verify_token(SECRET, &token2).expect("token2 should verify");
+        assert_ne!(
+            claims1.jti, claims2.jti,
+            "each token should have a unique jti"
+        );
+        assert_eq!(
+            claims1.sub, claims2.sub,
+            "but both should be for the same user"
+        );
+    }
+
+    #[test]
+    fn token_expires_after_ttl() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let claims = verify_token(SECRET, &token).expect("token should verify");
+
+        let now = now_secs();
+        let ttl_secs = claims.exp - now;
+
+        assert!(ttl_secs > 0, "token should have positive TTL");
+        assert!(
+            ttl_secs >= 7 * 24 * 60 * 60 - 1 && ttl_secs <= 7 * 24 * 60 * 60 + 1,
+            "token TTL should be 7 days (within ±1 second for timing variance)"
+        );
+    }
 }
