@@ -10,7 +10,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_crypto::SealedSeed;
-use octo_wallet_core::{compute_inner_tx_hash, sign_fee_bump, FeeBumpRequest};
+use octo_wallet_core::{
+    compute_inner_tx_hash, inner_sequence_number, sign_fee_bump, FeeBumpRequest,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -79,6 +81,25 @@ pub async fn sponsor(
 
     // 3. Validate the inner XDR (op allowlist + no self-sponsorship). Pure, no I/O.
     validate_inner_xdr(&inner_xdr, &wallet.stellar_account_g)?;
+
+    // Pre-flight sequence check to save a wasted budget reservation and signature on a doomed submission.
+    let live_seq = state
+        .horizon()
+        .account_sequence(&wallet.stellar_account_g)
+        .await
+        .map_err(|e| match e {
+            ApiError::NotFound => ApiError::BadRequest(
+                "This wallet is not funded on-chain yet. Fund it with XLM (testnet friendbot) first."
+                    .into(),
+            ),
+            other => other,
+        })?;
+    let inner_seq = inner_sequence_number(&inner_xdr)?;
+    if inner_seq <= live_seq {
+        return Err(ApiError::StaleSequence(
+            "Stale sequence number — refresh signing info and rebuild the transaction.".into(),
+        ));
+    }
 
     // 4. Compute the inner tx hash (dedup key) and reserve budget atomically.
     let inner_hash = compute_inner_tx_hash(&inner_xdr, state.network())?;

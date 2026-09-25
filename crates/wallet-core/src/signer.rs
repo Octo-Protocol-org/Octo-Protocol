@@ -464,6 +464,11 @@ pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
     Ok(parse_inner_v1(inner_xdr)?.tx.operations.len())
 }
 
+// Extract the sequence number of the inner transaction.
+pub fn inner_sequence_number(inner_xdr: &str) -> Result<i64, WalletError> {
+    Ok(parse_inner_v1(inner_xdr)?.tx.seq_num.0)
+}
+
 // Decode a base64 TransactionEnvelope strictly, rejecting trailing bytes after the envelope.
 pub fn decode_envelope_strict(
     b64: &str,

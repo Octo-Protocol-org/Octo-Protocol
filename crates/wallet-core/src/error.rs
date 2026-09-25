@@ -49,6 +49,10 @@ pub enum WalletError {
     /// An ed25519 signature failed to parse or did not verify against the claimed account.
     #[error("invalid signature")]
     InvalidSignature,
+
+    /// The transaction sequence number does not match the account's current chain sequence.
+    #[error("stale transaction sequence number")]
+    StaleSequence,
 }
 
 impl From<octo_crypto::CryptoError> for WalletError {
