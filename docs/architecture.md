@@ -77,3 +77,22 @@ server, and it is confined to one crate:
 
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
+
+## Wallet Foreign Key Constraints
+
+Wallets are intended to be permanent master records. To prevent accidental cascading deletions or silent orphaned records, all tables referencing `wallets(id)` enforce `ON DELETE RESTRICT`:
+
+| Table | Column | Initial Migration Constraint | Intended & Enforced Constraint |
+| --- | --- | --- | --- |
+| `addresses` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `transactions` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `withdrawals` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `webhook_endpoints` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `ingest_cursor` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `api_keys` | `wallet_id` | `ON DELETE CASCADE` (0005) | `ON DELETE RESTRICT` (0021) |
+| `gas_sponsorship_configs` | `wallet_id` | `ON DELETE CASCADE` (0007) | `ON DELETE RESTRICT` (0021) |
+| `sponsored_transactions` | `wallet_id` | `ON DELETE CASCADE` (0007) | `ON DELETE RESTRICT` (0021) |
+| `withdrawal_allowlist_configs` | `wallet_id` | `ON DELETE CASCADE` (0013) | `ON DELETE RESTRICT` (0021) |
+| `whitelisted_addresses` | `wallet_id` | `ON DELETE CASCADE` (0013) | `ON DELETE RESTRICT` (0021) |
+| `payment_links` | `wallet_id` | `ON DELETE CASCADE` (0014) | `ON DELETE RESTRICT` (0021) |
+
