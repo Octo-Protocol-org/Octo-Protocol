@@ -1703,6 +1703,26 @@ impl Store {
         Ok(())
     }
 
+    // Reconcile sponsored transactions stuck in pending past older_than by marking them failed.
+    pub async fn reconcile_stale_pending_sponsorships(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE sponsored_transactions
+            SET status = 'failed', error = COALESCE(error, 'timed out pending confirmation')
+            WHERE status = 'pending'
+              AND created_at < now() - make_interval(secs => $1)
+            "#,
+        )
+        .bind(older_than.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Sum of **confirmed** sponsored fees for a wallet so far today (UTC) — i.e. actually spent.
     /// (Pending rows are excluded; for budget *reservation* use
     /// [`Store::sum_sponsored_fees_reserved_today`].)

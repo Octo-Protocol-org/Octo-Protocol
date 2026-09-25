@@ -89,6 +89,28 @@ async fn main() -> Result<()> {
         "deposit ingest supervisor started"
     );
 
+    // Periodic background sweep to reconcile sponsorships stuck pending after a crash.
+    let sweep_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match sweep_store
+                .reconcile_stale_pending_sponsorships(Duration::from_secs(300))
+                .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "reconciled stale pending sponsored transactions");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to reconcile stale pending sponsorships");
+                }
+            }
+        }
+    });
+
     // REST API.
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
