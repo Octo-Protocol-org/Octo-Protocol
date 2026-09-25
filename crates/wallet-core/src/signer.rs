@@ -464,15 +464,30 @@ pub fn inner_operation_count(inner_xdr: &str) -> Result<usize, WalletError> {
     Ok(parse_inner_v1(inner_xdr)?.tx.operations.len())
 }
 
-/// Parse `inner_xdr` as a `TransactionEnvelope` and require that it decodes to specifically
-/// a v1 Tx, not a fee-bump or the legacy v0 form. Centralising the check here ensures the two
-/// call sites cannot silently drift apart as the fee-bump path grows.
+// Decode a base64 TransactionEnvelope strictly, rejecting trailing bytes after the envelope.
+pub fn decode_envelope_strict(
+    b64: &str,
+) -> Result<stellar_base::xdr::TransactionEnvelope, WalletError> {
+    use base64::Engine;
+    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize, XDRSerialize};
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|_| WalletError::InvalidXdr)?;
+    let env = TransactionEnvelope::from_xdr(&raw).map_err(|_| WalletError::InvalidXdr)?;
+    let encoded = env.xdr_bytes().map_err(|_| WalletError::InvalidXdr)?;
+    if encoded.len() != raw.len() {
+        return Err(WalletError::InvalidXdr);
+    }
+    Ok(env)
+}
+
+// Parse inner_xdr as a v1 Tx TransactionEnvelope using strict decoding.
 fn parse_inner_v1(
     inner_xdr: &str,
 ) -> Result<stellar_base::xdr::TransactionV1Envelope, WalletError> {
-    use stellar_base::xdr::{TransactionEnvelope, XDRDeserialize};
-    let env =
-        TransactionEnvelope::from_xdr_base64(inner_xdr).map_err(|_| WalletError::InvalidXdr)?;
+    use stellar_base::xdr::TransactionEnvelope;
+    let env = decode_envelope_strict(inner_xdr)?;
     match env {
         TransactionEnvelope::Tx(v1) => Ok(v1),
         _ => Err(WalletError::InvalidXdr),
