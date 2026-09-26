@@ -8,6 +8,9 @@
 //!  POST /logout    ──▶ revokes T2
 //! ```
 //!
+//! A password reset revokes *every* session at once: tokens carry the user's `session_epoch`, and
+//! bumping it makes all older tokens fail `authenticate`.
+//!
 //! Revocation uses a deny-list in Postgres (migration 0008_token_denylist.sql).
 //! Every authenticated request checks the deny-list after signature + expiry verification,
 //! so a revoked token is rejected even within its original TTL window.
@@ -82,6 +85,18 @@ pub struct VerifyEmailRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct RequestPasswordResetRequest {
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ConfirmPasswordResetRequest {
+    pub email: Option<String>,
+    pub code: Option<String>,
+    pub new_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct ResendOtpRequest {
     pub user_id: Option<Uuid>,
 }
@@ -113,6 +128,10 @@ pub struct Claims {
     /// and denylisting the old one would revoke the new one too.
     #[serde(default)]
     pub jti: String,
+    /// Session epoch the token was issued under; a token whose epoch is stale is revoked. Tokens
+    /// minted before epochs existed decode as 0, which matches every user's starting epoch.
+    #[serde(default)]
+    pub ep: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,28 +160,40 @@ fn check_auth_rate_limit(
     }
 }
 
-/// Generate, store, and email a signup-verification OTP. Shared by `signup`, `resend_otp`, and
-/// `login` when the account isn't yet verified.
-async fn issue_signup_otp(state: &AppState, user_id: Uuid, email: &str) -> Result<(), ApiError> {
+/// Generate, store, and email a one-time code for `purpose`. `bound_to` ties the code to one value
+/// (e.g. a new email address) so it can't be redeemed for anything else.
+async fn issue_otp(
+    state: &AppState,
+    user_id: Uuid,
+    purpose: &str,
+    to: &str,
+    bound_to: Option<&str>,
+) -> Result<(), ApiError> {
     let code = octo_email::generate_otp();
     let code_hash = octo_email::hash_otp(&code);
     state
         .store()
         .create_otp(
             user_id,
-            "signup",
+            purpose,
             &code_hash,
-            None,
+            bound_to,
             chrono::Duration::minutes(OTP_TTL_MINUTES),
         )
         .await
         .map_err(|_| ApiError::Internal)?;
     state
         .email()
-        .send_otp(email, "signup", &code)
+        .send_otp(to, purpose, &code)
         .await
         .map_err(|_| ApiError::Internal)?;
     Ok(())
+}
+
+/// Issue a signup-verification OTP. Shared by `signup`, `resend_otp`, and `login` when the account
+/// isn't yet verified.
+async fn issue_signup_otp(state: &AppState, user_id: Uuid, email: &str) -> Result<(), ApiError> {
+    issue_otp(state, user_id, "signup", email, None).await
 }
 
 /// `POST /v1/auth/signup`
@@ -252,7 +283,7 @@ pub async fn verify_email(
         .send(&user.email, "Welcome to Octo", &welcome_html)
         .await;
 
-    let token = issue_token(state.jwt_secret(), user.id)?;
+    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -354,7 +385,7 @@ pub async fn login(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id)?;
+    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
     Ok(Envelope::ok(
         serde_json::to_value(AuthResponse {
             token,
@@ -418,7 +449,7 @@ pub async fn refresh(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id)?;
+    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -476,6 +507,112 @@ pub async fn update_username(
     }))
 }
 
+/// Send a password-reset OTP if `email` belongs to a verified account; otherwise do nothing.
+async fn send_password_reset_otp(state: &AppState, email: &str) -> Result<(), ApiError> {
+    let Some(user) = state
+        .store()
+        .find_user_by_email(email)
+        .await
+        .map_err(|_| ApiError::Internal)?
+    else {
+        return Ok(());
+    };
+    if user.email_verified_at.is_none() {
+        return Ok(());
+    }
+    // Per-account cap: with the per-code attempt limit it bounds guessing to a few tries an hour.
+    if !state.rate_limiter().check(
+        &format!("pwreset:{}", user.id),
+        "pw_reset_send",
+        3,
+        std::time::Duration::from_secs(60 * 60),
+    ) {
+        return Ok(());
+    }
+    issue_otp(state, user.id, "password_reset", &user.email, None).await
+}
+
+/// `POST /v1/auth/request-password-reset` — email a reset code if the account exists.
+///
+/// The response is identical whether or not the email matches an account. The lookup and send run
+/// in the background, so neither the body nor the latency reveals which case it was.
+pub async fn request_password_reset(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<serde_json::Value>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    let req: RequestPasswordResetRequest = parse_optional(&body)?;
+    let email = normalize_email(req.email)?;
+
+    tokio::spawn(async move {
+        if let Err(e) = send_password_reset_otp(&state, &email).await {
+            tracing::warn!(error = ?e, "password-reset OTP could not be sent");
+        }
+    });
+    Ok(Envelope::ok(serde_json::json!({ "sent": true })))
+}
+
+/// `POST /v1/auth/confirm-password-reset` — verify the emailed code, set the new password, and
+/// revoke every existing session.
+pub async fn confirm_password_reset(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<serde_json::Value>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    let req: ConfirmPasswordResetRequest = parse_optional(&body)?;
+    // Validate the password first so a typo doesn't burn the one-time code.
+    let (email, new_password) = validate(Credentials {
+        email: req.email,
+        password: req.new_password,
+    })?;
+    let code = req
+        .code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("code is required".into()))?;
+
+    // One message for every failure: unknown email, wrong code, expired code, reused code.
+    let invalid = || ApiError::BadRequest("invalid or expired code".into());
+    let user = state
+        .store()
+        .find_user_by_email(&email)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or_else(invalid)?;
+    state
+        .store()
+        .verify_and_consume_otp(
+            user.id,
+            "password_reset",
+            &octo_email::hash_otp(&code),
+            None,
+        )
+        .await
+        .map_err(|_| invalid())?;
+
+    let hash = hash_password(&new_password)?;
+    state
+        .store()
+        .reset_password(user.id, &hash)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
+    crate::audit::record(
+        &state,
+        user.id,
+        "reset their password",
+        crate::audit::category::AUTH,
+        None,
+        &headers,
+    )
+    .await;
+
+    Ok(Envelope::ok(serde_json::json!({ "reset": true })))
+}
+
 /// `POST /v1/auth/logout` — invalidate the current session token server-side.
 ///
 /// Inserts the token's SHA-256 hash into the deny-list with an expiry matching the token's own
@@ -526,12 +663,15 @@ pub async fn logout(
 
 // --- helpers ---------------------------------------------------------------
 
-fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
-    let email = creds
-        .email
+fn normalize_email(email: Option<String>) -> Result<String, ApiError> {
+    email
         .map(|e| e.trim().to_lowercase())
         .filter(|e| e.contains('@') && e.len() >= 3)
-        .ok_or_else(|| ApiError::BadRequest("a valid email is required".into()))?;
+        .ok_or_else(|| ApiError::BadRequest("a valid email is required".into()))
+}
+
+fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
+    let email = normalize_email(creds.email)?;
     let password = creds
         .password
         .filter(|p| p.len() >= 8)
@@ -590,11 +730,12 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn issue_token(secret: &[u8], user_id: Uuid) -> Result<String, ApiError> {
+fn issue_token(secret: &[u8], user_id: Uuid, epoch: i32) -> Result<String, ApiError> {
     let claims = Claims {
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
         jti: Uuid::new_v4().to_string(),
+        ep: epoch,
     };
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
     let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -661,7 +802,8 @@ pub fn hash_token(token: &str) -> String {
 /// Checks, in order:
 /// 1. Presence of the `Authorization: Bearer <token>` header.
 /// 2. Valid HS256 signature and unexpired `exp` claim (`verify_token`).
-/// 3. Token is **not** in the server-side deny-list (populated by `POST /v1/auth/logout`).
+/// 3. Token's session epoch matches the user's current one (bumped by a password reset).
+/// 4. Token is **not** in the server-side deny-list (populated by `POST /v1/auth/logout`).
 ///    This adds one database round-trip per authenticated request. The deny-list table is indexed
 ///    on `(token_hash)` (primary key) so the lookup is a single index probe. In practice the
 ///    p99 overhead is well under 1 ms on a co-located Postgres instance; an in-memory cache is
@@ -692,6 +834,16 @@ pub async fn authenticate(
         .await
         .map_err(|_| ApiError::Internal)?;
     if denied {
+        return Err(ApiError::Unauthorized);
+    }
+
+    // A stale epoch (password reset) or a deleted user revokes the token.
+    let epoch = state
+        .store()
+        .get_session_epoch(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if epoch != Some(claims.ep) {
         return Err(ApiError::Unauthorized);
     }
 
@@ -783,6 +935,7 @@ mod tests {
             sub: user_id.to_string(),
             exp,
             jti: Uuid::new_v4().to_string(),
+            ep: 0,
         };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
         let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -800,7 +953,7 @@ mod tests {
     #[test]
     fn tampered_signature_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -823,7 +976,7 @@ mod tests {
     #[test]
     fn tampered_payload_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -847,7 +1000,7 @@ mod tests {
     #[test]
     fn non_standard_header_segment_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 

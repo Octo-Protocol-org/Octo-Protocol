@@ -111,6 +111,8 @@ pub struct User {
     pub password_hash: String,
     /// Null until the signup/login OTP is verified.
     pub email_verified_at: Option<DateTime<Utc>>,
+    /// Bumped to revoke every live session token at once (e.g. on password reset).
+    pub session_epoch: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -82,6 +82,7 @@ fn shell(body: &str, icon: Icon) -> String {
 pub fn otp_email(code: &str, purpose: &str) -> String {
     let action = match purpose {
         "withdrawal" => "confirm a withdrawal",
+        "password_reset" => "reset your password",
         _ => "verify your email",
     };
     shell(

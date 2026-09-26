@@ -164,6 +164,32 @@ impl Store {
         Ok(())
     }
 
+    /// The user's current session epoch, or `None` if the user no longer exists.
+    pub async fn get_session_epoch(&self, user_id: Uuid) -> Result<Option<i32>, StoreError> {
+        let epoch = sqlx::query_scalar("SELECT session_epoch FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(epoch)
+    }
+
+    /// Set a new password hash and bump the session epoch, revoking every existing session token.
+    pub async fn reset_password(
+        &self,
+        user_id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE users SET password_hash = $2, session_epoch = session_epoch + 1, \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // --- email OTP ----------------------------------------------------------
 
     /// Issue a fresh OTP row. Callers hash the code themselves before calling this.
@@ -227,10 +253,16 @@ impl Store {
             return Err(StoreError::InvalidOtp);
         }
 
-        sqlx::query("UPDATE email_otps SET consumed_at = now() WHERE id = $1")
-            .bind(otp.id)
-            .execute(&self.pool)
-            .await?;
+        // Atomic claim: of two concurrent submissions of the same code, only one may succeed.
+        let claimed = sqlx::query(
+            "UPDATE email_otps SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL",
+        )
+        .bind(otp.id)
+        .execute(&self.pool)
+        .await?;
+        if claimed.rows_affected() != 1 {
+            return Err(StoreError::InvalidOtp);
+        }
         Ok(())
     }
 

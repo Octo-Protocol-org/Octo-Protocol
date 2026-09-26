@@ -27,6 +27,10 @@ deny-list the presented token, and every authenticated request checks that deny-
 - `POST /v1/auth/refresh` — issue a new token **and revoke the presented one**.
 - `POST /v1/auth/logout` — revoke the presented token (a second logout is `401`, not `200`).
 - `GET  /v1/auth/me` — the current user.
+- `POST /v1/auth/request-password-reset` — `{email}`; emails a 10-minute OTP if a verified account
+  exists. Always returns the same `200` either way (no account enumeration).
+- `POST /v1/auth/confirm-password-reset` — `{email, code, new_password}`; sets the password and
+  **revokes every existing session**. Any failure is `400 invalid or expired code`.
 
 ## Custody model — read this before the wallet endpoints
 
