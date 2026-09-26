@@ -19,11 +19,12 @@ pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
     NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, SponsoredTransaction,
-    Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint, WhitelistedAddress, Withdrawal,
-    WithdrawalAllowlistConfig,
+    Transaction, User, Wallet, WebhookDelivery, WebhookDeliveryHealth, WebhookEndpoint,
+    WhitelistedAddress, Withdrawal, WithdrawalAllowlistConfig,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Embedded migrations, applied by [`Store::migrate`].
@@ -440,11 +441,13 @@ impl Store {
         user_id: Uuid,
         limit: i64,
         before_id: Option<Uuid>,
+        include_archived: bool,
     ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
             WHERE user_id = $1
+              AND ($4::bool OR archived_at IS NULL)
               AND ($2::uuid IS NULL OR (created_at, id) < (
                   SELECT created_at, id FROM wallets WHERE id = $2
               ))
@@ -455,6 +458,7 @@ impl Store {
         .bind(user_id)
         .bind(before_id)
         .bind(limit)
+        .bind(include_archived)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -467,11 +471,13 @@ impl Store {
         user_id: Uuid,
         limit: i64,
         before_id: Option<Uuid>,
+        include_archived: bool,
     ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
             WHERE user_id = $1
+              AND ($4::bool OR archived_at IS NULL)
               AND ($2::uuid IS NULL OR (created_at, id) < (
                     SELECT created_at, id FROM wallets WHERE id = $2
                   ))
@@ -482,9 +488,45 @@ impl Store {
         .bind(user_id)
         .bind(before_id)
         .bind(limit)
+        .bind(include_archived)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Archive a wallet so it is excluded from default lists and cannot accept mutations.
+    pub async fn archive_wallet(&self, id: Uuid) -> Result<(), StoreError> {
+        let rows = sqlx::query("UPDATE wallets SET archived_at = now() WHERE id = $1 AND archived_at IS NULL")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            let _ = self.get_wallet(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Restore an archived wallet to normal active operation.
+    pub async fn unarchive_wallet(&self, id: Uuid) -> Result<(), StoreError> {
+        let rows = sqlx::query("UPDATE wallets SET archived_at = NULL WHERE id = $1 AND archived_at IS NOT NULL")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            let _ = self.get_wallet(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Ensure a wallet exists and is active (not archived).
+    pub async fn ensure_wallet_active(&self, id: Uuid) -> Result<Wallet, StoreError> {
+        let wallet = self.get_wallet(id).await?;
+        if wallet.archived_at.is_some() {
+            return Err(StoreError::WalletArchived);
+        }
+        Ok(wallet)
     }
 
     /// List all wallets (used by the ingest supervisor to fan out poll loops).
@@ -1874,6 +1916,67 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Health rollup for a single webhook endpoint over the recent bounded window (last 24 hours).
+    pub async fn webhook_delivery_health(
+        &self,
+        endpoint_id: Uuid,
+    ) -> Result<WebhookDeliveryHealth, StoreError> {
+        let health = sqlx::query_as::<_, WebhookDeliveryHealth>(
+            r#"
+            SELECT
+                COALESCE(COUNT(CASE WHEN status = 'failed' AND created_at >= now() - INTERVAL '24 hours' THEN 1 END), 0)::bigint AS recent_failure_count,
+                MAX(CASE WHEN status = 'delivered' THEN created_at END) AS last_successful_delivery_at
+            FROM webhook_deliveries
+            WHERE endpoint_id = $1
+            "#,
+        )
+        .bind(endpoint_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(health)
+    }
+
+    /// Batched health rollup for all active webhook endpoints of a wallet (single aggregate query).
+    pub async fn wallet_webhook_delivery_health(
+        &self,
+        wallet_id: Uuid,
+    ) -> Result<HashMap<Uuid, WebhookDeliveryHealth>, StoreError> {
+        #[derive(sqlx::FromRow)]
+        struct EndpointHealthRow {
+            endpoint_id: Uuid,
+            recent_failure_count: i64,
+            last_successful_delivery_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let rows = sqlx::query_as::<_, EndpointHealthRow>(
+            r#"
+            SELECT
+                we.id AS endpoint_id,
+                COALESCE(COUNT(CASE WHEN wd.status = 'failed' AND wd.created_at >= now() - INTERVAL '24 hours' THEN 1 END), 0)::bigint AS recent_failure_count,
+                MAX(CASE WHEN wd.status = 'delivered' THEN wd.created_at END) AS last_successful_delivery_at
+            FROM webhook_endpoints we
+            LEFT JOIN webhook_deliveries wd ON wd.endpoint_id = we.id
+            WHERE we.wallet_id = $1 AND we.active = true
+            GROUP BY we.id
+            "#,
+        )
+        .bind(wallet_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for r in rows {
+            map.insert(
+                r.endpoint_id,
+                WebhookDeliveryHealth {
+                    recent_failure_count: r.recent_failure_count,
+                    last_successful_delivery_at: r.last_successful_delivery_at,
+                },
+            );
+        }
+        Ok(map)
     }
 
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.

@@ -27,6 +27,32 @@ cargo deny check   # licenses + advisories (cargo install cargo-deny)
 
 All of `fmt --check`, `clippy -D warnings`, and the test suite must pass.
 
+## Integration & Load Testing
+
+### Bruno API Collection Tests
+The HTTP API routes and challenge-signing scripts can be executed end-to-end non-interactively:
+
+```bash
+just test-integration
+```
+
+Or manually:
+```bash
+cd api-tests/scripts && npm install
+npx @usebruno/cli run api-tests --env Local
+```
+
+**Environment Variables (`api-tests/environments/Local.bru`):**
+- `base_url`: The target API server URL (defaults to `http://localhost:8080`).
+- Ensure `octo-server` has valid environment variables configured in `.env` (`DATABASE_URL`, `MASTER_KEY`, `JWT_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS`, `BIND_ADDR`).
+
+### Concurrency Load Tests
+High-concurrency stress tests (such as budget reservation under 100-way concurrency) are marked `#[ignore]` so they do not slow down default test runs. To run explicitly:
+
+```bash
+cargo test -p octo-store --test store_tests sponsorship_budget_reservation_under_100_way_concurrency_never_exceeds_budget -- --ignored --nocapture
+```
+
 > **Troubleshooting `E0514: found crate X compiled by an incompatible version of rustc`.**
 > This appears when `target/` holds artifacts from two different `rustc` builds that share a
 > version string but not their internal metadata format — e.g. a system `/usr/bin/rustc` vs. a

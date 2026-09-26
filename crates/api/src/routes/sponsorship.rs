@@ -70,6 +70,10 @@ pub async fn put_config(
     body: Bytes,
 ) -> ApiResult<Json<Envelope<SponsorshipConfigView>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
     let req: SponsorshipConfigRequest = parse_optional(&body)?;
 
     let enabled = req.enabled.unwrap_or(false);

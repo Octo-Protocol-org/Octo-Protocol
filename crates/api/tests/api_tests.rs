@@ -2643,3 +2643,134 @@ async fn submit_payment_validates_against_the_intents_own_address() {
         "a USDC payment to this intent's own address must pass validation and be relayed"
     );
 }
+
+#[tokio::test]
+async fn list_webhooks_includes_a_recent_failure_count_per_endpoint() {
+    let Some(state) = test_state().await else { return };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+
+    let w_resp = app
+        .clone()
+        .oneshot(create_wallet_req(&app, &token).await)
+        .await
+        .unwrap();
+    let w_id = body_json(w_resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ep = state
+        .store()
+        .create_webhook_endpoint(
+            Uuid::parse_str(&w_id).unwrap(),
+            "https://example.com/webhook",
+            "sec",
+        )
+        .await
+        .unwrap();
+
+    let payload = serde_json::json!({"event": "test"});
+    state
+        .store()
+        .log_webhook_delivery(ep.id, "test", &payload, "failed", 1, Some(500))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&format!("/v1/wallets/{w_id}/webhooks"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let list = j["data"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["recent_failure_count"], 1);
+}
+
+#[tokio::test]
+async fn list_webhooks_reflects_a_healthy_endpoint_with_zero_recent_failures() {
+    let Some(state) = test_state().await else { return };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+
+    let w_resp = app
+        .clone()
+        .oneshot(create_wallet_req(&app, &token).await)
+        .await
+        .unwrap();
+    let w_id = body_json(w_resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ep = state
+        .store()
+        .create_webhook_endpoint(
+            Uuid::parse_str(&w_id).unwrap(),
+            "https://example.com/healthy",
+            "sec",
+        )
+        .await
+        .unwrap();
+
+    let payload = serde_json::json!({"event": "test"});
+    state
+        .store()
+        .log_webhook_delivery(ep.id, "test", &payload, "delivered", 1, Some(200))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&format!("/v1/wallets/{w_id}/webhooks"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let list = j["data"].as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["recent_failure_count"], 0);
+    assert!(list[0]["last_successful_delivery_at"].is_string());
+}
+
+#[tokio::test]
+async fn list_webhooks_rollup_query_does_not_n_plus_one_across_multiple_endpoints() {
+    let Some(state) = test_state().await else { return };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+
+    let w_resp = app
+        .clone()
+        .oneshot(create_wallet_req(&app, &token).await)
+        .await
+        .unwrap();
+    let w_id = body_json(w_resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Register 5 endpoints
+    for i in 0..5 {
+        state
+            .store()
+            .create_webhook_endpoint(
+                Uuid::parse_str(&w_id).unwrap(),
+                &format!("https://example.com/ep_{i}"),
+                "sec",
+            )
+            .await
+            .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(get_auth(&format!("/v1/wallets/{w_id}/webhooks"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let list = j["data"].as_array().unwrap();
+    assert_eq!(list.len(), 5);
+}

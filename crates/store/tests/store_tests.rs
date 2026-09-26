@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0025.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "expected exactly the twenty known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 25],
+        "expected exactly the twenty-one known migrations to be recorded as applied"
     );
 }
 
@@ -1199,4 +1199,264 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
         token.is_none(),
         "mark_polled must not fabricate a cursor position"
     );
+}
+
+#[tokio::test]
+async fn archive_wallet_excludes_it_from_the_default_list_wallets_response() {
+    let Some(store) = store().await else { return };
+    let user_id = Uuid::new_v4();
+    let acct1 = format!("G{}", Uuid::new_v4().simple());
+    let acct2 = format!("G{}", Uuid::new_v4().simple());
+    let w1 = store
+        .create_wallet(NewWallet {
+            network: "testnet",
+            stellar_account_g: &acct1,
+            sealed_ciphertext: b"c",
+            sealed_nonce: b"n",
+            sealed_salt: b"s",
+            sealed_scheme: 1,
+            label: Some("w1"),
+            user_id: Some(user_id),
+            description: None,
+        })
+        .await
+        .expect("create w1");
+    let w2 = store
+        .create_wallet(NewWallet {
+            network: "testnet",
+            stellar_account_g: &acct2,
+            sealed_ciphertext: b"c",
+            sealed_nonce: b"n",
+            sealed_salt: b"s",
+            sealed_scheme: 1,
+            label: Some("w2"),
+            user_id: Some(user_id),
+            description: None,
+        })
+        .await
+        .expect("create w2");
+
+    // Archive w1
+    store.archive_wallet(w1.id).await.expect("archive w1");
+
+    // Default list (include_archived = false) must exclude w1
+    let default_list = store
+        .list_wallets_for_user(user_id, 10, None, false)
+        .await
+        .expect("list without archived");
+    assert_eq!(default_list.len(), 1);
+    assert_eq!(default_list[0].id, w2.id);
+
+    // List with include_archived = true must return both
+    let full_list = store
+        .list_wallets_for_user(user_id, 10, None, true)
+        .await
+        .expect("list with archived");
+    assert_eq!(full_list.len(), 2);
+}
+
+#[tokio::test]
+async fn archived_wallet_rejects_new_address_creation_with_a_clear_error() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    store.archive_wallet(wallet_id).await.expect("archive");
+
+    // ensure_wallet_active must return WalletArchived
+    let res = store.ensure_wallet_active(wallet_id).await;
+    match res {
+        Err(StoreError::WalletArchived) => {}
+        other => panic!("expected StoreError::WalletArchived, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn archived_wallet_still_allows_reading_balances_and_history() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // Record a deposit before archiving
+    let dep_id = store
+        .record_deposit(
+            wallet_id,
+            "archive_tx_1",
+            0,
+            1,
+            10_000_000,
+            "XLM",
+            None,
+            "G_SRC",
+            "M_DEST",
+        )
+        .await
+        .expect("record deposit");
+    assert!(dep_id.is_some());
+
+    // Archive the wallet
+    store.archive_wallet(wallet_id).await.expect("archive");
+
+    // Fetch directly by id remains allowed
+    let w = store.get_wallet(wallet_id).await.expect("get_wallet");
+    assert!(w.is_archived());
+    assert!(w.archived_at.is_some());
+
+    // Reading transaction history remains allowed for audit/history
+    let txs = store
+        .list_transactions(wallet_id, 10, None)
+        .await
+        .expect("list_transactions");
+    assert_eq!(txs.len(), 1);
+}
+
+#[tokio::test]
+async fn unarchive_wallet_restores_normal_operation() {
+    let Some(store) = store().await else { return };
+    let user_id = Uuid::new_v4();
+    let acct = format!("G{}", Uuid::new_v4().simple());
+    let w = store
+        .create_wallet(NewWallet {
+            network: "testnet",
+            stellar_account_g: &acct,
+            sealed_ciphertext: b"c",
+            sealed_nonce: b"n",
+            sealed_salt: b"s",
+            sealed_scheme: 1,
+            label: Some("w"),
+            user_id: Some(user_id),
+            description: None,
+        })
+        .await
+        .expect("create");
+
+    store.archive_wallet(w.id).await.expect("archive");
+    let active_res = store.ensure_wallet_active(w.id).await;
+    assert!(matches!(active_res, Err(StoreError::WalletArchived)));
+
+    // Unarchive
+    store.unarchive_wallet(w.id).await.expect("unarchive");
+    let active_res = store.ensure_wallet_active(w.id).await;
+    assert!(active_res.is_ok());
+
+    let list = store
+        .list_wallets_for_user(user_id, 10, None, false)
+        .await
+        .expect("list");
+    assert_eq!(list.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "load test: run with `cargo test -p octo-store --test store_tests sponsorship_budget_reservation_under_100_way_concurrency_never_exceeds_budget -- --ignored --nocapture`"]
+async fn sponsorship_budget_reservation_under_100_way_concurrency_never_exceeds_budget() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // Daily budget allowing exactly 10 transactions of fee 100 stroops (total 1,000 stroops).
+    let fee_per_tx = 100;
+    let max_successful = 10;
+    let daily_budget = fee_per_tx * max_successful;
+
+    // Spawn 100 concurrent reservation tasks.
+    let concurrency = 100;
+    let start_time = std::time::Instant::now();
+    let mut tasks = Vec::with_capacity(concurrency);
+
+    for i in 0..concurrency {
+        let store = store.clone();
+        let tx_hash = format!("load_tx_{}_{}", Uuid::new_v4().simple(), i);
+        tasks.push(tokio::spawn(async move {
+            let req_start = std::time::Instant::now();
+            let res = store
+                .try_reserve_sponsored_transaction(wallet_id, &tx_hash, fee_per_tx, Some(daily_budget))
+                .await;
+            let duration = req_start.elapsed();
+            (res, duration)
+        }));
+    }
+
+    let mut latencies: Vec<std::time::Duration> = Vec::with_capacity(concurrency);
+    let mut success_count = 0;
+    let mut budget_exceeded_count = 0;
+
+    for task in tasks {
+        let (res, duration) = task.await.expect("task join failed");
+        latencies.push(duration);
+        match res {
+            Ok(_) => success_count += 1,
+            Err(StoreError::BudgetExceeded) => budget_exceeded_count += 1,
+            Err(e) => panic!("unexpected error during concurrent reservation: {:?}", e),
+        }
+    }
+
+    latencies.sort();
+    let p50 = latencies[concurrency * 50 / 100];
+    let p95 = latencies[concurrency * 95 / 100];
+    let p99 = latencies[concurrency * 99 / 100];
+
+    println!(
+        "\n--- Sponsorship Budget Concurrency Load Test Results ---\n\
+         Total Requests: {}\n\
+         Successful Reservations: {}\n\
+         Budget Exceeded Rejections: {}\n\
+         Total Elapsed: {:?}\n\
+         Latency Percentiles:\n\
+           p50: {:?}\n\
+           p95: {:?}\n\
+           p99: {:?}\n\
+         -------------------------------------------------------",
+        concurrency, success_count, budget_exceeded_count, start_time.elapsed(), p50, p95, p99
+    );
+
+    assert_eq!(
+        success_count, max_successful,
+        "Total successfully reserved ({}) must match budget allowance ({})",
+        success_count, max_successful
+    );
+    assert_eq!(
+        budget_exceeded_count,
+        concurrency - max_successful,
+        "Remaining requests must be rejected with BudgetExceeded"
+    );
+
+    let spent = store.sum_sponsored_fees_today(wallet_id).await.expect("sum");
+    assert_eq!(spent, daily_budget, "Sum of fees today in DB must equal reserved total");
+}
+
+#[tokio::test]
+async fn webhook_delivery_health_aggregates_failures_and_last_success() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let ep = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/webhook", "secret")
+        .await
+        .expect("create ep");
+
+    // Initial state: no deliveries
+    let h0 = store.webhook_delivery_health(ep.id).await.expect("health");
+    assert_eq!(h0.recent_failure_count, 0);
+    assert!(h0.last_successful_delivery_at.is_none());
+
+    // Record one successful delivery and two failed deliveries
+    let payload = serde_json::json!({"test": true});
+    let _ = store
+        .log_webhook_delivery(ep.id, "deposit.confirmed", &payload, "delivered", 1, Some(200))
+        .await
+        .expect("log delivered");
+    let _ = store
+        .log_webhook_delivery(ep.id, "deposit.confirmed", &payload, "failed", 3, Some(500))
+        .await
+        .expect("log failed");
+    let _ = store
+        .log_webhook_delivery(ep.id, "deposit.confirmed", &payload, "failed", 3, Some(502))
+        .await
+        .expect("log failed");
+
+    let h1 = store.webhook_delivery_health(ep.id).await.expect("health");
+    assert_eq!(h1.recent_failure_count, 2);
+    assert!(h1.last_successful_delivery_at.is_some());
+
+    // Batched query
+    let batch = store.wallet_webhook_delivery_health(wallet_id).await.expect("batch");
+    assert_eq!(batch.len(), 1);
+    let ep_health = batch.get(&ep.id).expect("ep health");
+    assert_eq!(ep_health.recent_failure_count, 2);
+    assert!(ep_health.last_successful_delivery_at.is_some());
 }

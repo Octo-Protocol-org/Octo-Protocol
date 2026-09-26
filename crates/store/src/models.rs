@@ -37,12 +37,18 @@ pub struct Wallet {
     pub gas_tank_account_g: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 impl Wallet {
     /// True when the private key lives only client-side (server cannot sign).
     pub fn is_client_custody(&self) -> bool {
         self.custody == "client"
+    }
+
+    /// True when the wallet has been archived.
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 }
 
@@ -138,6 +144,13 @@ pub struct WebhookDelivery {
     pub response_code: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Recent delivery health rollup for a webhook endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WebhookDeliveryHealth {
+    pub recent_failure_count: i64,
+    pub last_successful_delivery_at: Option<DateTime<Utc>>,
 }
 
 /// An audit-log entry (append-only record of account activity).

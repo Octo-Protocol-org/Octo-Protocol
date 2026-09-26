@@ -25,6 +25,8 @@ pub struct WebhookView {
     /// Returned once on creation so the caller can verify signatures.
     pub secret: String,
     pub active: bool,
+    pub recent_failure_count: i64,
+    pub last_successful_delivery_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `POST /v1/wallets/:id/webhooks`
@@ -63,6 +65,8 @@ pub async fn create_webhook(
         url: ep.url,
         secret: ep.secret,
         active: ep.active,
+        recent_failure_count: 0,
+        last_successful_delivery_at: None,
     };
     let (status, json) = Envelope::created(view);
     Ok((status, json))
@@ -134,13 +138,24 @@ pub async fn list_webhooks(
     let _ = state.store().get_wallet(wallet_id).await?;
 
     let eps = state.store().active_webhook_endpoints(wallet_id).await?;
+    let health_map = state
+        .store()
+        .wallet_webhook_delivery_health(wallet_id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+
     let views: Vec<WebhookView> = eps
         .into_iter()
-        .map(|ep| WebhookView {
-            id: ep.id,
-            url: ep.url,
-            secret: ep.secret,
-            active: ep.active,
+        .map(|ep| {
+            let health = health_map.get(&ep.id).cloned().unwrap_or_default();
+            WebhookView {
+                id: ep.id,
+                url: ep.url,
+                secret: ep.secret,
+                active: ep.active,
+                recent_failure_count: health.recent_failure_count,
+                last_successful_delivery_at: health.last_successful_delivery_at,
+            }
         })
         .collect();
 

@@ -52,6 +52,9 @@ pub async fn sponsor(
         .ok_or_else(|| ApiError::BadRequest("max_base_fee_stroops must be > 0".into()))?;
 
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
 
     // 1. Sponsorship must be enabled for this wallet.
     let config = state

@@ -29,6 +29,10 @@ pub enum StoreError {
     /// An OTP was wrong, expired, already used, over the attempt limit, or tx-hash mismatched.
     #[error("invalid or expired code")]
     InvalidOtp,
+
+    /// The wallet has been archived and rejects mutating operations.
+    #[error("wallet is archived")]
+    WalletArchived,
 }
 
 impl StoreError {

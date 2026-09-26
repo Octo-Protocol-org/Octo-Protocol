@@ -183,6 +183,9 @@ pub async fn submit_signed(
     // For the audit log only: present when the caller used a login JWT (None for API keys).
     let audit_user = crate::auth::authenticate(&headers, &state).await.ok();
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
 
     let req: SubmitSignedRequest = parse_optional(&body)?;
     let signed_xdr = req
@@ -242,6 +245,9 @@ pub async fn withdraw_request_otp(
 ) -> ApiResult<Json<Envelope<WithdrawOtpResponse>>> {
     let user_id = require_login(&headers, &state).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
     if wallet.user_id != Some(user_id) {
         return Err(ApiError::NotFound);
     }
@@ -294,6 +300,9 @@ pub async fn withdraw_confirm(
 ) -> ApiResult<(StatusCode, Json<Envelope<SubmitSignedResponse>>)> {
     let user_id = require_login(&headers, &state).await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
     if wallet.user_id != Some(user_id) {
         return Err(ApiError::NotFound);
     }
