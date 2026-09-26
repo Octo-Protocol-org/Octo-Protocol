@@ -28,7 +28,7 @@ pub use address::{
     verify_account_signature, DecodedMuxed, DepositAddress,
 };
 pub use asset::is_valid_asset_code;
-pub use derive::WalletSeed;
+pub use derive::{validate_seed_phrase, WalletSeed};
 pub use error::WalletError;
 pub use provision::{import_wallet, provision_wallet, ProvisionedWallet};
 pub use signer::{
