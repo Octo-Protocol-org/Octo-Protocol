@@ -1200,3 +1200,14 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
         "mark_polled must not fabricate a cursor position"
     );
 }
+
+#[test]
+fn shared_cursor_pagination_helper_encodes_invariant() {
+    let query = octo_store::cursor_pagination_query("wallets", "user_id");
+    assert!(query.contains("SELECT * FROM wallets"));
+    assert!(query.contains("WHERE user_id = $1"));
+    assert!(query.contains("($2::uuid IS NULL OR (created_at, id) < ("));
+    assert!(query.contains("SELECT created_at, id FROM wallets WHERE id = $2"));
+    assert!(query.contains("ORDER BY created_at DESC, id DESC"));
+    assert!(query.contains("LIMIT $3"));
+}

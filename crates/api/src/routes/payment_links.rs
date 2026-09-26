@@ -326,11 +326,12 @@ fn check_public_rate_limit(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     class: &'static str,
     limit: u32,
+    window: std::time::Duration,
 ) -> Result<(), ApiError> {
     let ip = crate::rate_limit::client_ip(headers, peer.map(|c| c.0));
     if state
         .rate_limiter()
-        .check(&ip, class, limit, std::time::Duration::from_secs(60))
+        .check(&ip, class, limit, window)
     {
         Ok(())
     } else {
@@ -347,7 +348,14 @@ pub async fn get_public_payment_link(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<PublicPaymentLinkView>>> {
-    check_public_rate_limit(&state, &headers, peer, "pay_read", 60)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_read",
+        crate::rate_limit::PAY_READ_LIMIT,
+        crate::rate_limit::PAY_READ_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -390,7 +398,14 @@ pub async fn create_payment_intent(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<PaymentIntentView>>)> {
-    check_public_rate_limit(&state, &headers, peer, "pay_intent", 5)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_intent",
+        crate::rate_limit::PAY_INTENT_LIMIT,
+        crate::rate_limit::PAY_INTENT_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -463,7 +478,14 @@ pub async fn get_payment_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<PaymentStatusView>>> {
     // The pay page polls this every ~3s while waiting, so the ceiling is generous.
-    check_public_rate_limit(&state, &headers, peer, "pay_status", 60)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_status",
+        crate::rate_limit::PAY_STATUS_LIMIT,
+        crate::rate_limit::PAY_STATUS_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     let payment = state
         .store()
@@ -501,7 +523,14 @@ pub async fn public_signing_info(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<crate::routes::submit::SigningInfo>>> {
-    check_public_rate_limit(&state, &headers, peer, "pay_signing_info", 60)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_signing_info",
+        crate::rate_limit::PAY_SIGNING_INFO_LIMIT,
+        crate::rate_limit::PAY_SIGNING_INFO_WINDOW,
+    )?;
     // Confirms the link exists/is active before doing any Horizon work on the caller's behalf.
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
@@ -552,7 +581,14 @@ pub async fn submit_payment(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SubmitPaymentResponse>>)> {
-    check_public_rate_limit(&state, &headers, peer, "pay_submit", 20)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_submit",
+        crate::rate_limit::PAY_SUBMIT_LIMIT,
+        crate::rate_limit::PAY_SUBMIT_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);

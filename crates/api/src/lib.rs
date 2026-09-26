@@ -18,9 +18,11 @@ pub mod submit_validation;
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{Json, Router};
 use tower_http::cors::{Any, CorsLayer};
 
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
@@ -42,6 +44,7 @@ pub fn build_router(state: AppState) -> Router {
     // together with the error handler that turns an oversized body into a 413 envelope.
     Router::new()
         .route("/health", get(health))
+        .route("/health/ready", get(health_ready))
         .route("/v1/auth/signup", post(auth::signup))
         .route("/v1/auth/verify-email", post(auth::verify_email))
         .route("/v1/auth/resend-otp", post(auth::resend_otp))
@@ -195,6 +198,53 @@ pub fn build_router(state: AppState) -> Router {
 /// Liveness probe.
 async fn health() -> &'static str {
     "ok"
+}
+
+// Readiness probe checking database and Horizon reachability.
+async fn health_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let mut db_ok = false;
+    let mut horizon_ok = false;
+    let mut db_err = None;
+    let mut horizon_err = None;
+
+    match state.store().ping().await {
+        Ok(_) => db_ok = true,
+        Err(e) => db_err = Some(e.to_string()),
+    }
+
+    match state.horizon().check_reachability().await {
+        Ok(_) => horizon_ok = true,
+        Err(e) => horizon_err = Some(e),
+    }
+
+    if db_ok && horizon_ok {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "database": "ok",
+                "horizon": "ok"
+            })),
+        )
+    } else {
+        let mut failed = Vec::new();
+        if !db_ok {
+            failed.push("database");
+        }
+        if !horizon_ok {
+            failed.push("horizon");
+        }
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "database": if db_ok { "ok".to_string() } else { db_err.unwrap_or_else(|| "unreachable".into()) },
+                "horizon": if horizon_ok { "ok".to_string() } else { horizon_err.unwrap_or_else(|| "unreachable".into()) },
+                "failed": failed,
+                "error": format!("unreachable dependencies: {}", failed.join(", "))
+            })),
+        )
+    }
 }
 
 // NOTE: a `handle_errors` HandleErrorLayer helper lived here to convert oversized-body errors

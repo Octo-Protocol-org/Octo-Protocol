@@ -435,6 +435,97 @@ async fn health_is_public_and_ok() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// Local mock Horizon server for readiness testing.
+async fn start_mock_horizon_ok() -> String {
+    let app = Router::new().route("/", axum::routing::get(|| async { "horizon ok" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock horizon");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn health_ready_returns_200_when_db_and_horizon_are_both_reachable() {
+    let Some(_) = test_state().await else {
+        return;
+    };
+    let mock_horizon = start_mock_horizon_ok().await;
+    let url = database_url().unwrap();
+    let store = Store::connect(&url).await.expect("connect");
+    let state = AppState::new(
+        store,
+        [42u8; 32],
+        StellarNetwork::Testnet,
+        mock_horizon,
+        None,
+        octo_email::EmailSender::new_captured(),
+    );
+    let app = build_router(state);
+    let resp = app.oneshot(get("/health/ready")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["database"], "ok");
+    assert_eq!(json["horizon"], "ok");
+}
+
+#[tokio::test]
+async fn health_ready_returns_a_clear_503_naming_the_db_when_the_database_is_unreachable() {
+    let mock_horizon = start_mock_horizon_ok().await;
+    let dead_pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(100))
+        .connect_lazy("postgres://postgres:wrong@127.0.0.1:1/nonexistent")
+        .unwrap();
+    let store = Store::from_pool(dead_pool);
+    let state = AppState::new(
+        store,
+        [42u8; 32],
+        StellarNetwork::Testnet,
+        mock_horizon,
+        None,
+        octo_email::EmailSender::new_captured(),
+    );
+    let app = build_router(state);
+    let resp = app.oneshot(get("/health/ready")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "not_ready");
+    assert_eq!(json["horizon"], "ok");
+    assert!(json["database"] != "ok");
+    let error_str = json["error"].as_str().unwrap();
+    assert!(error_str.contains("database"));
+}
+
+#[tokio::test]
+async fn health_ready_returns_a_clear_503_naming_horizon_when_horizon_is_unreachable() {
+    let Some(_) = test_state().await else {
+        return;
+    };
+    let url = database_url().unwrap();
+    let store = Store::connect(&url).await.expect("connect");
+    let state = AppState::new(
+        store,
+        [42u8; 32],
+        StellarNetwork::Testnet,
+        "http://127.0.0.1:1".into(),
+        None,
+        octo_email::EmailSender::new_captured(),
+    );
+    let app = build_router(state);
+    let resp = app.oneshot(get("/health/ready")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(resp).await;
+    assert_eq!(json["status"], "not_ready");
+    assert_eq!(json["database"], "ok");
+    assert!(json["horizon"] != "ok");
+    let error_str = json["error"].as_str().unwrap();
+    assert!(error_str.contains("horizon"));
+}
+
 #[tokio::test]
 async fn backup_round_trips_the_opaque_blob_verbatim() {
     let Some(state) = test_state().await else {

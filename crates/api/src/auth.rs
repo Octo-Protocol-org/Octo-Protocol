@@ -131,7 +131,7 @@ fn check_auth_rate_limit(
     let ip = crate::rate_limit::client_ip(headers, peer);
     if state
         .rate_limiter()
-        .check(&ip, "auth", 10, std::time::Duration::from_secs(60))
+        .check(&ip, "auth", crate::rate_limit::AUTH_RATE_LIMIT, crate::rate_limit::AUTH_RATE_WINDOW)
     {
         Ok(())
     } else {
@@ -280,8 +280,8 @@ pub async fn resend_otp(
     if !state.rate_limiter().check(
         &format!("otp:{user_id}"),
         "otp_resend",
-        3,
-        std::time::Duration::from_secs(60 * 60),
+        crate::rate_limit::OTP_RESEND_USER_LIMIT,
+        crate::rate_limit::OTP_RESEND_USER_WINDOW,
     ) {
         return Err(ApiError::TooManyRequests(
             "too many resend attempts — wait a while and try again".into(),
@@ -291,8 +291,8 @@ pub async fn resend_otp(
     if !state.rate_limiter().check(
         &ip,
         "otp_resend_ip",
-        10,
-        std::time::Duration::from_secs(60 * 60),
+        crate::rate_limit::OTP_RESEND_IP_LIMIT,
+        crate::rate_limit::OTP_RESEND_IP_WINDOW,
     ) {
         return Err(ApiError::TooManyRequests(
             "too many resend attempts — wait a while and try again".into(),

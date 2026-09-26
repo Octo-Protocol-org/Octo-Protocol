@@ -77,3 +77,10 @@ server, and it is confined to one crate:
 
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
+
+## Deployment and Health Checks
+
+The server exposes two distinct health endpoints for container orchestrators and load balancers:
+
+- **Liveness probe (`GET /health`):** Lightweight and zero-dependency. Always returns HTTP 200 `ok` as long as the process is alive and able to accept HTTP connections. Used by orchestrators (e.g. Kubernetes liveness probe) to restart hung or deadlocked processes.
+- **Readiness probe (`GET /health/ready`):** Deep dependency check. Probes database reachability via `SELECT 1` and Horizon node reachability via `GET /`. Returns HTTP 200 with structured JSON (`{ "status": "ready", "database": "ok", "horizon": "ok" }`) when dependencies are operational. If any dependency is unreachable, returns HTTP 503 `Service Unavailable` with a structured payload naming the specific degraded dependency (`failed: ["database"]` or `failed: ["horizon"]`), allowing load balancers to safely remove the instance from traffic rotation without restarting the process.
