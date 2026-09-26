@@ -75,6 +75,9 @@ carries fee float only — the one server-held key in the system, bounded by you
 
 - `POST /v1/wallets/{id}/gas-tank` — provision the gas tank. **Dashboard JWT only** (an API key
   gets `401`). Idempotent: a second call returns the existing tank.
+- `GET  /v1/wallets/{id}/gas-tank` — the tank's public account (`gas_tank_address`), whether it is
+  `provisioned`, and today's `spent_today_stroops` against `daily_budget_stroops`. A wallet with
+  no tank returns `200` with `provisioned: false`. Never includes the sealed seed.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
   cap, and the daily budget.
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.

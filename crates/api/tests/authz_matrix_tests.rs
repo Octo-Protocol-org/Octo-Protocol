@@ -185,6 +185,11 @@ fn guarded_routes() -> Vec<GuardedRoute> {
             },
         },
         GuardedRoute {
+            name: "GET /v1/wallets/:id/gas-tank",
+            method: "GET",
+            path: |id| format!("/v1/wallets/{id}/gas-tank"),
+        },
+        GuardedRoute {
             name: "GET /v1/wallets/:id/sponsorship",
             method: "GET",
             path: |id| format!("/v1/wallets/{id}/sponsorship"),

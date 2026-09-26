@@ -2643,3 +2643,121 @@ async fn submit_payment_validates_against_the_intents_own_address() {
         "a USDC payment to this intent's own address must pass validation and be relayed"
     );
 }
+
+/// Create a wallet for `token` and return its id.
+async fn new_wallet_id(app: &axum::Router, token: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(app, token).await)
+        .await
+        .unwrap();
+    body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn get_gas_tank_returns_a_clean_not_provisioned_state_for_a_wallet_with_no_tank() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = new_wallet_id(&app, &token).await;
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["provisioned"], false);
+    assert!(data["gas_tank_address"].is_null());
+    assert_eq!(data["spent_today_stroops"], 0);
+}
+
+#[tokio::test]
+async fn get_gas_tank_returns_the_provisioned_tanks_status_and_spend() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = new_wallet_id(&app, &token).await;
+
+    let created = body_json(
+        app.clone()
+            .oneshot(post_auth(
+                &format!("/v1/wallets/{wallet_id}/gas-tank"),
+                &token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await["data"]["gas_tank_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/wallets/{wallet_id}/sponsorship"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"enabled":true,"daily_budget_stroops":5000}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["provisioned"], true);
+    assert_eq!(data["gas_tank_address"], created);
+    assert_eq!(data["sponsorship_enabled"], true);
+    assert_eq!(data["daily_budget_stroops"], 5000);
+    assert_eq!(data["spent_today_stroops"], 0);
+}
+
+#[tokio::test]
+async fn get_gas_tank_never_includes_sealed_seed_fields() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = new_wallet_id(&app, &token).await;
+    app.clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let raw = body_json(resp).await["data"].to_string();
+    for banned in ["sealed", "ciphertext", "nonce", "salt", "seed", "secret"] {
+        assert!(!raw.contains(banned), "response leaked `{banned}`: {raw}");
+    }
+}

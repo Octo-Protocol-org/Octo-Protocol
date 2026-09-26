@@ -162,6 +162,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ListTransactionsResponse'
+  /v1/wallets/{id}/gas-tank:
+    get:
+      summary: Get gas-tank status
+      description: >
+        The tank's public account and today's sponsored-fee spend. Never includes the sealed seed.
+        A wallet with no tank returns 200 with `provisioned: false` (not an error).
+      operationId: getGasTank
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GasTankStatusResponse'
   /v1/wallets/{id}/payment-links:
     post:
       summary: Create a payment link
@@ -485,6 +506,43 @@ components:
           type: string
         data:
           type: object
+    GasTankStatusResponse:
+      type: object
+      required:
+        - statusCode
+        - message
+        - data
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        data:
+          type: object
+          required:
+            - wallet_id
+            - provisioned
+            - gas_tank_address
+            - sponsorship_enabled
+            - daily_budget_stroops
+            - spent_today_stroops
+          properties:
+            wallet_id:
+              type: string
+              format: uuid
+            provisioned:
+              type: boolean
+            gas_tank_address:
+              type: string
+              nullable: true
+            sponsorship_enabled:
+              type: boolean
+            daily_budget_stroops:
+              type: integer
+              nullable: true
+            spent_today_stroops:
+              type: integer
+              description: Fees reserved today (pending + confirmed), UTC day.
     CreateWalletResponse:
       type: object
       required:
