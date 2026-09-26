@@ -95,9 +95,9 @@ pub struct WebhookDeliveryView {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// `DELETE /v1/wallets/:id/webhooks/:endpoint_id` — deactivate an endpoint.
+/// `DELETE /v1/wallets/:id/webhooks/:endpoint_id` — soft-delete an endpoint.
 ///
-/// Deactivates rather than hard-deletes so the delivery history (an audit trail) survives.
+/// Soft-deletes rather than hard-deletes so the delivery history (an audit trail) survives.
 /// Returns 404 if the endpoint belongs to a different wallet, so existence is not leaked.
 pub async fn delete_webhook(
     State(state): State<AppState>,
@@ -113,7 +113,7 @@ pub async fn delete_webhook(
 
     state
         .store()
-        .deactivate_webhook_endpoint(endpoint_id)
+        .delete_webhook(endpoint_id)
         .await?;
 
     Ok(Envelope::ok(serde_json::json!({
@@ -122,18 +122,28 @@ pub async fn delete_webhook(
     })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ListWebhooksQuery {
+    pub include_deleted: Option<bool>,
+}
+
 /// `GET /v1/wallets/:id/webhooks`
 pub async fn list_webhooks(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
+    Query(q): Query<ListWebhooksQuery>,
 ) -> ApiResult<Json<Envelope<Vec<WebhookView>>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
 
     // Confirm the wallet exists (404 otherwise).
     let _ = state.store().get_wallet(wallet_id).await?;
 
-    let eps = state.store().active_webhook_endpoints(wallet_id).await?;
+    let include_deleted = q.include_deleted.unwrap_or(false);
+    let eps = state
+        .store()
+        .list_webhooks(wallet_id, include_deleted)
+        .await?;
     let views: Vec<WebhookView> = eps
         .into_iter()
         .map(|ep| WebhookView {

@@ -43,6 +43,7 @@ All of `fmt --check`, `clippy -D warnings`, and the test suite must pass.
 - **Secrets:** never log seeds, private keys, or decrypted material. Secret-bearing types live in
   `wallet-core` and must `zeroize` on drop.
 - **Tests:** crypto and derivation code must include test vectors (e.g. SEP-0005).
+- **Migrations:** `crates/store/migrations/` is forward-only and append-only. Every PR adding a migration must also update the decision index in `docs/migrations.md` in the same PR.
 
 ## Branching
 

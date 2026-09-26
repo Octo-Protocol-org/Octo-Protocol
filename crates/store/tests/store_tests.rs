@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "expected exactly the twenty known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        "expected exactly the twenty-one known migrations to be recorded as applied"
     );
 }
 
@@ -1199,4 +1199,89 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
         token.is_none(),
         "mark_polled must not fabricate a cursor position"
     );
+}
+
+#[tokio::test]
+async fn delete_webhook_soft_deletes_rather_than_hard_deleting() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let ep = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/webhook", "test-secret")
+        .await
+        .expect("create endpoint");
+
+    store.delete_webhook(ep.id).await.expect("delete webhook");
+    let fetched = store.get_webhook_endpoint(ep.id).await.expect("get endpoint");
+    assert!(fetched.deleted_at.is_some(), "deleted_at must be populated");
+    assert!(!fetched.active, "endpoint must be deactivated");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_endpoints WHERE id = $1")
+        .bind(ep.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("count endpoints");
+    assert_eq!(count, 1, "row must still exist in database");
+}
+
+#[tokio::test]
+async fn dispatch_skips_a_soft_deleted_endpoint() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let ep = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/dispatch", "secret")
+        .await
+        .expect("create endpoint");
+
+    let active_before = store.active_webhook_endpoints(wallet_id).await.expect("active before");
+    assert!(active_before.iter().any(|e| e.id == ep.id));
+
+    store.delete_webhook(ep.id).await.expect("delete webhook");
+    let active_after = store.active_webhook_endpoints(wallet_id).await.expect("active after");
+    assert!(!active_after.iter().any(|e| e.id == ep.id), "dispatch query must skip soft-deleted endpoint");
+}
+
+#[tokio::test]
+async fn list_webhooks_excludes_soft_deleted_endpoints_by_default() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let ep1 = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/1", "secret1")
+        .await
+        .expect("create 1");
+    let ep2 = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/2", "secret2")
+        .await
+        .expect("create 2");
+
+    store.delete_webhook(ep1.id).await.expect("delete ep1");
+
+    let default_list = store.list_webhooks(wallet_id, false).await.expect("list default");
+    assert!(!default_list.iter().any(|e| e.id == ep1.id));
+    assert!(default_list.iter().any(|e| e.id == ep2.id));
+
+    let all_list = store.list_webhooks(wallet_id, true).await.expect("list with deleted");
+    assert!(all_list.iter().any(|e| e.id == ep1.id));
+    assert!(all_list.iter().any(|e| e.id == ep2.id));
+}
+
+#[tokio::test]
+async fn historical_deliveries_for_a_soft_deleted_endpoint_remain_queryable() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let ep = store
+        .create_webhook_endpoint(wallet_id, "https://example.com/deliveries", "secret")
+        .await
+        .expect("create endpoint");
+
+    let payload = serde_json::json!({"event": "payment.received"});
+    let delivery_id = store
+        .log_webhook_delivery(ep.id, "payment.received", &payload, "delivered", 1, Some(200))
+        .await
+        .expect("log delivery");
+
+    store.delete_webhook(ep.id).await.expect("delete webhook");
+
+    let deliveries = store.list_webhook_deliveries(ep.id, 10).await.expect("list deliveries");
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].id, delivery_id);
 }

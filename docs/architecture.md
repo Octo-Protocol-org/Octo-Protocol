@@ -77,3 +77,8 @@ server, and it is confined to one crate:
 
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
+
+## Database & Migrations
+
+Database schema migrations live under `crates/store/migrations/` and are strictly forward-only and append-only.
+For a complete audit trail of foreign key `ON DELETE` rules, constraints, and a one-line changelog index of every migration, see [`docs/migrations.md`](migrations.md).
