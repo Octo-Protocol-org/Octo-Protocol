@@ -41,6 +41,7 @@ hex.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tower.workspace = true
+tracing-subscriber.workspace = true
 sqlx.workspace = true
 stellar-base.workspace = true
 dotenvy = "0.15"
