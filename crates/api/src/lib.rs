@@ -138,7 +138,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/wallets/:id/backup", get(routes::wallets::get_backup))
         .route(
             "/v1/wallets/:id/gas-tank",
-            post(routes::wallets::create_gas_tank),
+            post(routes::wallets::create_gas_tank).get(routes::wallets::get_gas_tank),
         )
         .route(
             "/v1/wallets/:id/sponsorship",
