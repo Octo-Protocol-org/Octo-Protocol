@@ -90,6 +90,9 @@ impl From<octo_wallet_core::WalletError> for ApiError {
             | W::InvalidDerivationPath
             | W::InvalidXdr
             | W::InvalidSignature => ApiError::BadRequest("invalid input".into()),
+            W::ReservedNativeAssetCode => ApiError::BadRequest(
+                "native asset codes cannot be used as credit asset codes".into(),
+            ),
             W::KeyDerivation | W::Signing | W::SeedDecryption => ApiError::Internal,
         }
     }

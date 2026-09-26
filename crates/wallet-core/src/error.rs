@@ -29,6 +29,10 @@ pub enum WalletError {
     #[error("invalid asset code")]
     InvalidAssetCode,
 
+    /// A credit asset code conflicts with Octo's reserved native-asset spellings.
+    #[error("native asset codes cannot be used as credit asset codes")]
+    ReservedNativeAssetCode,
+
     /// A requested amount was out of range (must be a positive number of stroops).
     #[error("invalid amount")]
     InvalidAmount,
