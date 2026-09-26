@@ -83,6 +83,7 @@ pub fn otp_email(code: &str, purpose: &str) -> String {
     let action = match purpose {
         "withdrawal" => "confirm a withdrawal",
         "password_reset" => "reset your password",
+        "email_change" => "confirm your new email address",
         _ => "verify your email",
     };
     shell(
@@ -98,8 +99,31 @@ pub fn otp_email(code: &str, purpose: &str) -> String {
     )
 }
 
+/// Escape untrusted text for interpolation into HTML (emails are only loosely validated).
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Sent to the OLD address after an email change, so a hijacked change is noticed.
+pub fn email_changed_email(new_email: &str) -> String {
+    let new_email = escape_html(new_email);
+    shell(
+        &format!(
+            "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Your login email was changed</p>\
+<p style=\"margin:0;color:#666;\">This account's email is now {new_email}. If this wasn't you, reset your password right away.</p>"
+        ),
+        Icon::Warn,
+    )
+}
+
 /// Sent once, right after signup verification succeeds.
 pub fn welcome_email(email: &str) -> String {
+    let email = escape_html(email);
     shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Welcome to Octo 🎉</p>\

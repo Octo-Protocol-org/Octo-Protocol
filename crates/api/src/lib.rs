@@ -53,6 +53,11 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/auth/confirm-password-reset",
             post(auth::confirm_password_reset),
         )
+        .route("/v1/auth/change-email", post(auth::request_email_change))
+        .route(
+            "/v1/auth/change-email/confirm",
+            post(auth::confirm_email_change),
+        )
         .route("/v1/auth/login", post(auth::login))
         .route("/v1/auth/refresh", post(auth::refresh))
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))

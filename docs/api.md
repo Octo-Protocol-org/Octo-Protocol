@@ -31,6 +31,10 @@ deny-list the presented token, and every authenticated request checks that deny-
   exists. Always returns the same `200` either way (no account enumeration).
 - `POST /v1/auth/confirm-password-reset` — `{email, code, new_password}`; sets the password and
   **revokes every existing session**. Any failure is `400 invalid or expired code`.
+- `POST /v1/auth/change-email` — `{new_email, password}` (login required): verifies the current
+  password and emails an OTP to the **new** address. Nothing changes yet.
+- `POST /v1/auth/change-email/confirm` — `{new_email, code}` (login required): applies the change
+  once the new address's OTP is confirmed, and notifies the old address.
 
 ## Custody model — read this before the wallet endpoints
 

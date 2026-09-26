@@ -97,6 +97,19 @@ pub struct ConfirmPasswordResetRequest {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct RequestEmailChangeRequest {
+    pub new_email: Option<String>,
+    /// The account's current password — changing the login identifier is a sensitive action.
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ConfirmEmailChangeRequest {
+    pub new_email: Option<String>,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct ResendOtpRequest {
     pub user_id: Option<Uuid>,
 }
@@ -611,6 +624,140 @@ pub async fn confirm_password_reset(
     .await;
 
     Ok(Envelope::ok(serde_json::json!({ "reset": true })))
+}
+
+/// `POST /v1/auth/change-email` — step 1: email an OTP to the *new* address. The email is not
+/// changed here; only confirming the code (step 2) applies it.
+pub async fn request_email_change(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<serde_json::Value>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    let user_id = require_login(&headers, &state).await?;
+    let req: RequestEmailChangeRequest = parse_optional(&body)?;
+    let new_email = normalize_email(req.new_email)?;
+    let password = req
+        .password
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("password is required".into()))?;
+
+    // Per-account cap: bounds password guessing with a stolen session, and OTP mail to third parties.
+    if !state.rate_limiter().check(
+        &format!("emailchange:{user_id}"),
+        "email_change_request",
+        5,
+        std::time::Duration::from_secs(60 * 60),
+    ) {
+        return Err(ApiError::TooManyRequests(
+            "too many attempts — wait a while and try again".into(),
+        ));
+    }
+
+    let user = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?;
+    verify_password(&password, &user.password_hash)
+        .map_err(|_| ApiError::BadRequest("incorrect password".into()))?;
+
+    let taken = || ApiError::BadRequest("email already registered".into());
+    if new_email == user.email {
+        return Err(taken());
+    }
+    if state
+        .store()
+        .find_user_by_email(&new_email)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .is_some()
+    {
+        return Err(taken());
+    }
+
+    // Bound to the new address: the code can't be redeemed for a different one.
+    issue_otp(
+        &state,
+        user.id,
+        "email_change",
+        &new_email,
+        Some(&new_email),
+    )
+    .await?;
+    Ok(Envelope::ok(serde_json::json!({ "sent": true })))
+}
+
+/// `POST /v1/auth/change-email/confirm` — step 2: apply the change once the new address's OTP checks out.
+pub async fn confirm_email_change(
+    State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<UserView>>> {
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    let user_id = require_login(&headers, &state).await?;
+    let req: ConfirmEmailChangeRequest = parse_optional(&body)?;
+    let new_email = normalize_email(req.new_email)?;
+    let code = req
+        .code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("code is required".into()))?;
+
+    let old_email = state
+        .store()
+        .get_user(user_id)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .ok_or(ApiError::Unauthorized)?
+        .email;
+
+    state
+        .store()
+        .verify_and_consume_otp(
+            user_id,
+            "email_change",
+            &octo_email::hash_otp(&code),
+            Some(&new_email),
+        )
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid or expired code".into()))?;
+
+    // The unique index is the real guard: someone may have registered this address since step 1.
+    let user = state
+        .store()
+        .update_email(user_id, &new_email)
+        .await
+        .map_err(|e| match e {
+            octo_store::StoreError::Conflict => {
+                ApiError::BadRequest("email already registered".into())
+            }
+            _ => ApiError::Internal,
+        })?;
+
+    crate::audit::record(
+        &state,
+        user_id,
+        "changed their email",
+        crate::audit::category::AUTH,
+        Some(&new_email),
+        &headers,
+    )
+    .await;
+
+    let notice = octo_email::templates::email_changed_email(&new_email);
+    let _ = state
+        .email()
+        .send(&old_email, "Your Octo login email was changed", &notice)
+        .await;
+
+    Ok(Envelope::ok(UserView {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+    }))
 }
 
 /// `POST /v1/auth/logout` — invalidate the current session token server-side.

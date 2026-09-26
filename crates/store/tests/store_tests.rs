@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0022.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        (1..=21).collect::<Vec<i64>>(),
-        "expected exactly the 21 known migrations to be recorded as applied"
+        (1..=22).collect::<Vec<i64>>(),
+        "expected exactly the 22 known migrations to be recorded as applied"
     );
 }
 
