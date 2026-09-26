@@ -116,7 +116,7 @@ pub struct PaymentRequest<'a> {
     pub stroops: i64,
     /// `None` => native XLM. `Some((code, issuer_g))` => a credit asset.
     pub asset: Option<(&'a str, &'a str)>,
-    /// Optional numeric memo (used for the `G...`+memo deposit-return convention).
+    /// Optional nonnegative Stellar `MEMO_ID`; the `u64` type matches XDR and excludes negatives.
     pub memo_id: Option<u64>,
     /// The master account's current sequence number (fetched from Horizon by the caller).
     pub sequence: i64,
@@ -423,8 +423,10 @@ pub fn sign_fee_bump(
     })
 }
 
-/// Compute the Stellar transaction hash (sha256 of the signing payload) for the inner transaction
-/// in a fee-bump flow. This is the standard txID that would appear in Horizon/explorers.
+/// Compute the Stellar transaction hash (SHA-256 of the network-specific signing payload) for the
+/// inner transaction in a fee-bump flow. This is the standard txID Horizon uses, not a hash of the
+/// submitted envelope bytes: signatures are excluded and the decoded transaction is XDR-serialized
+/// as a `TransactionSignaturePayload`.
 pub fn compute_inner_tx_hash(
     inner_xdr: &str,
     network: StellarNetwork,
@@ -780,6 +782,78 @@ mod tests {
         let h2 = compute_inner_tx_hash(&inner.envelope_xdr, StellarNetwork::Testnet).unwrap();
         assert_eq!(h1, h2, "hash must be deterministic");
         assert_ne!(h1, [0u8; 32], "hash must not be all zeros");
+    }
+
+    #[test]
+    fn compute_inner_tx_hash_matches_stellar_signing_payload_hash() {
+        use sha2::{Digest, Sha256};
+        use stellar_base::xdr::{
+            Hash, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+            XDRSerialize,
+        };
+
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let inner = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo_id: None,
+                sequence: 5,
+            },
+        )
+        .unwrap();
+        let transaction = parse_inner_v1(&inner.envelope_xdr).unwrap().tx;
+        let network_hash: [u8; 32] = StellarNetwork::Testnet
+            .to_base()
+            .network_id()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let payload = TransactionSignaturePayload {
+            network_id: Hash(network_hash),
+            tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(transaction),
+        };
+        let expected: [u8; 32] = Sha256::digest(payload.xdr_bytes().unwrap()).into();
+
+        assert_eq!(
+            compute_inner_tx_hash(&inner.envelope_xdr, StellarNetwork::Testnet).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn sign_payment_encodes_memo_id_u64_max() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo_id: Some(u64::MAX),
+                sequence: 5,
+            },
+        )
+        .unwrap();
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr)
+                .unwrap();
+
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(envelope) => assert!(matches!(
+                envelope.tx.memo,
+                stellar_base::xdr::Memo::Id(id) if id == u64::MAX
+            )),
+            _ => panic!("unexpected envelope variant"),
+        }
     }
 
     #[test]

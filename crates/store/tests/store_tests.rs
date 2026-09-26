@@ -638,6 +638,26 @@ async fn withdrawal_idempotency_key_blocks_double_spend() {
     assert!(third.is_ok());
 }
 
+#[tokio::test]
+async fn withdrawal_rejects_negative_memo_id() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    let result = store
+        .create_withdrawal(NewWithdrawal {
+            wallet_id,
+            idempotency_key: "negative-memo",
+            destination_account: "Gdest",
+            asset_code: "native",
+            asset_issuer: None,
+            amount_stroops: 1_000,
+            memo_id: Some(-1),
+        })
+        .await;
+
+    assert!(matches!(result, Err(StoreError::InvalidMemoId)));
+}
+
 /// Insert a minimal gas_sponsorship_configs row (no limits) for `wallet_id`.
 async fn insert_sponsorship_config(store: &Store, wallet_id: Uuid) {
     sqlx::query("INSERT INTO gas_sponsorship_configs (wallet_id, enabled) VALUES ($1, true)")
