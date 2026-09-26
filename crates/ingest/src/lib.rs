@@ -589,8 +589,10 @@ impl Supervisor {
             .await?;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
         let mut tasks = tokio::task::JoinSet::new();
+        let mut task_wallets = HashMap::new();
 
         for w in wallets {
+            let wallet_id = w.id;
             let store = self.store.clone();
             let store_for_mark = self.store.clone();
             let horizon_url = self.horizon_url.clone();
@@ -599,7 +601,7 @@ impl Supervisor {
             let retry = self.retry.clone();
             let circuit = self.circuit.clone();
             let semaphore = semaphore.clone();
-            tasks.spawn(async move {
+            let task_id = tasks.spawn(async move {
                 // Held for the duration of this wallet's poll; bounds how many Horizon requests
                 // are in flight at once without limiting how many wallets we *queue*.
                 let _permit = semaphore.acquire_owned().await;
@@ -617,18 +619,28 @@ impl Supervisor {
                 // Record the attempt regardless of outcome, so a wallet whose polls keep failing
                 // still backs off instead of being retried at full rate forever.
                 let _ = store_for_mark.mark_polled(w.id).await;
-                (w.id, result)
+                (wallet_id, result)
             });
+            task_wallets.insert(task_id.id(), wallet_id);
         }
 
         let mut total = 0;
-        while let Some(joined) = tasks.join_next().await {
+        while let Some(joined) = tasks.join_next_with_id().await {
             match joined {
-                Ok((_wallet_id, Ok(n))) => total += n,
-                Ok((wallet_id, Err(e))) => {
+                Ok((task_id, (_wallet_id, Ok(n)))) => {
+                    task_wallets.remove(&task_id);
+                    total += n;
+                }
+                Ok((task_id, (wallet_id, Err(e)))) => {
+                    task_wallets.remove(&task_id);
                     tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed")
                 }
-                Err(e) => tracing::warn!(error = ?e, "wallet poll task panicked"),
+                Err(e) => match task_wallets.remove(&e.id()) {
+                    Some(wallet_id) => {
+                        tracing::error!(wallet = %wallet_id, error = ?e, "wallet poll task panicked; it will be retried on a later tick")
+                    }
+                    None => tracing::error!(error = ?e, "wallet poll task panicked; wallet id unavailable"),
+                },
             }
         }
         Ok(total)

@@ -105,6 +105,17 @@ impl WebhookSender {
 
         let res = tokio::time::timeout(self.delivery_timeout, async {
             for attempt in 1..=self.max_attempts {
+                match self.store.is_webhook_endpoint_active(ep.id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(endpoint_id = %ep.id, "stopping webhook retries for inactive endpoint");
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        tracing::warn!(endpoint_id = %ep.id, error = ?error, "stopping webhook retries because endpoint status could not be checked");
+                        return Err(());
+                    }
+                }
                 attempts_made = attempt;
                 let resp = self
                     .http
@@ -120,7 +131,7 @@ impl WebhookSender {
                         let code = r.status().as_u16() as i32;
                         last_code = Some(code);
                         if r.status().is_success() {
-                            return Ok(attempt);
+                            return Ok(Some(attempt));
                         }
                     }
                     Err(_) => last_code = None,
@@ -136,7 +147,7 @@ impl WebhookSender {
         .await;
 
         match res {
-            Ok(Ok(successful_attempt)) => {
+            Ok(Ok(Some(successful_attempt))) => {
                 let _ = self
                     .store
                     .log_webhook_delivery(
@@ -150,6 +161,20 @@ impl WebhookSender {
                     .await;
                 true
             }
+            Ok(Ok(None)) => {
+                let _ = self
+                    .store
+                    .log_webhook_delivery(
+                        ep.id,
+                        event_type,
+                        body,
+                        "failed",
+                        attempts_made as i32,
+                        last_code,
+                    )
+                    .await;
+                false
+            }
             Ok(Err(())) => {
                 let _ = self
                     .store
@@ -158,7 +183,7 @@ impl WebhookSender {
                         event_type,
                         body,
                         "failed",
-                        self.max_attempts as i32,
+                        attempts_made as i32,
                         last_code,
                     )
                     .await;

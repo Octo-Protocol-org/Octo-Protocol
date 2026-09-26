@@ -77,6 +77,8 @@ carries fee float only — the one server-held key in the system, bounded by you
   gets `401`). Idempotent: a second call returns the existing tank.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
   cap, and the daily budget.
+- Sponsorship and whitelist config `PUT` requests require at least one field; an empty body or
+  `{}` returns `400 Bad Request`.
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
   The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
   untouched. Over budget → `429`; duplicate inner tx → `409`.
