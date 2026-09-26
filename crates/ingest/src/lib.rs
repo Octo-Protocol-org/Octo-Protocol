@@ -856,4 +856,34 @@ mod tests {
         // Numbers outside i32 range should fail
         assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        // Fuzz test asserting that operation_index_from_toid never panics on arbitrary string inputs.
+        #[test]
+        fn operation_index_from_toid_never_panics_on_arbitrary_input(
+            input in ".*"
+        ) {
+            let _ = operation_index_from_toid(&input);
+        }
+
+        // Fuzz test asserting any successfully extracted operation index is non-negative and within valid bounds.
+        #[test]
+        fn operation_index_from_toid_extracted_value_is_always_within_the_documented_valid_range_when_some(
+            input in prop_oneof![
+                ".*",
+                "[0-9]{1,19}-[0-9]{1,10}-[0-9]{1,10}",
+                "[ \t]*[0-9]+-[0-9]+-[0-9]+[ \t]*",
+                "-?[0-9]+--?[0-9]+--?[0-9]+",
+                "\\PC*",
+            ]
+        ) {
+            if let Some(idx) = operation_index_from_toid(&input) {
+                prop_assert!(idx >= 0 && idx <= i32::MAX);
+            }
+        }
+    }
 }

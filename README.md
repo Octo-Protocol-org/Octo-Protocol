@@ -210,6 +210,17 @@ Full mapping in **[docs/threat-model.md](docs/threat-model.md)**. Amounts are in
 end-to-end (never floats). Report vulnerabilities per **[SECURITY.md](SECURITY.md)** — **do not**
 open public issues for security reports.
 
+## Documentation
+
+- [Architecture Overview](docs/architecture.md)
+- [Threat Model & Security](docs/threat-model.md)
+- [Deposit Model & Attribution](docs/deposit-model.md)
+- [Non-Custodial Transaction Flow](docs/non-custodial-flow.md)
+- [Operational Runbook: Key Migration](docs/runbook-migrate-keys.md)
+- [Operational Runbook: Operation Index Backfill](docs/runbook-backfill-operation-index.md)
+- [Backfill Constraint Safety Analysis](docs/backfill-constraint-analysis.md)
+- [REST API Specification](docs/api.md)
+
 ## Roadmap
 
 - **Gas sponsorship** — *shipped.* App developers can sponsor their users' Stellar transactions
