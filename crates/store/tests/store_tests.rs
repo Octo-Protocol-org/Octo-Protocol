@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "expected exactly the twenty known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        "expected exactly the twenty-one known migrations to be recorded as applied"
     );
 }
 
@@ -1198,5 +1198,59 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
     assert!(
         token.is_none(),
         "mark_polled must not fabricate a cursor position"
+    );
+}
+
+#[tokio::test]
+async fn reseal_wallet_leaves_the_row_completely_unchanged_when_the_update_violates_a_constraint() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // Get initial wallet state
+    let before = store.get_wallet(wallet_id).await.expect("get wallet before");
+    assert_eq!(before.sealed_scheme, Some(1));
+    assert_eq!(before.sealed_ciphertext.as_deref(), Some(b"ciphertext" as &[u8]));
+    assert_eq!(before.sealed_nonce.as_deref(), Some(b"nonce12bytes" as &[u8]));
+    assert_eq!(before.sealed_salt.as_deref(), Some(b"saltsaltsaltsalt" as &[u8]));
+
+    // Attempt reseal_wallet with an invalid scheme value (0) that violates the
+    // wallets_sealed_scheme_check CHECK constraint (requires sealed_scheme IS NULL OR sealed_scheme >= 1).
+    let result = store
+        .reseal_wallet(
+            wallet_id,
+            b"new_ciphertext",
+            b"new_nonce12byt",
+            b"new_saltsaltsaltsalt",
+            0, // invalid scheme violating check constraint (0 < 1)
+            1,   // expected old scheme
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "reseal_wallet must fail when new_scheme violates a CHECK constraint"
+    );
+
+    // Verify that the row is completely unchanged (statement atomicity: zero partial updates).
+    let after = store.get_wallet(wallet_id).await.expect("get wallet after");
+    assert_eq!(
+        after.sealed_scheme, before.sealed_scheme,
+        "sealed_scheme must be completely unchanged"
+    );
+    assert_eq!(
+        after.sealed_ciphertext, before.sealed_ciphertext,
+        "sealed_ciphertext must be completely unchanged"
+    );
+    assert_eq!(
+        after.sealed_nonce, before.sealed_nonce,
+        "sealed_nonce must be completely unchanged"
+    );
+    assert_eq!(
+        after.sealed_salt, before.sealed_salt,
+        "sealed_salt must be completely unchanged"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "updated_at must be completely unchanged (zero partial effect)"
     );
 }
