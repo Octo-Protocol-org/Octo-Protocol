@@ -4,7 +4,7 @@
 use crate::derive::WalletSeed;
 use crate::error::WalletError;
 use crate::signer::StellarNetwork;
-use octo_crypto::{seal, SealedSeed, MASTER_KEY_LEN};
+use octo_crypto::{seal_with_account_id, SealedSeed, MASTER_KEY_LEN};
 use stellar_base::crypto::DalekKeyPair;
 use zeroize::Zeroizing;
 
@@ -29,7 +29,12 @@ pub fn provision_wallet(
 ) -> Result<ProvisionedWallet, WalletError> {
     let (mnemonic, seed) = WalletSeed::generate();
     let account_g = master_account_id(&seed)?;
-    let sealed = seal(master_key, seed.as_bytes(), network.crypto_context())?;
+    let sealed = seal_with_account_id(
+        master_key,
+        seed.as_bytes(),
+        network.crypto_context(),
+        &account_g,
+    )?;
     Ok(ProvisionedWallet {
         account_g,
         sealed,
@@ -45,7 +50,12 @@ pub fn import_wallet(
 ) -> Result<ProvisionedWallet, WalletError> {
     let seed = WalletSeed::from_phrase(mnemonic)?;
     let account_g = master_account_id(&seed)?;
-    let sealed = seal(master_key, seed.as_bytes(), network.crypto_context())?;
+    let sealed = seal_with_account_id(
+        master_key,
+        seed.as_bytes(),
+        network.crypto_context(),
+        &account_g,
+    )?;
     Ok(ProvisionedWallet {
         account_g,
         sealed,

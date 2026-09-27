@@ -57,6 +57,8 @@ pub const SALT_LEN: usize = 32;
 /// The current sealing scheme: AES-256-GCM with per-record HKDF-SHA256 subkey derivation and
 /// context-bound AAD. All new seals are produced with this scheme tag.
 pub const SCHEME_V1: u8 = 1;
+/// AES-256-GCM with the network context and owning account id bound into the AAD.
+pub const SCHEME_V2: u8 = 2;
 
 /// A sealed secret: the AES-256-GCM ciphertext (including the authentication tag) plus the
 /// public, non-secret `nonce` and `salt` needed to open it, and an explicit `scheme` version tag
@@ -104,6 +106,10 @@ impl SealedSeed {
         salt: &[u8],
         scheme: u8,
     ) -> Result<SealedSeed, CryptoError> {
+        match scheme {
+            SCHEME_V1 | SCHEME_V2 => {}
+            _ => return Err(CryptoError::UnknownScheme(scheme)),
+        }
         let nonce: [u8; NONCE_LEN] = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength)?;
@@ -175,6 +181,24 @@ pub fn seal(
     })
 }
 
+/// Seal a secret while binding its owning Stellar account id into the authenticated context.
+pub fn seal_with_account_id(
+    master_key: &[u8; MASTER_KEY_LEN],
+    plaintext: &[u8],
+    context: &[u8],
+    account_id: &str,
+) -> Result<SealedSeed, CryptoError> {
+    if account_id.is_empty() {
+        return Err(CryptoError::AccountIdentityRequired);
+    }
+    let mut bound_context = context.to_vec();
+    bound_context.push(0);
+    bound_context.extend_from_slice(account_id.as_bytes());
+    let mut sealed = seal(master_key, plaintext, &bound_context)?;
+    sealed.scheme = SCHEME_V2;
+    Ok(sealed)
+}
+
 /// Authenticated-decrypt a [`SealedSeed`] produced by [`seal`].
 ///
 /// Returns the plaintext wrapped in [`Zeroizing`] so it is wiped when dropped. Fails with
@@ -190,6 +214,7 @@ pub fn open(
     // Validate the scheme tag before attempting any cryptographic operation.
     match sealed.scheme {
         SCHEME_V1 => {} // the only supported scheme
+        SCHEME_V2 => return Err(CryptoError::AccountIdentityRequired),
         _ => return Err(CryptoError::UnknownScheme(sealed.scheme)),
     }
 
@@ -214,6 +239,27 @@ pub fn open(
     Ok(Zeroizing::new(plaintext))
 }
 
+/// Open a V2 secret using the expected owning Stellar account id.
+pub fn open_with_account_id(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    context: &[u8],
+    account_id: &str,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    if sealed.scheme != SCHEME_V2 {
+        return open(master_key, sealed, context);
+    }
+    if account_id.is_empty() {
+        return Err(CryptoError::AccountIdentityRequired);
+    }
+    let mut bound_context = context.to_vec();
+    bound_context.push(0);
+    bound_context.extend_from_slice(account_id.as_bytes());
+    let mut v1 = sealed.clone();
+    v1.scheme = SCHEME_V1;
+    open(master_key, &v1, &bound_context)
+}
+
 /// Rotate the master key protecting an already-sealed secret.
 ///
 /// Opens `sealed` under `old_key`/`context`, then seals the recovered plaintext under `new_key`
@@ -230,9 +276,24 @@ pub fn reseal(
     seal(new_key, plaintext.as_ref(), context)
 }
 
+/// Rotate a sealed secret into the account-bound V2 scheme.
+pub fn reseal_with_account_id(
+    old_key: &[u8; MASTER_KEY_LEN],
+    new_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    context: &[u8],
+    account_id: &str,
+) -> Result<SealedSeed, CryptoError> {
+    let plaintext = open_with_account_id(old_key, sealed, context, account_id)?;
+    seal_with_account_id(new_key, plaintext.as_ref(), context, account_id)
+}
+
 /// Convenience: parse a 32-byte master key from a byte slice (e.g. decoded from a KMS/env value).
 pub fn master_key_from_slice(bytes: &[u8]) -> Result<[u8; MASTER_KEY_LEN], CryptoError> {
-    bytes.try_into().map_err(|_| CryptoError::InvalidKeyLength)
+    bytes.try_into().map_err(|_| CryptoError::InvalidMasterKeyLength {
+        expected: MASTER_KEY_LEN,
+        actual: bytes.len(),
+    })
 }
 
 #[cfg(test)]
@@ -263,6 +324,45 @@ mod tests {
         assert_eq!(
             sealed.scheme, SCHEME_V1,
             "seal must always produce scheme v1"
+        );
+    }
+
+    #[test]
+    fn account_bound_v2_rejects_the_wrong_account_id() {
+        let mk = key();
+        let sealed = seal_with_account_id(&mk, b"seed", CTX, "GGOOD").unwrap();
+        assert!(matches!(
+            open_with_account_id(&mk, &sealed, CTX, "GBAD"),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn v1_rows_still_open_with_the_original_context() {
+        let mk = key();
+        let sealed = seal(&mk, b"seed", CTX).unwrap();
+        assert_eq!(open(&mk, &sealed, CTX).unwrap().as_slice(), b"seed");
+    }
+
+    #[test]
+    fn reseal_migrates_v1_to_account_bound_v2() {
+        let old_mk = key();
+        let new_mk = key();
+        let sealed = seal(&old_mk, b"seed", CTX).unwrap();
+        let migrated = reseal_with_account_id(
+            &old_mk,
+            &new_mk,
+            &sealed,
+            CTX,
+            "GACCOUNT",
+        )
+        .unwrap();
+        assert_eq!(migrated.scheme, SCHEME_V2);
+        assert_eq!(
+            open_with_account_id(&new_mk, &migrated, CTX, "GACCOUNT")
+                .unwrap()
+                .as_slice(),
+            b"seed"
         );
     }
 
@@ -405,12 +505,24 @@ mod tests {
         assert!(master_key_from_slice(&[0u8; 32]).is_ok());
         assert!(matches!(
             master_key_from_slice(&[0u8; 31]),
-            Err(CryptoError::InvalidKeyLength)
+            Err(CryptoError::InvalidMasterKeyLength { .. })
         ));
         assert!(matches!(
             master_key_from_slice(&[0u8; 33]),
-            Err(CryptoError::InvalidKeyLength)
+            Err(CryptoError::InvalidMasterKeyLength { .. })
         ));
+    }
+
+    #[test]
+    fn from_parts_with_scheme_rejects_unknown_scheme() {
+        let error = SealedSeed::from_parts_with_scheme(
+            vec![0u8; 16],
+            &[0u8; NONCE_LEN],
+            &[0u8; SALT_LEN],
+            255,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CryptoError::UnknownScheme(255)));
     }
 
     // ---------------------------------------------------------------------------

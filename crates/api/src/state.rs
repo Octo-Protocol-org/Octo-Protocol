@@ -188,8 +188,7 @@ impl AppState {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .map_err(|_| ApiError::BadRequest("invalid MASTER_KEY (base64)".into()))?;
-        master_key_from_slice(&raw)
-            .map_err(|_| ApiError::BadRequest("MASTER_KEY must be 32 bytes".into()))
+        master_key_from_slice(&raw).map_err(|error| ApiError::BadRequest(error.to_string()))
     }
 
     pub fn store(&self) -> &Store {
@@ -222,9 +221,13 @@ impl AppState {
     ///
     /// When no next key is configured, always returns `master_key`.
     pub fn master_key_for_scheme(&self, sealed_scheme: i16) -> &[u8; MASTER_KEY_LEN] {
-        use octo_crypto::SCHEME_V1;
+        use octo_crypto::{SCHEME_V1, SCHEME_V2};
         match &self.inner.master_key_next {
-            Some(next_key) if sealed_scheme == SCHEME_V1 as i16 => next_key,
+            Some(next_key)
+                if sealed_scheme == SCHEME_V1 as i16 || sealed_scheme == SCHEME_V2 as i16 =>
+            {
+                next_key
+            }
             _ => &self.inner.master_key,
         }
     }

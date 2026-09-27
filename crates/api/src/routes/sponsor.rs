@@ -10,7 +10,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_crypto::SealedSeed;
-use octo_wallet_core::{compute_inner_tx_hash, sign_fee_bump, FeeBumpRequest};
+use octo_wallet_core::{
+    compute_inner_tx_hash, sign_fee_bump_with_account_id, FeeBumpRequest,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -117,17 +119,22 @@ pub async fn sponsor(
     let scheme = wallet
         .sealed_scheme
         .unwrap_or(octo_crypto::SCHEME_V1 as i16);
-    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
+    let scheme_byte = u8::try_from(scheme).map_err(|_| ApiError::Internal)?;
+    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme_byte)
         .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {
         inner_xdr: &inner_xdr,
         max_base_fee_stroops: max_fee,
     };
-    let signed = match sign_fee_bump(
-        state.master_key_for_scheme(scheme),
+    let Some(account_id) = wallet.gas_tank_account_g.as_deref() else {
+        return Err(ApiError::Internal);
+    };
+    let signed = match sign_fee_bump_with_account_id(
+        state.master_key_for_scheme(i16::from(scheme_byte)),
         &sealed,
         state.network(),
         0,
+        account_id,
         &fb,
     ) {
         Ok(s) => s,

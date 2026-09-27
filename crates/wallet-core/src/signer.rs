@@ -12,7 +12,7 @@
 
 use crate::derive::WalletSeed;
 use crate::error::WalletError;
-use octo_crypto::{open, SealedSeed, MASTER_KEY_LEN};
+use octo_crypto::{open, open_with_account_id, SealedSeed, MASTER_KEY_LEN};
 use stellar_base::crypto::DalekKeyPair;
 use stellar_base::network::Network;
 // sign_fee_bump (production, not test-gated) rejects sub-minimum fees against this constant.
@@ -260,6 +260,9 @@ pub fn sign_change_trust(
     account_index: u32,
     req: &ChangeTrustRequest<'_>,
 ) -> Result<SignedPayment, WalletError> {
+    if !is_valid_asset_code(req.asset_code) {
+        return Err(WalletError::InvalidAssetCode);
+    }
     if let Some(limit) = req.limit_stroops {
         if limit < 0 {
             return Err(WalletError::InvalidAmount);
@@ -338,6 +341,36 @@ pub fn sign_fee_bump(
     account_index: u32,
     req: &FeeBumpRequest<'_>,
 ) -> Result<SignedPayment, WalletError> {
+    sign_fee_bump_impl(master_key, sealed, network, account_index, req, None)
+}
+
+/// Sign a fee bump while binding a V2 sealed seed to its owning account.
+pub fn sign_fee_bump_with_account_id(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    network: StellarNetwork,
+    account_index: u32,
+    account_id: &str,
+    req: &FeeBumpRequest<'_>,
+) -> Result<SignedPayment, WalletError> {
+    sign_fee_bump_impl(
+        master_key,
+        sealed,
+        network,
+        account_index,
+        req,
+        Some(account_id),
+    )
+}
+
+fn sign_fee_bump_impl(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    network: StellarNetwork,
+    account_index: u32,
+    req: &FeeBumpRequest<'_>,
+    account_id: Option<&str>,
+) -> Result<SignedPayment, WalletError> {
     use sha2::{Digest, Sha256};
     use stellar_base::xdr::{
         BytesM, DecoratedSignature, FeeBumpTransaction as XdrFeeBump, FeeBumpTransactionEnvelope,
@@ -357,7 +390,15 @@ pub fn sign_fee_bump(
     let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
-    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
+    let seed_bytes = match account_id {
+        Some(account_id) => open_with_account_id(
+            master_key,
+            sealed,
+            network.crypto_context(),
+            account_id,
+        )?,
+        None => open(master_key, sealed, network.crypto_context())?,
+    };
     let seed = WalletSeed::from_bytes(seed_bytes.to_vec());
     let secret = seed.derive_ed25519_secret(account_index);
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
