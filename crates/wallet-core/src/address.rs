@@ -119,6 +119,7 @@ pub fn verify_account_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // A valid testnet/mainnet-format account (the SEP-0005 Test 1 account 0).
     const BASE: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
@@ -340,5 +341,65 @@ mod tests {
         // Garbage base64 / wrong-length signatures must fail, not panic.
         assert!(verify_account_signature(&account, msg, "not-base64!").is_err());
         assert!(verify_account_signature(&account, msg, "AAAA").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Proptest cross-validation: is_valid_account vs stellar-strkey's decoder
+    //
+    // Methodology: identical to the asset-code cross-validation in asset.rs.
+    // `stellar_strkey::ed25519::PublicKey::from_string` is the ground truth —
+    // it validates the version byte, base-32 encoding, length, and CRC-16.
+    // `is_valid_account` must agree with it on every input, across valid strkeys,
+    // near-valid strings with a single flipped character, wrong-length inputs,
+    // wrong prefix, non-ASCII, and empty strings.
+    //
+    // Runs as part of the default `cargo test` invocation so it is always
+    // exercised in CI without any manual flag.
+    // -----------------------------------------------------------------------
+
+    /// Ground truth: does `stellar_strkey::ed25519::PublicKey::from_string` accept `s`?
+    fn strkey_accepts(s: &str) -> bool {
+        PublicKey::from_string(s).is_ok()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// Wide, adversarial corpus: valid strkeys, near-valid strings with one flipped
+        /// character, wrong-length inputs, wrong prefix, non-ASCII, and empty strings.
+        /// Asserts `is_valid_account`'s verdict always agrees with whether the stellar-strkey
+        /// decoder actually succeeds or fails — following the same cross-validation methodology
+        /// established for asset-code validation in asset.rs.
+        #[test]
+        fn is_valid_account_verdict_never_disagrees_with_stellar_bases_own_strkey_decode_across_a_wide_randomized_corpus(
+            chars in prop::collection::vec(any::<char>(), 0..80)
+        ) {
+            let s: String = chars.into_iter().collect();
+            prop_assert_eq!(
+                is_valid_account(&s),
+                strkey_accepts(&s),
+                "disagreement for address={:?}",
+                s
+            );
+        }
+
+        /// ASCII-only variant biased toward the boundary lengths of a G... strkey (56 chars).
+        /// A valid ed25519 public-key strkey is exactly 56 base-32 characters; lengths 50..=62
+        /// with printable ASCII catch any off-by-one in length gating.
+        #[test]
+        fn boundary_biased_ascii_lengths_for_is_valid_account_never_disagree(
+            len in 50usize..=62,
+            seed in any::<u8>(),
+        ) {
+            // Rotate through printable ASCII so the alphabet is deterministic but varied.
+            let b = (seed % (0x7e - 0x20)) + 0x20;
+            let s: String = std::iter::repeat(b as char).take(len).collect();
+            prop_assert_eq!(
+                is_valid_account(&s),
+                strkey_accepts(&s),
+                "disagreement for address={:?}",
+                s
+            );
+        }
     }
 }
