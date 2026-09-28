@@ -141,6 +141,7 @@ pub struct NewWithdrawal<'a> {
     pub asset_code: &'a str,
     pub asset_issuer: Option<&'a str>,
     pub amount_stroops: i64,
+    /// Optional nonnegative memo ID; the database stores the signed i64 subset of Stellar's u64.
     pub memo_id: Option<i64>,
 }
 
@@ -1186,6 +1187,10 @@ impl Store {
         &self,
         new: NewWithdrawal<'_>,
     ) -> Result<Withdrawal, StoreError> {
+        if new.memo_id.is_some_and(|memo_id| memo_id < 0) {
+            return Err(StoreError::InvalidMemoId);
+        }
+
         sqlx::query_as::<_, Withdrawal>(
             r#"
             INSERT INTO withdrawals

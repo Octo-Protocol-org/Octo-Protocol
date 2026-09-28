@@ -502,3 +502,57 @@ pub async fn list_wallets(
         next_cursor,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_responses_never_serialize_sealed_seed_fields() {
+        let id = Uuid::nil();
+        let wallet = WalletView {
+            id,
+            network: "testnet".into(),
+            address: "Gaddress".into(),
+            custody: "client".into(),
+            label: None,
+            description: None,
+        };
+        let responses = [
+            serde_json::to_string(&CreateWalletResponse {
+                id,
+                network: "testnet".into(),
+                address: "Gaddress".into(),
+                custody: "client".into(),
+                funded: false,
+            })
+            .unwrap(),
+            serde_json::to_string(&wallet).unwrap(),
+            serde_json::to_string(&WalletListResponse {
+                data: vec![wallet],
+                next_cursor: None,
+            })
+            .unwrap(),
+            serde_json::to_string(&GasTankView {
+                wallet_id: id,
+                gas_tank_address: "Ggas-tank".into(),
+                funded: false,
+            })
+            .unwrap(),
+        ];
+
+        for response in responses {
+            for field in [
+                "sealed_ciphertext",
+                "sealed_nonce",
+                "sealed_salt",
+                "sealed_scheme",
+            ] {
+                assert!(
+                    !response.contains(field),
+                    "wallet response must not include {field}"
+                );
+            }
+        }
+    }
+}

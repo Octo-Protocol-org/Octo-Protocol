@@ -143,6 +143,7 @@ fn derive_subkey(
 /// (e.g. `b"octo:mainnet"`). A fresh random nonce and salt are generated per call, so sealing the
 /// same plaintext twice yields different output. The returned [`SealedSeed`] always has
 /// `scheme = `[`SCHEME_V1`].
+/// Nonce and salt bytes come from `OsRng`, the operating system's cryptographically secure RNG.
 pub fn seal(
     master_key: &[u8; MASTER_KEY_LEN],
     plaintext: &[u8],
@@ -300,6 +301,18 @@ mod tests {
         // Both still open to the same plaintext.
         assert_eq!(open(&mk, &a, CTX).unwrap().as_slice(), secret);
         assert_eq!(open(&mk, &b, CTX).unwrap().as_slice(), secret);
+    }
+
+    #[test]
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
+        let mk = key();
+        let secret = b"identical plaintext";
+        let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
+        for _ in 0..10_000 {
+            let sealed = seal(&mk, secret, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
+        }
     }
 
     #[test]
