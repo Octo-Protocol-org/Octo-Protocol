@@ -450,6 +450,23 @@ impl Horizon {
             Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
         }
     }
+
+    // Probe Horizon root endpoint to verify node reachability.
+    pub async fn check_reachability(&self) -> Result<(), String> {
+        let url = self.base_url.trim_end_matches('/');
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .map_err(|e| format!("horizon unreachable: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("horizon returned HTTP {}", resp.status()))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
