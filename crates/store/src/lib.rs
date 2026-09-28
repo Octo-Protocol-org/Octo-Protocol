@@ -587,6 +587,14 @@ impl Store {
     /// already migrated (e.g. by a concurrent runner) the update is silently skipped rather than
     /// overwriting a newer record.
     ///
+    /// # Atomicity Guarantee
+    ///
+    /// This method executes a single SQL `UPDATE` statement. Its atomicity guarantee (ensuring
+    /// that a failure mid-write never leaves a wallet row half-migrated or partially updated) relies
+    /// entirely on PostgreSQL's native single-statement atomicity semantics. No application-level
+    /// transaction wrapper is used; Postgres guarantees that a statement either succeeds completely
+    /// or rolls back its effect on the row entirely.
+    ///
     /// Returns `true` if the row was updated, `false` if it was already on the target scheme.
     pub async fn reseal_wallet(
         &self,
