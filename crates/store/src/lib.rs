@@ -1283,7 +1283,8 @@ impl Store {
         .ok_or(StoreError::NotFound)
     }
 
-    /// Public lookup by slug — no wallet scoping, this is the pay-page entry point.
+    /// Public lookup by slug — the UNIQUE constraint supplies the index for this equality lookup.
+    /// No wallet scoping; this is the pay-page entry point.
     pub async fn get_payment_link_by_slug(&self, slug: &str) -> Result<PaymentLink, StoreError> {
         sqlx::query_as::<_, PaymentLink>("SELECT * FROM payment_links WHERE slug = $1")
             .bind(slug)
@@ -1853,6 +1854,17 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)
+    }
+
+    /// Check whether a webhook endpoint is still active using its indexed id.
+    pub async fn is_webhook_endpoint_active(&self, id: Uuid) -> Result<bool, StoreError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM webhook_endpoints WHERE id = $1 AND active = true)",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from)
     }
 
     /// An endpoint's delivery history, newest first, capped at `limit` rows.
