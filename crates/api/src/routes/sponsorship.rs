@@ -62,7 +62,7 @@ pub async fn get_config(
     Ok(Envelope::ok(view))
 }
 
-/// `PUT /v1/wallets/:id/sponsorship`
+/// `PUT /v1/wallets/:id/sponsorship`; requires at least one field (see `docs/api.md`).
 pub async fn put_config(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
@@ -71,6 +71,14 @@ pub async fn put_config(
 ) -> ApiResult<Json<Envelope<SponsorshipConfigView>>> {
     authorize_wallet(&headers, &state, wallet_id).await?;
     let req: SponsorshipConfigRequest = parse_optional(&body)?;
+    if req.enabled.is_none()
+        && req.per_tx_fee_cap_stroops.is_none()
+        && req.daily_budget_stroops.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "at least one field must be provided".into(),
+        ));
+    }
 
     let enabled = req.enabled.unwrap_or(false);
     if let Some(cap) = req.per_tx_fee_cap_stroops {

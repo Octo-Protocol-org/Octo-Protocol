@@ -693,8 +693,10 @@ impl Supervisor {
         // of the shared concurrency budget. Paged by id so memory doesn't scale with wallet count.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
         let mut tasks = tokio::task::JoinSet::new();
+        let mut task_wallets = HashMap::new();
 
         for w in wallets {
+            let wallet_id = w.id;
             let store = self.store.clone();
             let store_for_mark = self.store.clone();
             let horizon_url = self.horizon_url.clone();
@@ -703,7 +705,7 @@ impl Supervisor {
             let retry = self.retry.clone();
             let circuit = self.circuit.clone();
             let semaphore = semaphore.clone();
-            tasks.spawn(async move {
+            let task_id = tasks.spawn(async move {
                 // Held for the duration of this wallet's poll; bounds how many Horizon requests
                 // are in flight at once without limiting how many wallets we *queue*.
                 let _permit = semaphore.acquire_owned().await;
@@ -741,6 +743,7 @@ impl Supervisor {
                 }
                 (w.id, result)
             });
+            task_wallets.insert(task_id.id(), wallet_id);
         }
 
         let mut total = 0;
@@ -782,6 +785,23 @@ impl Supervisor {
                 if let Some(joined) = tasks.join_next().await {
                     total += Self::tally(joined);
                 }
+            }
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            total += Self::tally(joined);
+        }
+        match fetch_error {
+            Some(e) => Err(e.into()),
+            None => Ok(total),
+        }
+    }
+
+    /// Queue one wallet's poll on `tasks`, gated by the shared concurrency `semaphore`.
+    fn spawn_poll(
+        &self,
+        tasks: &mut tokio::task::JoinSet<(Uuid, Result<usize, IngestError>)>,
+        semaphore: &Arc<tokio::sync::Semaphore>,
             }
         }
 

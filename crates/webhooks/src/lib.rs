@@ -181,6 +181,12 @@ impl WebhookSender {
         )
         .await;
 
+                    }
+                }
+            }),
+        )
+        .await;
+
         let (status, outcome) = match result {
             Ok(Ok(outcome)) => ("delivered", outcome),
             Ok(Err(ResilienceError::Exhausted(outcome))) => ("failed", outcome),
