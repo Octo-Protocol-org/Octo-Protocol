@@ -61,15 +61,29 @@ pub struct CreateWalletRequest {
 /// How long an issued ownership challenge stays redeemable.
 const CHALLENGE_TTL_SECS: i64 = 600;
 
-fn challenge_hmac_input(user_id: Uuid, ts: i64, nonce: &str) -> String {
-    format!("wallet-challenge:{user_id}:{ts}:{nonce}")
+fn challenge_hmac_input(user_id: Uuid, ts: i64, nonce: &str, network_passphrase: &str) -> String {
+    format!("wallet-challenge:v2:{network_passphrase}:{user_id}:{ts}:{nonce}")
+}
+
+fn issue_challenge(
+    secret: &[u8],
+    user_id: Uuid,
+    ts: i64,
+    nonce: &str,
+    network_passphrase: &str,
+) -> String {
+    let mac = crate::auth::sign_hs256(
+        secret,
+        challenge_hmac_input(user_id, ts, nonce, network_passphrase).as_bytes(),
+    );
+    format!("v2.{ts}.{nonce}.{network_passphrase}.{mac}")
 }
 
 /// `GET /v1/wallets/challenge` — issue a short-lived ownership challenge for wallet creation.
 ///
 /// The client must sign the returned string with the keypair it intends to register, proving it
-/// controls the private key. The challenge is HMAC-bound to the requesting user, so a captured
-/// (challenge, signature) pair cannot be replayed by a different account.
+/// controls the private key. The challenge is bound to both the requesting user and the configured
+/// network passphrase, preventing cross-account and cross-network replay.
 pub async fn wallet_challenge(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -77,12 +91,15 @@ pub async fn wallet_challenge(
     let user_id = authenticate(&headers, &state).await?;
     let ts = crate::auth::now_secs();
     let nonce = Uuid::new_v4().simple().to_string();
-    let mac = crate::auth::sign_hs256(
+    let challenge = issue_challenge(
         state.jwt_secret(),
-        challenge_hmac_input(user_id, ts, &nonce).as_bytes(),
+        user_id,
+        ts,
+        &nonce,
+        state.network().passphrase(),
     );
     Ok(Envelope::ok(ChallengeResponse {
-        challenge: format!("{ts}.{nonce}.{mac}"),
+        challenge,
     }))
 }
 
@@ -99,20 +116,44 @@ fn verify_ownership(
     challenge: &str,
     signature: &str,
 ) -> Result<(), ApiError> {
+    verify_ownership_for_network(
+        state.jwt_secret(),
+        user_id,
+        state.network().passphrase(),
+        challenge,
+        signature,
+        crate::auth::now_secs(),
+    )
+}
+
+fn verify_ownership_for_network(
+    secret: &[u8],
+    user_id: Uuid,
+    expected_network_passphrase: &str,
+    challenge: &str,
+    signature: &str,
+    now: i64,
+) -> Result<(), ApiError> {
     let bad = || ApiError::BadRequest("invalid or expired ownership challenge".into());
 
-    let mut parts = challenge.splitn(3, '.');
+    let mut parts = challenge.splitn(5, '.');
+    let version = parts.next().ok_or_else(bad)?;
     let ts: i64 = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     let nonce = parts.next().ok_or_else(bad)?;
+    let network_passphrase = parts.next().ok_or_else(bad)?;
     let mac = parts.next().ok_or_else(bad)?;
 
-    let age = crate::auth::now_secs() - ts;
+    if version != "v2" || network_passphrase != expected_network_passphrase {
+        return Err(bad());
+    }
+
+    let age = now.checked_sub(ts).ok_or_else(bad)?;
     if !(0..=CHALLENGE_TTL_SECS).contains(&age) {
         return Err(bad());
     }
     if !crate::auth::verify_hs256(
-        state.jwt_secret(),
-        challenge_hmac_input(user_id, ts, nonce).as_bytes(),
+        secret,
+        challenge_hmac_input(user_id, ts, nonce, network_passphrase).as_bytes(),
         mac,
     ) {
         return Err(bad());
@@ -127,6 +168,40 @@ fn verify_ownership(
             )
         },
     )
+}
+
+#[cfg(test)]
+mod challenge_tests {
+    use super::*;
+    use base64::Engine as _;
+    use octo_wallet_core::StellarNetwork;
+
+    #[test]
+    fn ownership_signature_is_bound_to_the_network_passphrase() {
+        let secret = b"test challenge secret";
+        let user_id = Uuid::new_v4();
+        let now = crate::auth::now_secs();
+        let nonce = Uuid::new_v4().simple().to_string();
+        let network_a = StellarNetwork::Testnet.passphrase();
+        let challenge = issue_challenge(secret, user_id, now, &nonce, network_a);
+        let keypair = stellar_base::crypto::DalekKeyPair::random().unwrap();
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(keypair.sign(challenge.as_bytes()).to_vec());
+
+        assert!(verify_ownership_for_network(
+            secret, user_id, network_a, &challenge, &signature, now
+        )
+        .is_ok());
+        assert!(verify_ownership_for_network(
+            secret,
+            user_id,
+            StellarNetwork::Public.passphrase(),
+            &challenge,
+            &signature,
+            now,
+        )
+        .is_err());
+    }
 }
 
 /// What we return after creating a wallet. No secret material — the key was generated client-side

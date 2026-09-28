@@ -22,7 +22,7 @@ use stellar_base::transaction::MIN_BASE_FEE;
 use crate::address::is_valid_account;
 // Used only by the feature-gated custodial signing fixtures below.
 #[cfg(any(test, feature = "test-fixtures"))]
-use crate::asset::is_valid_asset_code;
+use crate::asset::validate_asset_code;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::amount::Stroops;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -192,9 +192,7 @@ pub fn sign_payment(
     let asset = match req.asset {
         None => Asset::new_native(),
         Some((code, issuer)) => {
-            if !is_valid_asset_code(code) {
-                return Err(WalletError::InvalidAssetCode);
-            }
+            validate_asset_code(code)?;
             if !is_valid_account(issuer) {
                 return Err(WalletError::InvalidAddress);
             }
