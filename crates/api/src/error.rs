@@ -78,6 +78,9 @@ impl From<octo_store::StoreError> for ApiError {
         match e {
             octo_store::StoreError::Conflict => ApiError::Conflict,
             octo_store::StoreError::NotFound => ApiError::NotFound,
+            octo_store::StoreError::WalletArchived => {
+                ApiError::Forbidden("wallet is archived".into())
+            }
             octo_store::StoreError::InvalidMemoId => {
                 ApiError::BadRequest("memo id must be nonnegative".into())
             }

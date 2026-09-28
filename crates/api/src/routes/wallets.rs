@@ -21,6 +21,9 @@ pub struct ListParams {
     pub limit: Option<i64>,
     /// Cursor: return rows created before this id (exclusive).
     pub before: Option<Uuid>,
+    /// Whether to include archived wallets in the listing (default false).
+    #[serde(default)]
+    pub include_archived: Option<bool>,
 }
 
 /// Query parameters for `list_transactions`: supports pagination and direction filter.
@@ -225,6 +228,7 @@ pub struct WalletView {
     pub custody: String,
     pub label: Option<String>,
     pub description: Option<String>,
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Paginated list response for wallets.
@@ -574,6 +578,7 @@ fn to_view(w: octo_store::Wallet) -> WalletView {
         custody: w.custody,
         label: w.label,
         description: w.description,
+        archived_at: w.archived_at,
     }
 }
 
@@ -605,7 +610,7 @@ pub async fn list_wallets(
     // Fetch limit+1 to detect whether a next page exists.
     let rows = state
         .store()
-        .list_wallets_for_user(user_id, limit + 1, q.before)
+        .list_wallets_for_user(user_id, limit + 1, q.before, q.include_archived.unwrap_or(false))
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -624,6 +629,46 @@ pub async fn list_wallets(
         data: wallets.into_iter().map(to_view).collect(),
         next_cursor,
     }))
+}
+
+/// `PATCH /v1/wallets/:id/archive` — archive a wallet (dashboard login only).
+pub async fn archive_wallet(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    let user_id = authenticate(&headers, &state).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    state.store().archive_wallet(id).await?;
+    let updated = state.store().get_wallet(id).await?;
+    Ok(Envelope::ok(to_view(updated)))
+}
+
+/// `PATCH /v1/wallets/:id/unarchive` — unarchive a wallet (dashboard login only).
+pub async fn unarchive_wallet(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    let user_id = authenticate(&headers, &state).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    state.store().unarchive_wallet(id).await?;
+    let updated = state.store().get_wallet(id).await?;
+    Ok(Envelope::ok(to_view(updated)))
+}
+
+/// Guard check ensuring a wallet is not archived before executing a mutating operation.
+pub fn ensure_wallet_not_archived(wallet: &octo_store::Wallet) -> ApiResult<()> {
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -678,4 +723,5 @@ mod tests {
             }
         }
     }
+}
 }

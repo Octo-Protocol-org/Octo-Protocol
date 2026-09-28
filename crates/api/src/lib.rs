@@ -22,7 +22,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
@@ -90,6 +90,8 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::wallets::wallet_challenge),
         )
         .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
+        .route("/v1/wallets/:id/archive", patch(routes::wallets::archive_wallet))
+        .route("/v1/wallets/:id/unarchive", patch(routes::wallets::unarchive_wallet))
         .route(
             "/v1/wallets/:id/balances",
             get(routes::wallets::get_balances)
