@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-/// Errors returned by wallet-core operations.
+/// Wallet errors never contain secret material or unredacted transaction data that could leak through logs.
 #[derive(Debug, Error)]
 pub enum WalletError {
     /// The supplied BIP39 mnemonic phrase was invalid.
@@ -23,6 +23,10 @@ pub enum WalletError {
     /// Failed to construct a Stellar keypair from the derived seed bytes.
     #[error("key derivation failed")]
     KeyDerivation,
+
+    /// The mnemonic-derived account did not match the account claimed by the caller.
+    #[error("mnemonic does not derive the expected account")]
+    MnemonicAccountMismatch,
 
     /// An address string (G... or M...) could not be parsed.
     #[error("invalid Stellar address")]
@@ -63,5 +67,33 @@ impl From<octo_crypto::CryptoError> for WalletError {
     fn from(_: octo_crypto::CryptoError) -> Self {
         // Collapse all crypto failures to a single coarse variant — do not leak which.
         WalletError::SeedDecryption
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WalletError;
+
+    #[test]
+    fn wallet_error_output_never_contains_secret_material() {
+        let secret = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
+        let errors = [
+            WalletError::InvalidMnemonic,
+            WalletError::InvalidDerivationPath,
+            WalletError::KeyDerivation,
+            WalletError::MnemonicAccountMismatch,
+            WalletError::InvalidAddress,
+            WalletError::InvalidAssetCode,
+            WalletError::InvalidAmount,
+            WalletError::Signing,
+            WalletError::SeedDecryption,
+            WalletError::InvalidXdr,
+            WalletError::InvalidSignature,
+        ];
+
+        for error in errors {
+            assert!(!error.to_string().contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
     }
 }

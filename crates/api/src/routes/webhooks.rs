@@ -9,6 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,6 +48,14 @@ pub async fn create_webhook(
         ));
     }
 
+    if let Some(api_host) = state.public_api_host() {
+        if targets_host(&url, api_host) {
+            return Err(ApiError::BadRequest(
+                "url must not point to this API's public host".into(),
+            ));
+        }
+    }
+
     // Confirm the wallet exists (404 otherwise).
     let _ = state.store().get_wallet(wallet_id).await?;
 
@@ -66,6 +75,29 @@ pub async fn create_webhook(
     };
     let (status, json) = Envelope::created(view);
     Ok((status, json))
+}
+
+// This blocks direct host matches only; an alternate hostname or proxy can still route back here.
+fn targets_host(url: &str, expected_host: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .host_str()
+                .map(|host| host.eq_ignore_ascii_case(expected_host))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::targets_host;
+
+    #[test]
+    fn webhook_host_guard_rejects_only_the_configured_host() {
+        assert!(targets_host("https://API.octo.dev:8443/hooks", "api.octo.dev"));
+        assert!(!targets_host("https://customer.example/hooks", "api.octo.dev"));
+    }
 }
 
 #[derive(Debug, Deserialize)]

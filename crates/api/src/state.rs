@@ -34,6 +34,8 @@ struct Inner {
     /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
     /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
     public_app_url: String,
+    /// Hostname of the API's public base URL, used to reject direct self-referential webhooks.
+    public_api_host: Option<String>,
     /// HMAC secret for signing dashboard auth JWTs.
     jwt_secret: Vec<u8>,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
@@ -139,6 +141,25 @@ impl AppState {
         self
     }
 
+    /// Configure the public API URL used to block direct webhook callbacks to this API.
+    pub fn with_public_api_url(mut self, url: Option<&str>) -> Result<Self, &'static str> {
+        let host = url
+            .map(|url| {
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| "PUBLIC_API_URL must be an absolute URL")?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err("PUBLIC_API_URL must use http or https");
+                }
+                parsed
+                    .host_str()
+                    .map(str::to_ascii_lowercase)
+                    .ok_or("PUBLIC_API_URL must include a hostname")
+            })
+            .transpose()?;
+        Arc::make_mut(&mut self.inner).public_api_host = host;
+        Ok(self)
+    }
+
     /// Set the next master key for zero-downtime key rotation.
     /// When set, new records are sealed under it and existing records are opened by trying it
     /// first, then `master_key` (see [`AppState::opening_keys`]).
@@ -176,6 +197,7 @@ impl AppState {
                 horizon_url,
                 friendbot_url,
                 public_app_url,
+                public_api_host: None,
                 jwt_secret,
                 webhooks,
                 email,
@@ -268,5 +290,9 @@ impl AppState {
     /// Base URL of the hosted checkout frontend (no trailing slash).
     pub fn public_app_url(&self) -> &str {
         &self.inner.public_app_url
+    }
+
+    pub fn public_api_host(&self) -> Option<&str> {
+        self.inner.public_api_host.as_deref()
     }
 }

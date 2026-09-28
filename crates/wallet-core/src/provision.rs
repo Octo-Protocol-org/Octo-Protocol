@@ -37,14 +37,18 @@ pub fn provision_wallet(
     })
 }
 
-/// Re-provision from an existing mnemonic (recovery / import).
+/// Re-provision from an existing mnemonic and verify its derived account before sealing the seed.
 pub fn import_wallet(
     master_key: &[u8; MASTER_KEY_LEN],
     network: StellarNetwork,
     mnemonic: &str,
+    expected_account_g: &str,
 ) -> Result<ProvisionedWallet, WalletError> {
     let seed = WalletSeed::from_phrase(mnemonic)?;
     let account_g = master_account_id(&seed)?;
+    if account_g != expected_account_g {
+        return Err(WalletError::MnemonicAccountMismatch);
+    }
     let sealed = seal(master_key, seed.as_bytes(), network.crypto_context())?;
     Ok(ProvisionedWallet {
         account_g,
@@ -82,11 +86,31 @@ mod tests {
     fn import_reproduces_account_from_mnemonic() {
         let mk = [9u8; 32];
         let vector = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
-        let p = import_wallet(&mk, StellarNetwork::Testnet, vector).unwrap();
+        let p = import_wallet(
+            &mk,
+            StellarNetwork::Testnet,
+            vector,
+            "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6",
+        )
+        .unwrap();
         assert_eq!(
             p.account_g,
             "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6"
         );
+    }
+
+    #[test]
+    fn import_rejects_a_mnemonic_that_does_not_derive_the_expected_account() {
+        let mk = [9u8; 32];
+        let vector = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
+        let result = import_wallet(
+            &mk,
+            StellarNetwork::Testnet,
+            vector,
+            "GBAW5XGWORWVFE2XTJYDTLDHXTY2Q2MO73HYCGB3XMFMQ562Q2W2GJQX",
+        );
+
+        assert!(matches!(result, Err(WalletError::MnemonicAccountMismatch)));
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub use models::{
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 /// Embedded migrations, applied by [`Store::migrate`].
@@ -59,6 +60,50 @@ fn clamp_limit(limit: i64) -> i64 {
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
+}
+
+/// A wallet row lock held while a gas-tank keypair is provisioned and persisted.
+pub struct GasTankProvision {
+    transaction: Transaction<'static, Postgres>,
+    wallet: Wallet,
+}
+
+impl GasTankProvision {
+    pub fn wallet(&self) -> &Wallet {
+        &self.wallet
+    }
+
+    /// Persist the provisioned tank and release the row lock on commit.
+    pub async fn set_gas_tank(
+        mut self,
+        gas_tank_account_g: &str,
+        sealed_ciphertext: &[u8],
+        sealed_nonce: &[u8],
+        sealed_salt: &[u8],
+        sealed_scheme: i16,
+    ) -> Result<Wallet, StoreError> {
+        let wallet = sqlx::query_as::<_, Wallet>(
+            r#"
+            UPDATE wallets
+            SET gas_tank_account_g = $2, sealed_ciphertext = $3, sealed_nonce = $4,
+                sealed_salt = $5, sealed_scheme = $6, updated_at = now()
+            WHERE id = $1 AND custody = 'client' AND gas_tank_account_g IS NULL
+            RETURNING *
+            "#,
+        )
+        .bind(self.wallet.id)
+        .bind(gas_tank_account_g)
+        .bind(sealed_ciphertext)
+        .bind(sealed_nonce)
+        .bind(sealed_salt)
+        .bind(sealed_scheme)
+        .fetch_optional(&mut *self.transaction)
+        .await?
+        .ok_or(StoreError::Conflict)?;
+
+        self.transaction.commit().await?;
+        Ok(wallet)
+    }
 }
 
 /// Parameters for creating a server-custody wallet (legacy wallets and gas-tank fee accounts —
@@ -107,6 +152,23 @@ impl Store {
             .connect(database_url)
             .await?;
         Ok(Self { pool })
+    }
+
+    /// Lock the wallet row before key generation; commit with `GasTankProvision::set_gas_tank`.
+    pub async fn lock_gas_tank_provision(
+        &self,
+        wallet_id: Uuid,
+    ) -> Result<GasTankProvision, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let wallet = sqlx::query_as::<_, Wallet>(
+            "SELECT * FROM wallets WHERE id = $1 FOR UPDATE",
+        )
+        .bind(wallet_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+        Ok(GasTankProvision { transaction, wallet })
     }
 
     /// Build a store from an existing pool (useful in tests).

@@ -321,13 +321,28 @@ pub async fn create_gas_tank(
         ));
     }
 
+    // Hold the row lock through persistence so a concurrent request cannot provision another keypair.
+    let provisioning = state.store().lock_gas_tank_provision(id).await?;
+    let locked_wallet = provisioning.wallet();
+    if locked_wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    if locked_wallet.gas_tank_account_g.is_some() {
+        return Err(ApiError::Conflict);
+    }
+    if !locked_wallet.is_client_custody() {
+        return Err(ApiError::BadRequest(
+            "legacy server-custody wallets pay fees from their own account; no gas tank needed"
+                .into(),
+        ));
+    }
+
     // Provision a fresh keypair inside wallet-core. The mnemonic is deliberately dropped: the
     // tank is a disposable fee account, recoverable only by re-provisioning.
     let provisioned = octo_wallet_core::provision_wallet(state.sealing_key(), state.network())?;
     let wallet = state
         .store()
         .set_gas_tank(
-            id,
             &provisioned.account_g,
             &provisioned.sealed.ciphertext,
             &provisioned.sealed.nonce,

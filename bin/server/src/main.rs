@@ -57,7 +57,9 @@ async fn main() -> Result<()> {
         resilience.retry_policy(),
         resilience.circuit_breaker(),
     )
-    .with_jwt_secret(cfg.jwt_secret.clone());
+    .with_jwt_secret(cfg.jwt_secret.clone())
+    .with_public_api_url(cfg.public_api_url.as_deref())
+    .map_err(anyhow::Error::msg)?;
     // MASTER_KEY_NEXT, when set, activates zero-downtime key rotation: already-migrated rows
     // (by sealed_scheme) sign with this key; un-migrated rows still use `master_key`. Without
     // this call the parsed env var was read into config and then never used anywhere.
@@ -222,6 +224,8 @@ struct Config {
     /// Base URL of the hosted checkout frontend (e.g. `https://app.octo.dev`), used to build the
     /// `url` field on payment-link responses. Defaults to the local frontend dev server.
     public_app_url: String,
+    /// Public base URL of this API, for blocking direct self-referential webhook endpoints.
+    public_api_url: Option<String>,
     resend_api_key: String,
     email_from_address: String,
     master_key: [u8; 32],
@@ -267,6 +271,9 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:3000".to_string())
             .trim_end_matches('/')
             .to_string();
+        let public_api_url = std::env::var("PUBLIC_API_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty());
 
         let resend_api_key =
             std::env::var("RESEND_API_KEY").context("RESEND_API_KEY is required")?;
@@ -320,6 +327,7 @@ impl Config {
             horizon_url,
             friendbot_url,
             public_app_url,
+            public_api_url,
             resend_api_key,
             email_from_address,
             master_key,
