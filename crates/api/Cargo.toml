@@ -37,6 +37,7 @@ rand.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+url = "2"
 
 [dev-dependencies]
 tokio.workspace = true

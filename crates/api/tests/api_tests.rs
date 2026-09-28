@@ -649,32 +649,132 @@ async fn submit_signed_requires_transaction_xdr() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+const TRUSTLINE_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+/// Local mock Horizon serving `GET /accounts/:id` with a fixed sequence, so the trustline success
+/// path runs on every build instead of needing a funded testnet account.
+async fn start_mock_horizon_accounts() -> String {
+    async fn account() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "sequence": "15942562120466433",
+            "balances": [],
+            "subentry_count": 0,
+            "num_sponsoring": 0,
+            "num_sponsored": 0
+        }))
+    }
+    let app = Router::new().route("/accounts/:id", axum::routing::get(account));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
 #[tokio::test]
-async fn custodial_trustline_is_gone() {
+async fn add_trustline_returns_signing_info_for_a_valid_asset() {
+    let Some(url) = database_url() else { return };
+    let store = Store::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let state = AppState::new(
+        store,
+        [42u8; 32],
+        StellarNetwork::Testnet,
+        start_mock_horizon_accounts().await,
+        None,
+        octo_email::EmailSender::new_captured(),
+    );
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+
+    let body = format!(r#"{{"asset_code":"USDC","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/trustlines"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = &body_json(resp).await["data"];
+    assert_eq!(data["sequence"], "15942562120466433");
+    assert_eq!(data["asset_code"], "USDC");
+    assert_eq!(data["asset_issuer"], TRUSTLINE_ISSUER);
+    assert_eq!(data["base_fee_stroops"], 100);
+    assert_eq!(
+        data["limit_stroops"],
+        i64::MAX.to_string(),
+        "omitted limit = unlimited"
+    );
+    assert_eq!(
+        data["network_passphrase"],
+        StellarNetwork::Testnet.passphrase()
+    );
+    assert!(data["account"].as_str().unwrap().starts_with('G'));
+    assert_eq!(
+        data["submit_url"],
+        format!("/v1/wallets/{wallet_id}/submit-signed")
+    );
+}
+
+#[tokio::test]
+async fn add_trustline_rejects_an_invalid_asset_code() {
     let Some(state) = test_state().await else {
         return;
     };
     let app = build_router(state.clone());
     let token = auth_token(&app, &state).await;
-    let resp = app
-        .clone()
-        .oneshot(create_wallet_req(&app, &token).await)
-        .await
-        .unwrap();
-    let wallet_id = body_json(resp).await["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/trustlines");
 
+    // Empty code, 13-byte code, bad issuer, negative limit: all rejected before Horizon is hit.
+    for body in [
+        format!(r#"{{"asset_code":"","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#),
+        format!(r#"{{"asset_code":"ABCDEFGHIJKLM","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#),
+        r#"{"asset_code":"USDC","asset_issuer":"not-a-strkey"}"#.to_string(),
+        format!(
+            r#"{{"asset_code":"USDC","asset_issuer":"{TRUSTLINE_ISSUER}","limit_stroops":-1}}"#
+        ),
+        format!(r#"{{"asset_issuer":"{TRUSTLINE_ISSUER}"}}"#),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(post_json_auth(&uri, &body, &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[tokio::test]
+async fn add_trustline_requires_wallet_authorization() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = create_wallet_for(&app, &token).await;
+    let uri = format!("/v1/wallets/{wallet_id}/trustlines");
+    let body = format!(r#"{{"asset_code":"USDC","asset_issuer":"{TRUSTLINE_ISSUER}"}}"#);
+
+    // No credentials → 401.
+    let unauth = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(unauth).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Another user must not learn whether this wallet exists → 404.
+    let other = auth_token(&app, &state).await;
     let resp = app
-        .oneshot(post_json_auth(
-            &format!("/v1/wallets/{wallet_id}/trustlines"),
-            r#"{"asset_code":"USDC","asset_issuer":"GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"}"#,
-            &token,
-        ))
+        .oneshot(post_json_auth(&uri, &body, &other))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::GONE);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Regression coverage for the withdrawal route's use of the shared
@@ -853,11 +953,12 @@ async fn regenerating_api_key_invalidates_the_previous_one() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Regenerate: POST again with the (dashboard) owner token.
+    // Regenerate: POST again with the (dashboard) owner token, explicitly confirming rotation.
     let resp = app
         .clone()
-        .oneshot(post_auth(
+        .oneshot(post_json_auth(
             &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            r#"{"confirm":true}"#,
             &token,
         ))
         .await
@@ -2642,4 +2743,203 @@ async fn submit_payment_validates_against_the_intents_own_address() {
         StatusCode::CREATED,
         "a USDC payment to this intent's own address must pass validation and be relayed"
     );
+}
+
+/// Create a wallet for `token` and return its id.
+async fn new_wallet_id(app: &axum::Router, token: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(app, token).await)
+        .await
+        .unwrap();
+    body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn get_gas_tank_returns_a_clean_not_provisioned_state_for_a_wallet_with_no_tank() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = new_wallet_id(&app, &token).await;
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["provisioned"], false);
+}
+
+#[tokio::test]
+async fn list_deliveries_response_includes_the_new_diagnostic_fields() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+#[tokio::test]
+async fn get_gas_tank_returns_a_clean_not_provisioned_state_for_a_wallet_with_no_tank() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+
+    let wallet_id = new_wallet_id(&app, &token).await;
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["provisioned"], false);
+    assert!(data["gas_tank_address"].is_null());
+    assert_eq!(data["spent_today_stroops"], 0);
+}
+
+#[tokio::test]
+async fn get_gas_tank_returns_the_provisioned_tanks_status_and_spend() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = new_wallet_id(&app, &token).await;
+
+    let created = body_json(
+        app.clone()
+            .oneshot(post_auth(
+                &format!("/v1/wallets/{wallet_id}/gas-tank"),
+                &token,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await["data"]["gas_tank_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/wallets/{wallet_id}/sponsorship"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"enabled":true,"daily_budget_stroops":5000}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["provisioned"], true);
+    assert_eq!(data["gas_tank_address"], created);
+    assert_eq!(data["sponsorship_enabled"], true);
+    assert_eq!(data["daily_budget_stroops"], 5000);
+    assert_eq!(data["spent_today_stroops"], 0);
+}
+
+#[tokio::test]
+async fn get_gas_tank_never_includes_sealed_seed_fields() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id = new_wallet_id(&app, &token).await;
+    app.clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(get_auth(
+            &format!("/v1/wallets/{wallet_id}/gas-tank"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let raw = body_json(resp).await["data"].to_string();
+    for banned in ["sealed", "ciphertext", "nonce", "salt", "seed", "secret"] {
+        assert!(!raw.contains(banned), "response leaked `{banned}`: {raw}");
+    }
+}
+
+#[tokio::test]
+async fn list_deliveries_response_includes_the_new_diagnostic_fields() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+
+    let wallet_id: uuid::Uuid = create_wallet_for(&app, &token).await.parse().unwrap();
+
+    // Seed a failed delivery directly: this test covers the read path, not dispatch.
+    let ep = state
+        .store()
+        .create_webhook_endpoint(wallet_id, "https://merchant.example/hook", "s")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        state
+            .store()
+            .log_webhook_delivery(
+                ep.id,
+                "deposit.created",
+                &serde_json::json!({}),
+                "failed",
+                3,
+                Some(503),
+                Some("upstream unavailable"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{}/deliveries?limit=1", ep.id);
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = body_json(resp).await["data"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1, "?limit= must be honoured");
+    assert_eq!(rows[0]["response_code"], 503);
+    assert_eq!(rows[0]["response_body_snippet"], "upstream unavailable");
+    assert_eq!(rows[0]["attempts"], 3);
+}
+
 }
