@@ -149,6 +149,7 @@ fn derive_subkey(
 /// (e.g. `b"octo:mainnet"`). A fresh random nonce and salt are generated per call, so sealing the
 /// same plaintext twice yields different output. The returned [`SealedSeed`] always has
 /// `scheme = `[`SCHEME_V1`].
+/// Nonce and salt bytes come from `OsRng`, the operating system's cryptographically secure RNG.
 pub fn seal(
     master_key: &[u8; MASTER_KEY_LEN],
     plaintext: &[u8],
@@ -266,13 +267,24 @@ pub fn open_with_account_id(
 /// and the same `context`. The intermediate plaintext is wrapped in [`Zeroizing`] (as returned by
 /// [`open`]) and wiped on drop. The returned [`SealedSeed`] gets a fresh random nonce and salt, as
 /// [`seal`] always generates — it never reuses the original record's.
+///
+/// `reseal` is the one place a legacy `scheme = 0` record is accepted: `0` names the same
+/// algorithm as [`SCHEME_V1`], so it is opened as V1 and re-sealed with an explicit V1 tag.
 pub fn reseal(
     old_key: &[u8; MASTER_KEY_LEN],
     new_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
     context: &[u8],
 ) -> Result<SealedSeed, CryptoError> {
-    let plaintext = open(old_key, sealed, context)?;
+    let plaintext = if sealed.scheme == 0 {
+        let as_v1 = SealedSeed {
+            scheme: SCHEME_V1,
+            ..sealed.clone()
+        };
+        open(old_key, &as_v1, context)?
+    } else {
+        open(old_key, sealed, context)?
+    };
     seal(new_key, plaintext.as_ref(), context)
 }
 
@@ -392,6 +404,79 @@ mod tests {
     }
 
     #[test]
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
+        let mk = key();
+        let secret = b"identical plaintext";
+        let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
+        for _ in 0..10_000 {
+            let sealed = seal(&mk, secret, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
+        }
+    }
+        }
+    }
+
+    #[test]
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
+        let mk = key();
+        let secret = b"identical plaintext";
+        let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
+        for _ in 0..10_000 {
+            let sealed = seal(&mk, secret, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
+        }
+    }
+
+    #[test]
+    fn nonces_show_no_correlation_with_varying_plaintext_and_key_across_a_large_sample() {
+        const SAMPLE_SIZE: usize = 10_000;
+        let mut nonces = std::collections::HashSet::with_capacity(SAMPLE_SIZE);
+        let mut sum_n: f64 = 0.0;
+        let mut sum_k: f64 = 0.0;
+        let mut sum_p: f64 = 0.0;
+        let mut sum_nk: f64 = 0.0;
+        let mut sum_np: f64 = 0.0;
+        let mut sum_n_sq: f64 = 0.0;
+        let mut sum_k_sq: f64 = 0.0;
+        let mut sum_p_sq: f64 = 0.0;
+
+        for _ in 0..SAMPLE_SIZE {
+            let mut mk = [0u8; MASTER_KEY_LEN];
+            let mut pt = [0u8; 32];
+            OsRng.fill_bytes(&mut mk);
+            OsRng.fill_bytes(&mut pt);
+
+            let sealed = seal(&mk, &pt, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce collision detected in varied sample");
+
+            let n_val = sealed.nonce[0] as f64;
+            let k_val = mk[0] as f64;
+            let p_val = pt[0] as f64;
+
+            sum_n += n_val;
+            sum_k += k_val;
+            sum_p += p_val;
+            sum_nk += n_val * k_val;
+            sum_np += n_val * p_val;
+            sum_n_sq += n_val * n_val;
+            sum_k_sq += k_val * k_val;
+            sum_p_sq += p_val * p_val;
+        }
+
+        let n = SAMPLE_SIZE as f64;
+        let r_key = (n * sum_nk - sum_n * sum_k)
+            / (((n * sum_n_sq - sum_n * sum_n) * (n * sum_k_sq - sum_k * sum_k)).sqrt());
+        let r_pt = (n * sum_np - sum_n * sum_p)
+            / (((n * sum_n_sq - sum_n * sum_n) * (n * sum_p_sq - sum_p * sum_p)).sqrt());
+
+        // Pearson correlation between nonce and input bytes must be negligible (< 0.05).
+        assert!(r_key.abs() < 0.05, "correlation detected between nonce and key: {r_key}");
+        assert!(r_pt.abs() < 0.05, "correlation detected between nonce and plaintext: {r_pt}");
+    }
+
+    #[test]
     fn tampered_ciphertext_fails() {
         let mk = key();
         let mut sealed = seal(&mk, b"seed", CTX).unwrap();
@@ -481,6 +566,20 @@ mod tests {
 
         assert_ne!(resealed.nonce, sealed.nonce);
         assert_ne!(resealed.salt, sealed.salt);
+    }
+
+    #[test]
+    fn reseal_upgrades_a_legacy_scheme_0_record_to_v1() {
+        let (old_mk, new_mk) = (key(), key());
+        let mut legacy = seal(&old_mk, b"legacy seed", CTX).unwrap();
+        legacy.scheme = 0;
+        assert!(open(&old_mk, &legacy, CTX).is_err());
+        let resealed = reseal(&old_mk, &new_mk, &legacy, CTX).unwrap();
+        assert_eq!(resealed.scheme, SCHEME_V1);
+        assert_eq!(
+            open(&new_mk, &resealed, CTX).unwrap().as_slice(),
+            b"legacy seed"
+        );
     }
 
     #[test]
