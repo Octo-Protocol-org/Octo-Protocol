@@ -19,13 +19,52 @@ pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::header::HeaderName;
 use axum::http::StatusCode;
+use axum::http::HeaderValue;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::Instrument;
+
+/// Canonical header name for request correlation IDs.
+pub static REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Extracted or generated request ID stored in request extensions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestId(pub String);
+
+/// Middleware that extracts or generates a request ID, enters an info span, and echoes it in responses.
+pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
+    // Reuse caller-supplied X-Request-Id if non-empty and valid ASCII, else generate UUIDv4.
+    let request_id = req
+        .headers()
+        .get(&REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && HeaderValue::from_str(s).is_ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Record request ID in request extensions for handlers.
+    req.extensions_mut().insert(RequestId(request_id.clone()));
+
+    // Open tracing span carrying the request ID for cross-service log correlation.
+    let span = tracing::info_span!("request", request_id = %request_id);
+
+    // Run downstream middleware and routes within the span context.
+    let mut response = next.run(req).instrument(span).await;
+
+    // Attach request ID header to response.
+    if let Ok(val) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER.clone(), val);
+    }
+
+    response
+}
 
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
 ///
@@ -218,6 +257,7 @@ pub fn build_router(state: AppState) -> Router {
         // cleanly with `Router::layer` here.
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .layer(cors)
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
 

@@ -81,6 +81,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set cache key date
+        id: cache-date
+        run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      - name: Cache cargo-audit binary and advisory DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: ${{ runner.os }}-cargo-audit-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
       # A prebuilt binary, deliberately not rustsec/audit-check: that action shells out to
       # `cargo install cargo-audit`, which picks up the 1.84.1 pin in rust-toolchain.toml and
       # fails, because a current cargo-audit needs rustc 1.88+. Installing a prebuilt binary
@@ -98,6 +110,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set cache key date
+        id: cache-date
+        run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      - name: Cache cargo-deny advisory DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/advisory-dbs
+          key: ${{ runner.os }}-cargo-deny-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deny-
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   secret-scan:
