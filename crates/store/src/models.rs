@@ -134,6 +134,7 @@ pub struct WebhookEndpoint {
     pub secret: String,
     pub active: bool,
     pub created_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// A single webhook delivery attempt (append-only log).

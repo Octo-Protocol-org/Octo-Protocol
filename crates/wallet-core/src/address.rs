@@ -170,6 +170,26 @@ mod tests {
         assert_eq!(decoded.base_account(), BASE);
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(1000))]
+
+        // Assert round-trip ID preservation for arbitrary u64 values.
+        #[test]
+        fn encode_then_decode_muxed_round_trips_for_arbitrary_u64_ids(id in proptest::num::u64::ANY) {
+            let encoded = encode_muxed(BASE, id).unwrap();
+            let decoded = decode_muxed(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded.id, id);
+        }
+
+        // Assert decoded base account matches input account across all generated IDs.
+        #[test]
+        fn decoded_base_account_always_matches_the_original_input_account(id in proptest::num::u64::ANY) {
+            let encoded = encode_muxed(BASE, id).unwrap();
+            let decoded = decode_muxed(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded.base_account(), BASE);
+        }
+    }
+
     #[test]
     fn rejects_invalid_base_account() {
         assert!(matches!(
