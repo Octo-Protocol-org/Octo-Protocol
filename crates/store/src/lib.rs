@@ -99,6 +99,12 @@ impl Store {
         &self.pool
     }
 
+    // Ping the database to verify pool reachability.
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     // --- users ------------------------------------------------------------
 
     /// Create a user. `email` should already be lowercased by the caller. Returns
@@ -468,22 +474,13 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
-        let rows = sqlx::query_as::<_, Wallet>(
-            r#"
-            SELECT * FROM wallets
-            WHERE user_id = $1
-              AND ($2::uuid IS NULL OR (created_at, id) < (
-                    SELECT created_at, id FROM wallets WHERE id = $2
-                  ))
-            ORDER BY created_at DESC, id DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(user_id)
-        .bind(before_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let query = cursor_pagination_query("wallets", "user_id");
+        let rows = sqlx::query_as::<_, Wallet>(&query)
+            .bind(user_id)
+            .bind(before_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -736,22 +733,13 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Address>, StoreError> {
-        let rows = sqlx::query_as::<_, Address>(
-            r#"
-            SELECT * FROM addresses
-            WHERE wallet_id = $1
-              AND ($2::uuid IS NULL OR (created_at, id) < (
-                    SELECT created_at, id FROM addresses WHERE id = $2
-                  ))
-            ORDER BY created_at DESC, id DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(before_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let query = cursor_pagination_query("addresses", "wallet_id");
+        let rows = sqlx::query_as::<_, Address>(&query)
+            .bind(wallet_id)
+            .bind(before_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -856,22 +844,13 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
-        let rows = sqlx::query_as::<_, Transaction>(
-            r#"
-            SELECT * FROM transactions
-            WHERE wallet_id = $1
-              AND ($2::uuid IS NULL OR (created_at, id) < (
-                    SELECT created_at, id FROM transactions WHERE id = $2
-                  ))
-            ORDER BY created_at DESC, id DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(before_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let query = cursor_pagination_query("transactions", "wallet_id");
+        let rows = sqlx::query_as::<_, Transaction>(&query)
+            .bind(wallet_id)
+            .bind(before_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -1325,22 +1304,13 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<PaymentLink>, StoreError> {
-        let rows = sqlx::query_as::<_, PaymentLink>(
-            r#"
-            SELECT * FROM payment_links
-            WHERE wallet_id = $1
-              AND ($2::uuid IS NULL OR (created_at, id) < (
-                  SELECT created_at, id FROM payment_links WHERE id = $2
-              ))
-            ORDER BY created_at DESC, id DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(wallet_id)
-        .bind(before_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let query = cursor_pagination_query("payment_links", "wallet_id");
+        let rows = sqlx::query_as::<_, PaymentLink>(&query)
+            .bind(wallet_id)
+            .bind(before_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -1963,4 +1933,19 @@ impl Store {
             .await?;
         Ok(result.rows_affected())
     }
+}
+
+// Builds keyset cursor pagination query using (created_at, id) tuple comparison for deterministic descending order.
+pub fn cursor_pagination_query(table: &str, filter_column: &str) -> String {
+    format!(
+        r#"
+        SELECT * FROM {table}
+        WHERE {filter_column} = $1
+          AND ($2::uuid IS NULL OR (created_at, id) < (
+                SELECT created_at, id FROM {table} WHERE id = $2
+              ))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $3
+        "#
+    )
 }
