@@ -31,7 +31,7 @@ use tower_http::cors::{Any, CorsLayer};
 /// These routes deserialize JSON from raw `Bytes`; a `Bytes` extractor alone would otherwise
 /// rely on axum's implicit body limit (currently 2 MiB in this workspace's version). Making the
 /// limit explicit here keeps the behavior intentional and version-stable.
-const REQUEST_BODY_LIMIT: usize = 64 * 1024;
+pub const REQUEST_BODY_LIMIT: usize = 64 * 1024;
 
 /// Caller-facing wall-clock ceiling for routes that make a synchronous outbound call (Horizon).
 ///
