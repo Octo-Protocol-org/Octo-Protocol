@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_crypto::SealedSeed;
 use octo_wallet_core::{
-    compute_inner_tx_hash, inner_sequence_number, sign_fee_bump, FeeBumpRequest,
+    compute_inner_tx_hash, inner_sequence_number, sign_fee_bump, sign_fee_bump_with_account_id, FeeBumpRequest,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -140,7 +140,8 @@ pub async fn sponsor(
     let scheme = wallet
         .sealed_scheme
         .unwrap_or(octo_crypto::SCHEME_V1 as i16);
-    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
+    let scheme_byte = u8::try_from(scheme).map_err(|_| ApiError::Internal)?;
+    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme_byte)
         .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {
         inner_xdr: &inner_xdr,

@@ -210,8 +210,7 @@ impl AppState {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .map_err(|_| ApiError::BadRequest("invalid MASTER_KEY (base64)".into()))?;
-        master_key_from_slice(&raw)
-            .map_err(|_| ApiError::BadRequest("MASTER_KEY must be 32 bytes".into()))
+        master_key_from_slice(&raw).map_err(|error| ApiError::BadRequest(error.to_string()))
     }
 
     pub fn store(&self) -> &Store {
@@ -257,6 +256,7 @@ impl AppState {
             .as_deref()
             .into_iter()
             .chain(std::iter::once(&*self.inner.master_key))
+    }
     }
 
     pub fn jwt_secret(&self) -> &[u8] {

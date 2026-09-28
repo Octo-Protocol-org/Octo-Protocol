@@ -68,7 +68,7 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use octo_crypto::{master_key_from_slice, MASTER_KEY_LEN};
+use octo_crypto::{master_key_from_slice, reseal_with_account_id, MASTER_KEY_LEN, SCHEME_V2};
 use octo_store::Store;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
 
     loop {
         let batch = store
-            .list_wallets_needing_reseal(SCHEME_V1 as i16, cfg.batch_size, after_id)
+            .list_wallets_needing_reseal(SCHEME_V2 as i16, cfg.batch_size, after_id)
             .await
             .context("list_wallets_needing_reseal")?;
 
@@ -150,15 +150,25 @@ async fn main() -> Result<()> {
                 ciphertext.clone(),
                 nonce,
                 salt,
-                scheme as u8,
+                u8::try_from(scheme).context("sealed scheme must fit in an unsigned byte")?,
             )
             .with_context(|| format!("from_parts wallet {}", wallet.id))?;
 
             // Context is the network string bound into the AEAD AAD (e.g. "octo:mainnet").
             let context = format!("octo:{}", wallet.network);
+            let account_id = wallet
+                .gas_tank_account_g
+                .as_deref()
+                .unwrap_or(&wallet.stellar_account_g);
 
-            // reseal: open under old key → re-seal under new key (Zeroizing throughout).
-            let new_sealed = reseal(&cfg.old_key, &cfg.new_key, &sealed, context.as_bytes())
+            // Reseal into the account-bound scheme (Zeroizing throughout).
+            let new_sealed = reseal_with_account_id(
+                &cfg.old_key,
+                &cfg.new_key,
+                &sealed,
+                context.as_bytes(),
+                account_id,
+            )
                 .with_context(|| format!("reseal wallet {}", wallet.id))?;
 
             // Atomically swap the DB record. The idempotency guard (expected_old_scheme)
@@ -169,7 +179,7 @@ async fn main() -> Result<()> {
                     &new_sealed.ciphertext,
                     &new_sealed.nonce,
                     &new_sealed.salt,
-                    SCHEME_V1 as i16,
+                    SCHEME_V2 as i16,
                     scheme,
                 )
                 .await
