@@ -143,6 +143,7 @@ fn derive_subkey(
 /// (e.g. `b"octo:mainnet"`). A fresh random nonce and salt are generated per call, so sealing the
 /// same plaintext twice yields different output. The returned [`SealedSeed`] always has
 /// `scheme = `[`SCHEME_V1`].
+/// Nonce and salt bytes come from `OsRng`, the operating system's cryptographically secure RNG.
 pub fn seal(
     master_key: &[u8; MASTER_KEY_LEN],
     plaintext: &[u8],
@@ -220,13 +221,24 @@ pub fn open(
 /// and the same `context`. The intermediate plaintext is wrapped in [`Zeroizing`] (as returned by
 /// [`open`]) and wiped on drop. The returned [`SealedSeed`] gets a fresh random nonce and salt, as
 /// [`seal`] always generates — it never reuses the original record's.
+///
+/// `reseal` is the one place a legacy `scheme = 0` record is accepted: `0` names the same
+/// algorithm as [`SCHEME_V1`], so it is opened as V1 and re-sealed with an explicit V1 tag.
 pub fn reseal(
     old_key: &[u8; MASTER_KEY_LEN],
     new_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
     context: &[u8],
 ) -> Result<SealedSeed, CryptoError> {
-    let plaintext = open(old_key, sealed, context)?;
+    let plaintext = if sealed.scheme == 0 {
+        let as_v1 = SealedSeed {
+            scheme: SCHEME_V1,
+            ..sealed.clone()
+        };
+        open(old_key, &as_v1, context)?
+    } else {
+        open(old_key, sealed, context)?
+    };
     seal(new_key, plaintext.as_ref(), context)
 }
 
@@ -292,13 +304,28 @@ mod tests {
     }
 
     #[test]
-    fn seals_of_same_plaintext_never_repeat_nonce() {
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
         let mk = key();
-        let secret = b"constant plaintext across 10,000 iterations";
+        let secret = b"identical plaintext";
         let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
         for _ in 0..10_000 {
             let sealed = seal(&mk, secret, CTX).unwrap();
-            assert!(nonces.insert(sealed.nonce), "nonce collision detected in same-plaintext sample");
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
+        }
+    }
+        }
+    }
+
+    #[test]
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
+        let mk = key();
+        let secret = b"identical plaintext";
+        let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
+        for _ in 0..10_000 {
+            let sealed = seal(&mk, secret, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
         }
     }
 
@@ -439,6 +466,20 @@ mod tests {
 
         assert_ne!(resealed.nonce, sealed.nonce);
         assert_ne!(resealed.salt, sealed.salt);
+    }
+
+    #[test]
+    fn reseal_upgrades_a_legacy_scheme_0_record_to_v1() {
+        let (old_mk, new_mk) = (key(), key());
+        let mut legacy = seal(&old_mk, b"legacy seed", CTX).unwrap();
+        legacy.scheme = 0;
+        assert!(open(&old_mk, &legacy, CTX).is_err());
+        let resealed = reseal(&old_mk, &new_mk, &legacy, CTX).unwrap();
+        assert_eq!(resealed.scheme, SCHEME_V1);
+        assert_eq!(
+            open(&new_mk, &resealed, CTX).unwrap().as_slice(),
+            b"legacy seed"
+        );
     }
 
     #[test]
