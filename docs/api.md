@@ -30,6 +30,14 @@ deny-list the presented token, and every authenticated request checks that deny-
   password, revokes **every** session issued before the change (per-user `session_epoch`), and
   returns a fresh token. Login-JWT only (not API keys); rate-limited per IP and per user.
 - `GET  /v1/auth/me` — the current user.
+- `POST /v1/auth/request-password-reset` — `{email}`; emails a 10-minute OTP if a verified account
+  exists. Always returns the same `200` either way (no account enumeration).
+- `POST /v1/auth/confirm-password-reset` — `{email, code, new_password}`; sets the password and
+  **revokes every existing session**. Any failure is `400 invalid or expired code`.
+- `POST /v1/auth/change-email` — `{new_email, password}` (login required): verifies the current
+  password and emails an OTP to the **new** address. Nothing changes yet.
+- `POST /v1/auth/change-email/confirm` — `{new_email, code}` (login required): applies the change
+  once the new address's OTP is confirmed, and notifies the old address.
 
 ## Custody model — read this before the wallet endpoints
 
@@ -84,6 +92,9 @@ carries fee float only — the one server-held key in the system, bounded by you
 
 - `POST /v1/wallets/{id}/gas-tank` — provision the gas tank. **Dashboard JWT only** (an API key
   gets `401`). Idempotent: a second call returns the existing tank.
+- `GET  /v1/wallets/{id}/gas-tank` — the tank's public account (`gas_tank_address`), whether it is
+  `provisioned`, and today's `spent_today_stroops` against `daily_budget_stroops`. A wallet with
+  no tank returns `200` with `provisioned: false`. Never includes the sealed seed.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
   cap, and the daily budget.
   - `daily_budget_stroops`: `null`/omitted = **unlimited**; `0` = sponsorship **fully disabled**

@@ -386,6 +386,54 @@ pub struct GasTankView {
     pub funded: bool,
 }
 
+/// A wallet's gas-tank status. Public account and spend only — the sealed seed never leaves the DB.
+#[derive(Debug, Serialize)]
+pub struct GasTankStatusView {
+    pub wallet_id: Uuid,
+    pub provisioned: bool,
+    pub gas_tank_address: Option<String>,
+    pub sponsorship_enabled: bool,
+    pub daily_budget_stroops: Option<i64>,
+    /// Fees reserved today (pending + confirmed), the same figure the budget check enforces.
+    pub spent_today_stroops: i64,
+}
+
+/// `GET /v1/wallets/{id}/gas-tank` — the tank's public account and today's spend against budget.
+/// A wallet with no tank gets a 200 with `provisioned: false`, so a dashboard can render "not set up".
+pub async fn get_gas_tank(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<GasTankStatusView>>> {
+    authorize_wallet(&headers, &state, id).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    let Some(gas_tank_address) = wallet.gas_tank_account_g else {
+        return Ok(Envelope::ok(GasTankStatusView {
+            wallet_id: id,
+            provisioned: false,
+            gas_tank_address: None,
+            sponsorship_enabled: false,
+            daily_budget_stroops: None,
+            spent_today_stroops: 0,
+        }));
+    };
+
+    let config = state.store().get_gas_sponsorship_config(id).await?;
+    let spent_today_stroops = state
+        .store()
+        .sum_sponsored_fees_reserved_today(id)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(Envelope::ok(GasTankStatusView {
+        wallet_id: id,
+        provisioned: true,
+        gas_tank_address: Some(gas_tank_address),
+        sponsorship_enabled: config.as_ref().is_some_and(|c| c.enabled),
+        daily_budget_stroops: config.and_then(|c| c.daily_budget_stroops),
+        spent_today_stroops,
+    }))
+}
+
 /// `GET /v1/wallets/{id}/balances` — live on-chain balances from Horizon.
 pub async fn get_balances(
     State(state): State<AppState>,

@@ -55,6 +55,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/signup", post(auth::signup))
         .route("/v1/auth/verify-email", post(auth::verify_email))
         .route("/v1/auth/resend-otp", post(auth::resend_otp))
+        .route(
+            "/v1/auth/request-password-reset",
+            post(auth::request_password_reset),
+        )
+        .route(
+            "/v1/auth/confirm-password-reset",
+            post(auth::confirm_password_reset),
+        )
+        .route("/v1/auth/change-email", post(auth::request_email_change))
+        .route(
+            "/v1/auth/change-email/confirm",
+            post(auth::confirm_email_change),
+        )
         .route("/v1/auth/login", post(auth::login))
         .route("/v1/auth/refresh", post(auth::refresh))
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
@@ -137,7 +150,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/wallets/:id/backup", get(routes::wallets::get_backup))
         .route(
             "/v1/wallets/:id/gas-tank",
-            post(routes::wallets::create_gas_tank),
+            post(routes::wallets::create_gas_tank).get(routes::wallets::get_gas_tank),
         )
         .route(
             "/v1/wallets/:id/sponsorship",
