@@ -47,7 +47,9 @@ decrypt. Consequently:
   **Never returns a mnemonic** — the client generated it and the server never saw it.
 - `GET  /v1/wallets` — list your wallets (paginated).
 - `GET  /v1/wallets/{id}` — wallet details.
-- `GET  /v1/wallets/{id}/balances` — live on-chain balances.
+- `GET  /v1/wallets/{id}/balances` — live on-chain balances. Fetched synchronously from
+  Horizon under a **10 s** route timeout (independent of per-attempt retries); if Horizon is
+  slower than that, the request ends with `504` in the standard envelope — safe to retry.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
   recovery. **Dashboard JWT only.** Useless without the user's password.
@@ -77,6 +79,11 @@ carries fee float only — the one server-held key in the system, bounded by you
   gets `401`). Idempotent: a second call returns the existing tank.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
   cap, and the daily budget.
+  - `daily_budget_stroops`: `null`/omitted = **unlimited**; `0` = sponsorship **fully disabled**
+    for the day (every sponsor request gets `429`); negative → `400`.
+  - `per_tx_fee_cap_stroops`: `null`/omitted = no per-transaction cap; negative → `400`.
+  - When both are set, `per_tx_fee_cap_stroops` must be `<=` `daily_budget_stroops`, otherwise
+    `400` naming both values. Either field may be left unset independently.
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
   The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
   untouched. Over budget → `429`; duplicate inner tx → `409`.
@@ -90,18 +97,24 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `DELETE /v1/wallets/{id}/webhooks/{endpoint_id}` — deactivate (soft delete, so the delivery
   history survives as an audit trail).
 - `GET    /v1/wallets/{id}/webhooks/{endpoint_id}/deliveries` — delivery history (`?limit=`,
-  default 50, max 200).
+  default 50, max 200). Each row carries `response_code` (HTTP status of the last attempt, `null` on
+  a connection error/timeout) and `response_body_snippet` (first ≤ 1 KiB of the response body, with
+  the signature and secret redacted). Transport errors and 5xx are retried with backoff (3 attempts,
+  20 s ceiling); other non-2xx responses are not retried.
 
 Deliveries are signed `HMAC-SHA256` over the raw body. Endpoint URLs are SSRF-screened:
-loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike.
+loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike —
+including IPv4-mapped IPv6 (`[::ffff:127.0.0.1]`) and the unspecified address (`0.0.0.0`, `[::]`).
 
 ## API keys
 
 All three require a **dashboard JWT** and wallet ownership — an API key can never manage keys,
 so it cannot escalate or revoke itself.
 
-- `POST   /v1/wallets/{id}/api-key` — generate/regenerate (the plaintext key is shown **once**;
-  only a SHA-256 hash is stored).
+- `POST   /v1/wallets/{id}/api-key` — generate (the plaintext key is shown **once**; only a
+  SHA-256 hash is stored). The first key needs no body. Once a key exists, rotating it requires
+  `{"confirm": true}` — otherwise `409` ("an API key already exists; pass confirm=true to rotate
+  it"). Rotation immediately invalidates the previous key.
 - `GET    /v1/wallets/{id}/api-key` — metadata (prefix, created_at) — never the key itself.
 - `DELETE /v1/wallets/{id}/api-key` — revoke.
 
@@ -118,4 +131,5 @@ so it cannot escalate or revoke itself.
   `{ statusCode, message, data: { data: [...], next_cursor } }`.
 - **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
 - **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
-  custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.
+  custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded), `504` (upstream
+  Horizon exceeded a route timeout). There is no `422`.
