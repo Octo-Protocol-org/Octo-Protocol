@@ -1268,4 +1268,3 @@ async fn migrate_applies_cleanly_from_a_genuinely_empty_database() {
     .execute(&base_pool)
     .await;
 }
-

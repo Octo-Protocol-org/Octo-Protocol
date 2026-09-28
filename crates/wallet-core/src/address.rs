@@ -38,6 +38,8 @@ pub fn deposit_address(base_account: &str, id: u64) -> Result<DepositAddress, Wa
 }
 
 /// Encode a base account (`G...`) + id into a muxed address (`M...`).
+///
+/// Every `u64` id is valid, including zero; zero is not a missing-id sentinel.
 pub fn encode_muxed(base_account: &str, id: u64) -> Result<String, WalletError> {
     let pk = PublicKey::from_string(base_account).map_err(|_| WalletError::InvalidAddress)?;
     let muxed = MuxedAccount { ed25519: pk.0, id };
@@ -49,7 +51,7 @@ pub fn encode_muxed(base_account: &str, id: u64) -> Result<String, WalletError> 
 pub struct DecodedMuxed {
     /// The base ed25519 public key bytes.
     pub ed25519: [u8; 32],
-    /// The 64-bit id (customer id / memo id).
+    /// The 64-bit id (customer id / memo id); zero is a valid value.
     pub id: u64,
 }
 
@@ -62,6 +64,8 @@ impl DecodedMuxed {
 }
 
 /// Decode a muxed address (`M...`) back into its base account and id.
+///
+/// An id of zero is a valid id, not an indication that the address is missing one.
 pub fn decode_muxed(muxed_address: &str) -> Result<DecodedMuxed, WalletError> {
     let mux = MuxedAccount::from_string(muxed_address).map_err(|_| WalletError::InvalidAddress)?;
     Ok(DecodedMuxed {
@@ -70,7 +74,8 @@ pub fn decode_muxed(muxed_address: &str) -> Result<DecodedMuxed, WalletError> {
     })
 }
 
-/// Validate that a string is a well-formed base account address (`G...`).
+/// Validate that a string is a well-formed base account address (`G...`), including its strkey
+/// checksum. Muxed (`M...`) addresses are intentionally not base accounts.
 pub fn is_valid_account(address: &str) -> bool {
     PublicKey::from_string(address).is_ok()
 }
@@ -150,10 +155,38 @@ mod tests {
     }
 
     #[test]
-    fn id_zero_and_max_roundtrip() {
-        for id in [0u64, u64::MAX] {
-            let decoded = decode_muxed(&encode_muxed(BASE, id).unwrap()).unwrap();
-            assert_eq!(decoded.id, id);
+    fn id_zero_roundtrips_as_a_valid_id() {
+        let encoded = encode_muxed(BASE, 0).unwrap();
+        let decoded = decode_muxed(&encoded).unwrap();
+        assert_eq!(decoded.id, 0);
+        assert_eq!(decoded.base_account(), BASE);
+    }
+
+    #[test]
+    fn u64_max_roundtrips_without_wraparound() {
+        let encoded = encode_muxed(BASE, u64::MAX).unwrap();
+        let decoded = decode_muxed(&encoded).unwrap();
+        assert_eq!(decoded.id, u64::MAX);
+        assert_eq!(decoded.base_account(), BASE);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(1000))]
+
+        // Assert round-trip ID preservation for arbitrary u64 values.
+        #[test]
+        fn encode_then_decode_muxed_round_trips_for_arbitrary_u64_ids(id in proptest::num::u64::ANY) {
+            let encoded = encode_muxed(BASE, id).unwrap();
+            let decoded = decode_muxed(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded.id, id);
+        }
+
+        // Assert decoded base account matches input account across all generated IDs.
+        #[test]
+        fn decoded_base_account_always_matches_the_original_input_account(id in proptest::num::u64::ANY) {
+            let encoded = encode_muxed(BASE, id).unwrap();
+            let decoded = decode_muxed(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded.base_account(), BASE);
         }
     }
 
@@ -165,6 +198,17 @@ mod tests {
         ));
         assert!(!is_valid_account("not-an-address"));
         assert!(is_valid_account(BASE));
+        assert!(!is_valid_account(&encode_muxed(BASE, 1).unwrap()));
+    }
+
+    #[test]
+    fn rejects_account_with_corrupted_character_and_matching_prefix_and_length() {
+        let replacement = if BASE.as_bytes()[20] == b'X' { 'Y' } else { 'X' };
+        let corrupted = format!("{}{}{}", &BASE[..20], replacement, &BASE[21..]);
+
+        assert_eq!(corrupted.len(), BASE.len());
+        assert!(corrupted.starts_with('G'));
+        assert!(!is_valid_account(&corrupted));
     }
 
     #[test]

@@ -5,12 +5,16 @@
 
 use thiserror::Error;
 
-/// Errors returned by wallet-core operations.
+/// Wallet errors never contain secret material or unredacted transaction data that could leak through logs.
 #[derive(Debug, Error)]
 pub enum WalletError {
     /// The supplied BIP39 mnemonic phrase was invalid.
     #[error("invalid mnemonic phrase")]
     InvalidMnemonic,
+
+    /// The mnemonic phrase failed the BIP-39 checksum verification.
+    #[error("invalid mnemonic checksum")]
+    InvalidChecksum,
 
     /// A derivation path component or index was invalid.
     #[error("invalid derivation path")]
@@ -20,6 +24,10 @@ pub enum WalletError {
     #[error("key derivation failed")]
     KeyDerivation,
 
+    /// The mnemonic-derived account did not match the account claimed by the caller.
+    #[error("mnemonic does not derive the expected account")]
+    MnemonicAccountMismatch,
+
     /// An address string (G... or M...) could not be parsed.
     #[error("invalid Stellar address")]
     InvalidAddress,
@@ -28,6 +36,10 @@ pub enum WalletError {
     /// (see [`crate::asset::is_valid_asset_code`]).
     #[error("invalid asset code")]
     InvalidAssetCode,
+
+    /// A credit asset code conflicts with Octo's reserved native-asset spellings.
+    #[error("native asset codes cannot be used as credit asset codes")]
+    ReservedNativeAssetCode,
 
     /// A requested amount was out of range (must be a positive number of stroops).
     #[error("invalid amount")]
@@ -49,11 +61,43 @@ pub enum WalletError {
     /// An ed25519 signature failed to parse or did not verify against the claimed account.
     #[error("invalid signature")]
     InvalidSignature,
+
+    /// The transaction sequence number does not match the account's current chain sequence.
+    #[error("stale transaction sequence number")]
+    StaleSequence,
 }
 
 impl From<octo_crypto::CryptoError> for WalletError {
     fn from(_: octo_crypto::CryptoError) -> Self {
         // Collapse all crypto failures to a single coarse variant — do not leak which.
         WalletError::SeedDecryption
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WalletError;
+
+    #[test]
+    fn wallet_error_output_never_contains_secret_material() {
+        let secret = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
+        let errors = [
+            WalletError::InvalidMnemonic,
+            WalletError::InvalidDerivationPath,
+            WalletError::KeyDerivation,
+            WalletError::MnemonicAccountMismatch,
+            WalletError::InvalidAddress,
+            WalletError::InvalidAssetCode,
+            WalletError::InvalidAmount,
+            WalletError::Signing,
+            WalletError::SeedDecryption,
+            WalletError::InvalidXdr,
+            WalletError::InvalidSignature,
+        ];
+
+        for error in errors {
+            assert!(!error.to_string().contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
     }
 }
