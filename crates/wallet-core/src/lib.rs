@@ -32,8 +32,8 @@ pub use derive::WalletSeed;
 pub use error::WalletError;
 pub use provision::{import_wallet, provision_wallet, ProvisionedWallet};
 pub use signer::{
-    account_id_from_sealed, compute_inner_tx_hash, inner_operation_count, sign_fee_bump,
-    FeeBumpRequest, SignedPayment, StellarNetwork,
+    account_id_from_sealed, compute_inner_tx_hash, decode_envelope_strict, inner_operation_count,
+    inner_sequence_number, sign_fee_bump, FeeBumpRequest, SignedPayment, StellarNetwork,
 };
 
 // Payment signing is a TEST FIXTURE ONLY since the non-custodial cutover: production code paths

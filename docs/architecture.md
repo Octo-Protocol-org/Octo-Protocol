@@ -51,7 +51,9 @@ The client fetches `GET /signing-info` (sequence, network passphrase, base fee),
 envelope and submits it to Horizon **unmodified** → record + webhook on confirmation. Horizon's
 result codes are passed back so the client can correct and re-sign.
 
-The custodial `POST /withdraw` and `POST /trustlines` endpoints are `410 Gone` tombstones.
+The custodial `POST /withdraw` endpoint is a `410 Gone` tombstone. `POST /trustlines` validates the
+asset and returns ChangeTrust signing info (sequence, passphrase, fee, limit); the client signs
+locally and relays via `submit-signed`.
 
 ## Signing safety
 
@@ -77,3 +79,29 @@ server, and it is confined to one crate:
 
 Keys are never written to disk or logs and are never persisted in derived form. Worst-case
 exposure of this key is the gas budget — never customer balances.
+
+### Entropy source (load-bearing)
+Every server-generated mnemonic comes from `WalletSeed::generate` (`wallet-core/src/derive.rs`),
+which fills 128 bits of entropy from `rand::rngs::OsRng` (the OS CSPRNG, `getrandom(2)`) and
+calls `Mnemonic::from_entropy`. It deliberately bypasses tiny-bip39's `Mnemonic::new`, whose
+`thread_rng()` source depends on a default crate feature and a `rand` implementation detail.
+`crypto::seal` uses the same `OsRng` for nonces and salts. Any bump of `tiny-bip39` or `rand`
+must re-confirm this path stays OS-backed.
+
+## Wallet Foreign Key Constraints
+
+Wallets are intended to be permanent master records. To prevent accidental cascading deletions or silent orphaned records, all tables referencing `wallets(id)` enforce `ON DELETE RESTRICT`:
+
+| Table | Column | Initial Migration Constraint | Intended & Enforced Constraint |
+| --- | --- | --- | --- |
+| `addresses` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `transactions` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `withdrawals` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `webhook_endpoints` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `ingest_cursor` | `wallet_id` | `ON DELETE CASCADE` (0001) | `ON DELETE RESTRICT` (0021) |
+| `api_keys` | `wallet_id` | `ON DELETE CASCADE` (0005) | `ON DELETE RESTRICT` (0021) |
+| `gas_sponsorship_configs` | `wallet_id` | `ON DELETE CASCADE` (0007) | `ON DELETE RESTRICT` (0021) |
+| `sponsored_transactions` | `wallet_id` | `ON DELETE CASCADE` (0007) | `ON DELETE RESTRICT` (0021) |
+| `withdrawal_allowlist_configs` | `wallet_id` | `ON DELETE CASCADE` (0013) | `ON DELETE RESTRICT` (0021) |
+| `whitelisted_addresses` | `wallet_id` | `ON DELETE CASCADE` (0013) | `ON DELETE RESTRICT` (0021) |
+| `payment_links` | `wallet_id` | `ON DELETE CASCADE` (0014) | `ON DELETE RESTRICT` (0021) |

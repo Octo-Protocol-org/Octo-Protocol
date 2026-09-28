@@ -18,9 +18,12 @@ pub mod submit_validation;
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, Request};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
@@ -29,6 +32,13 @@ use tower_http::cors::{Any, CorsLayer};
 /// rely on axum's implicit body limit (currently 2 MiB in this workspace's version). Making the
 /// limit explicit here keeps the behavior intentional and version-stable.
 const REQUEST_BODY_LIMIT: usize = 64 * 1024;
+
+/// Caller-facing wall-clock ceiling for routes that make a synchronous outbound call (Horizon).
+///
+/// Independent of the per-attempt client timeout and retry policy in [`horizon`]: those bound
+/// each attempt, this bounds the whole request so a slow-but-responding upstream can't pin a
+/// client connection open across several retries.
+pub const OUTBOUND_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the API router with shared state.
 pub fn build_router(state: AppState) -> Router {
@@ -62,6 +72,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/refresh", post(auth::refresh))
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
         .route("/v1/auth/logout", post(auth::logout))
+        .route("/v1/auth/change-password", post(auth::change_password))
         .route("/v1/audit-logs", get(routes::audit::list_audit_logs))
         .route(
             "/v1/uploads/signature",
@@ -79,7 +90,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
         .route(
             "/v1/wallets/:id/balances",
-            get(routes::wallets::get_balances),
+            get(routes::wallets::get_balances)
+                .layer(middleware::from_fn(outbound_route_timeout)),
         )
         .route(
             "/v1/wallets/:id/transactions",
@@ -109,16 +121,16 @@ pub fn build_router(state: AppState) -> Router {
                 .get(routes::apikeys::get_key)
                 .delete(routes::apikeys::delete_key),
         )
-        // Custodial signing tombstones (410 Gone since the non-custodial cutover).
+        // Custodial signing tombstone (410 Gone since the non-custodial cutover).
         .route(
             "/v1/wallets/:id/withdraw",
             post(routes::withdrawals::withdraw),
         )
+        // Non-custodial path: clients sign locally and relay through these.
         .route(
             "/v1/wallets/:id/trustlines",
             post(routes::trustlines::add_trustline),
         )
-        // Non-custodial path: clients sign locally and relay through these.
         .route(
             "/v1/wallets/:id/submit-signed",
             post(routes::submit::submit_signed),
@@ -203,6 +215,18 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .layer(cors)
         .with_state(state)
+}
+
+/// Cap a route at [`OUTBOUND_ROUTE_TIMEOUT`], answering `504` in the standard envelope on expiry.
+async fn outbound_route_timeout(req: Request, next: Next) -> Response {
+    match tokio::time::timeout(OUTBOUND_ROUTE_TIMEOUT, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            tracing::warn!(timeout_secs = OUTBOUND_ROUTE_TIMEOUT.as_secs(), "route timed out");
+            ApiError::GatewayTimeout("upstream did not respond in time; please retry".into())
+                .into_response()
+        }
+    }
 }
 
 /// Liveness probe.
