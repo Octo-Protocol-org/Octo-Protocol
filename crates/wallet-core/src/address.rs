@@ -225,6 +225,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn to_base_account_rejects_a_muxed_address_with_a_corrupted_character() {
+        let muxed = encode_muxed(BASE, 42).unwrap();
+        let replacement = if muxed.as_bytes()[20] == b'X' { 'Y' } else { 'X' };
+        let corrupted = format!("{}{}{}", &muxed[..20], replacement, &muxed[21..]);
+
+        assert!(matches!(
+            to_base_account(&corrupted),
+            Err(WalletError::InvalidAddress)
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // Strkey-level corruption tests
     //
