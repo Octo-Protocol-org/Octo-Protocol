@@ -13,6 +13,7 @@ use octo_crypto::SealedSeed;
 use octo_wallet_core::{
     compute_inner_tx_hash, inner_sequence_number, sign_fee_bump, sign_fee_bump_with_account_id, FeeBumpRequest,
 };
+use stellar_base::transaction::MIN_BASE_FEE;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -52,6 +53,12 @@ pub async fn sponsor(
         .max_base_fee_stroops
         .filter(|f| *f > 0)
         .ok_or_else(|| ApiError::BadRequest("max_base_fee_stroops must be > 0".into()))?;
+    if max_fee < MIN_BASE_FEE.to_i64() {
+        return Err(ApiError::BadRequest(format!(
+            "max_base_fee_stroops must be at least {}",
+            MIN_BASE_FEE.to_i64()
+        )));
+    }
 
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.is_archived() {

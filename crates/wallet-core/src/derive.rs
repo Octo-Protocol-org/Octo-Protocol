@@ -22,6 +22,8 @@ const BIP44_PURPOSE: u32 = 44;
 const HARDENED: u32 = 0x8000_0000;
 /// Entropy for a 12-word BIP39 mnemonic (128 bits).
 const MNEMONIC_ENTROPY_LEN: usize = 16;
+/// BIP39 seed output length, independent of mnemonic entropy length.
+const BIP39_SEED_LEN: usize = 64;
 
 /// Validate a BIP-39 recovery phrase without constructing or holding secret material.
 ///
@@ -88,9 +90,13 @@ impl WalletSeed {
         Ok(WalletSeed(Zeroizing::new(seed.as_bytes().to_vec())))
     }
 
-    /// Construct directly from raw seed bytes (e.g. after decrypting a sealed seed).
-    pub fn from_bytes(bytes: Vec<u8>) -> WalletSeed {
-        WalletSeed(Zeroizing::new(bytes))
+    /// Construct from the 64-byte BIP39 seed output (e.g. after decrypting a sealed seed).
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<WalletSeed, WalletError> {
+        let bytes = Zeroizing::new(bytes);
+        if bytes.len() != BIP39_SEED_LEN {
+            return Err(WalletError::InvalidSeedLength);
+        }
+        Ok(WalletSeed(bytes))
     }
 
     /// Borrow the raw seed bytes (kept private to the crate; callers derive, they don't read).
@@ -232,6 +238,26 @@ mod tests {
     }
 
     #[test]
+    fn from_bytes_accepts_only_the_64_byte_bip39_seed_length() {
+        assert!(matches!(
+            WalletSeed::from_bytes(Vec::new()),
+            Err(WalletError::InvalidSeedLength)
+        ));
+        assert!(matches!(
+            WalletSeed::from_bytes(vec![0; BIP39_SEED_LEN - 1]),
+            Err(WalletError::InvalidSeedLength)
+        ));
+        assert!(matches!(
+            WalletSeed::from_bytes(vec![0; BIP39_SEED_LEN + 1]),
+            Err(WalletError::InvalidSeedLength)
+        ));
+
+        let phrase_seed = WalletSeed::from_phrase(VECTOR_MNEMONIC).unwrap();
+        assert_eq!(phrase_seed.as_bytes().len(), BIP39_SEED_LEN);
+        assert!(WalletSeed::from_bytes(vec![0; BIP39_SEED_LEN]).is_ok());
+    }
+
+    #[test]
     fn from_phrase_rejects_a_word_not_in_the_wordlist() {
         assert!(matches!(
             WalletSeed::from_phrase("not a real mnemonic phrase at all"),
@@ -347,8 +373,8 @@ mod tests {
             let mnemonic =
                 bip39::Mnemonic::from_entropy(&entropy, bip39::Language::English).unwrap();
             let seed_bytes = bip39::Seed::new(&mnemonic, "").as_bytes().to_vec();
-            let seed_a = WalletSeed::from_bytes(seed_bytes.clone());
-            let seed_b = WalletSeed::from_bytes(seed_bytes);
+            let seed_a = WalletSeed::from_bytes(seed_bytes.clone()).unwrap();
+            let seed_b = WalletSeed::from_bytes(seed_bytes).unwrap();
             let secret_a = seed_a.derive_ed25519_secret(index).unwrap();
             let secret_b = seed_b.derive_ed25519_secret(index).unwrap();
             prop_assert_eq!(*secret_a, *secret_b);
@@ -363,8 +389,10 @@ mod tests {
             prop_assume!(index_a != index_b);
             let mnemonic =
                 bip39::Mnemonic::from_entropy(&entropy, bip39::Language::English).unwrap();
-            let seed =
-                WalletSeed::from_bytes(bip39::Seed::new(&mnemonic, "").as_bytes().to_vec());
+            let seed = WalletSeed::from_bytes(
+                bip39::Seed::new(&mnemonic, "").as_bytes().to_vec(),
+            )
+            .unwrap();
             let secret_a = seed.derive_ed25519_secret(index_a).unwrap();
             let secret_b = seed.derive_ed25519_secret(index_b).unwrap();
             prop_assert_ne!(*secret_a, *secret_b);
