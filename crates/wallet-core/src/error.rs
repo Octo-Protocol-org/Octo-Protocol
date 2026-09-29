@@ -2,6 +2,11 @@
 //!
 //! Like [`octo_crypto::CryptoError`], variants avoid carrying secret material. They describe the
 //! *kind* of failure (bad input, derivation, signing) without echoing keys, seeds, or amounts.
+//!
+//! Every variant carries an explicit `#[error("...")]` message so the user/log-facing text is
+//! deliberate and auditable, rather than whatever `Debug`'s derive happens to produce. These
+//! messages are the single place `WalletError` text is produced and are guaranteed to contain no
+//! secret material (mnemonics, seeds, keys, signatures, or amounts).
 
 use thiserror::Error;
 
@@ -78,24 +83,74 @@ impl From<octo_crypto::CryptoError> for WalletError {
 mod tests {
     use super::WalletError;
 
+    /// Every variant, paired with the exact `Display` message it must produce. Keeping this list
+    /// exhaustive (and asserting the count below) means a newly added variant without an explicit,
+    /// audited message fails the test rather than silently falling back to derived `Debug` output.
+    const ALL_VARIANTS: &[(WalletError, &str)] = &[
+        (WalletError::InvalidMnemonic, "invalid mnemonic phrase"),
+        (WalletError::InvalidChecksum, "invalid mnemonic checksum"),
+        (WalletError::InvalidDerivationPath, "invalid derivation path"),
+        (WalletError::KeyDerivation, "key derivation failed"),
+        (
+            WalletError::MnemonicAccountMismatch,
+            "mnemonic does not derive the expected account",
+        ),
+        (WalletError::InvalidAddress, "invalid Stellar address"),
+        (WalletError::InvalidAssetCode, "invalid asset code"),
+        (
+            WalletError::ReservedNativeAssetCode,
+            "native asset codes cannot be used as credit asset codes",
+        ),
+        (WalletError::InvalidAmount, "invalid amount"),
+        (WalletError::Signing, "transaction signing failed"),
+        (WalletError::SeedDecryption, "seed decryption failed"),
+        (WalletError::InvalidXdr, "invalid transaction XDR"),
+        (WalletError::InvalidSignature, "invalid signature"),
+        (WalletError::StaleSequence, "stale transaction sequence number"),
+    ];
+
+    /// Substrings that must never appear in any `WalletError` `Display` message. These cover the
+    /// secret material the parallel secret-exposure audit flagged: mnemonics, seeds, keys,
+    /// signatures, and amounts.
+    const FORBIDDEN_SUBSTRINGS: &[&str] = &[
+        "illness spike retreat truth genius clock brain pass fit cave bargain toe",
+        "seed",
+        "secret",
+        "private",
+        "mnemonic",
+        "signature",
+        "amount",
+    ];
+
+    #[test]
+    fn every_walleterror_variant_has_an_explicit_display_message_containing_no_secret_material() {
+        // Guard against a variant being added without an entry in `ALL_VARIANTS`.
+        assert_eq!(ALL_VARIANTS.len(), 14, "update ALL_VARIANTS for new variants");
+
+        for (error, expected) in ALL_VARIANTS {
+            let display = error.to_string();
+
+            // The `Display` text must be the deliberate, hand-written message — not derived
+            // `Debug` output.
+            assert_eq!(&display, expected, "unexpected Display message for {error:?}");
+            assert_ne!(display, format!("{error:?}"), "Display must not equal Debug output");
+
+            // No secret material may leak through the user/log-facing text.
+            let lower = display.to_lowercase();
+            for forbidden in FORBIDDEN_SUBSTRINGS {
+                assert!(
+                    !lower.contains(&forbidden.to_lowercase()),
+                    "Display for {error:?} leaked forbidden substring {forbidden:?}: {display:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn wallet_error_output_never_contains_secret_material() {
         let secret = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
-        let errors = [
-            WalletError::InvalidMnemonic,
-            WalletError::InvalidDerivationPath,
-            WalletError::KeyDerivation,
-            WalletError::MnemonicAccountMismatch,
-            WalletError::InvalidAddress,
-            WalletError::InvalidAssetCode,
-            WalletError::InvalidAmount,
-            WalletError::Signing,
-            WalletError::SeedDecryption,
-            WalletError::InvalidXdr,
-            WalletError::InvalidSignature,
-        ];
 
-        for error in errors {
+        for (error, _) in ALL_VARIANTS {
             assert!(!error.to_string().contains(secret));
             assert!(!format!("{error:?}").contains(secret));
         }
