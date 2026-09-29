@@ -16,6 +16,10 @@ pub enum WalletError {
     #[error("invalid mnemonic checksum")]
     InvalidChecksum,
 
+    /// Raw seed bytes did not have the 64-byte BIP-39 seed length.
+    #[error("invalid seed length")]
+    InvalidSeedLength,
+
     /// A derivation path component or index was invalid.
     #[error("invalid derivation path")]
     InvalidDerivationPath,
@@ -83,6 +87,7 @@ mod tests {
         let secret = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
         let errors = [
             WalletError::InvalidMnemonic,
+            WalletError::InvalidSeedLength,
             WalletError::InvalidDerivationPath,
             WalletError::KeyDerivation,
             WalletError::MnemonicAccountMismatch,
