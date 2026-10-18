@@ -50,10 +50,10 @@ reqwest.workspace = true
 octo-ingest.workspace = true
 # Pinned: newer 0.6.x requires edition2024 (Rust >= 1.85), but rust-toolchain.toml pins 1.84.1,
 # so an unpinned "0.6" resolves to a version this project's own toolchain cannot build.
-wiremock = "=0.6.2"
+wiremock = "=0.6.5"
 # OpenAPI contract drift tests (docs/openapi.yaml) — validate live responses against the spec.
 serde_yaml = "0.9"
-jsonschema = "0.26"
+jsonschema = "0.46"
 # Signing fixtures for validation tests only — never enabled in production builds.
 octo-wallet-core = { workspace = true, features = ["test-fixtures"] }
 # Captures OTP codes in memory instead of emailing them — never enabled in production builds.
