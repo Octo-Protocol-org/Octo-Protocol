@@ -19,7 +19,7 @@ This document serves as the single changelog-style decision index tracking every
 | `wallets` | `ingest_cursor` | `wallet_id` | `CASCADE` | Horizon sync cursor has a 1:1 lifecycle with the wallet. |
 | `users` | `wallets` | `user_id` | `SET NULL` | Preserves non-custodial wallets if an admin or dashboard user account is deleted. |
 | `wallets` | `api_keys` | `wallet_id` | `CASCADE` | API keys derive their permissions solely from the parent wallet. |
-| `users` | `audit_logs` | `user_id` | `CASCADE` | User-scoped audit events; system-level logs are archived independently. |
+| `users` | `audit_logs` | `user_id` | `CASCADE` | User-scoped audit events; system-level logs are archived independently. Since `0026` the cascade is the only non-retention path that may delete audit rows. |
 | `wallets` | `gas_sponsorship_configs` | `wallet_id` | `CASCADE` | Sponsorship configuration is a 1:1 extension of the sponsoring wallet. |
 | `wallets` | `sponsored_transactions` | `wallet_id` | `RESTRICT` | Fee-bump ledger must be preserved for audit and daily budget calculations. |
 | `wallets` | `withdrawal_allowlist_configs` | `wallet_id` | `CASCADE` | Anti-fraud toggle tied directly to wallet lifecycle. |
@@ -45,6 +45,7 @@ This document serves as the single changelog-style decision index tracking every
 | `0006` | `0006_audit_logs.sql` | `audit_logs` | Append-only table referencing `users(id) ON DELETE CASCADE`, tracking action, category, target, and IP. | Persistent audit trail for compliance and user visibility across dashboard operations. |
 | `0007` | `0007_gas_sponsorship.sql` | `gas_sponsorship_configs`, `sponsored_transactions` | Config `ON DELETE CASCADE`; `sponsored_transactions` `ON DELETE RESTRICT`, `UNIQUE (inner_tx_hash)`. | Enables fee-bump sponsorship with daily budget tracking and prevents duplicate inner transaction sponsorships. |
 | `0008` | `0008_scheme_version.sql` | `wallets` | Added `sealed_scheme SMALLINT NOT NULL DEFAULT 1`. | Explicit cipher/KDF version tag enabling zero-downtime key rotation via `bin/migrate-keys`. |
+| `0027` | `0027_api_key_lifecycle.sql` | `api_keys` | Added scopes, last-used timestamps, and optional expiry with supporting constraints/index. | Enables least-privilege keys and lifecycle enforcement without storing raw credentials. |
 | `0009` | `0009_token_denylist.sql` | `token_denylist` | SHA-256 hash of revoked JWTs with `expires_at` timestamp. | Stateless JWT revocation on logout without storing raw token strings in database. |
 | `0010` | `0010_sponsored_tx_status_index.sql` | `sponsored_transactions` | Replaced `(wallet_id, created_at)` with composite `(wallet_id, status, created_at DESC)`. | Aligns indexing with actual query filters (`wallet_id` + `status`) in hot fee-budget checks. |
 | `0011` | `0011_sponsored_and_audit_indexing.sql` | `sponsored_transactions`, `audit_logs` | Partial index for pending fee reservations; `pg_trgm` extension and GIN trigram index on audit logs. | Accelerates rolling daily budget CTEs and enables fast ILIKE search over audit actions/targets. |
@@ -58,7 +59,8 @@ This document serves as the single changelog-style decision index tracking every
 | `0019` | `0019_email_otp.sql` | `email_otps` | Table referencing `users(id) ON DELETE CASCADE`; code hash; purpose CHECK; optional `tx_hash_bound`. | Rate-limited email OTP verification for registration and high-risk withdrawal authorizations. |
 | `0020` | `0020_username.sql` | `users` | Added `username TEXT` with unique partial index on `lower(username)`. | Case-insensitive unique display handles distinct from email addresses. |
 | `0021` | `0021_soft_delete_webhook_endpoints.sql` | `webhook_endpoints` | Added `deleted_at TIMESTAMPTZ` and filtered indices on `(wallet_id)` where `deleted_at IS NULL`. | Soft-delete endpoint path (Issue #338) preventing accidental cascade-purges of `webhook_deliveries` logs. |
-| `0026` | `0026_rate_limit_buckets.sql` | `rate_limit_buckets` | `UNLOGGED`; PK `(key, class)`; index on `expires_at`; no foreign keys. | Shared fixed-window counters so API rate limits hold across replicas and restarts (Issue #445). Unlogged because losing counters on a Postgres crash only resets windows early. |
+| `0026` | `0026_audit_logs_append_only.sql` | `audit_logs`; functions `audit_logs_retention_allowed`, `audit_logs_block_mutation`, `audit_logs_block_truncate` | `BEFORE UPDATE OR DELETE` row trigger and `BEFORE TRUNCATE` statement trigger raise `insufficient_privilege`. Bypass only for members of `octo_audit_retention` (created out-of-band) or a `DELETE` whose owning `users` row is already gone (FK cascade). Functions pin `search_path = pg_catalog, pg_temp` and schema-qualify `users` via `TG_TABLE_SCHEMA`. | Issue #438: append-only was a convention. A temp table can't spoof the checks; signup rollback still cascades. See `docs/postgres-roles.md`. |
+| `0028` | `0028_rate_limit_buckets.sql` | `rate_limit_buckets` | `UNLOGGED`; PK `(key, class)`; index on `expires_at`; no foreign keys. | Shared fixed-window counters so API rate limits hold across replicas and restarts (Issue #445). Unlogged because losing counters on a Postgres crash only resets windows early. |
 
 ---
 

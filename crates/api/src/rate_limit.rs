@@ -10,7 +10,7 @@ use axum::http::HeaderMap;
 use octo_store::{Store, StoreError};
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +35,9 @@ pub const PAY_SIGNING_INFO_LIMIT: u32 = 60;
 pub const PAY_SIGNING_INFO_WINDOW: Duration = Duration::from_secs(60);
 pub const PAY_SUBMIT_LIMIT: u32 = 20;
 pub const PAY_SUBMIT_WINDOW: Duration = Duration::from_secs(60);
+// Seed-backup retrieval: legitimate use is a rare new-device recovery, so keep this tight.
+pub const BACKUP_USER_LIMIT: u32 = 5;
+pub const BACKUP_USER_WINDOW: Duration = Duration::from_secs(3600);
 
 /// Boxed future so [`RateLimitStore`] stays object-safe without an `async-trait` dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -69,7 +72,10 @@ impl MemoryRateLimitStore {
     fn count(&self, key: &str, class: &'static str, window: Duration) -> u64 {
         let now = Instant::now();
         // A panic elsewhere must not disable rate limiting, so recover from poisoning.
-        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if buckets.len() > SWEEP_THRESHOLD {
             buckets.retain(|_, (expires, _)| *expires > now);
@@ -224,24 +230,56 @@ impl RateLimiter {
     }
 }
 
-/// Best-effort client IP: first hop of `X-Forwarded-For` (set by a fronting proxy), else the
-/// socket peer address, else a shared fallback key (still rate-limited, just collectively).
-///
-/// The forwarded hop is only used when it parses as an IP, and is re-serialised canonically, so
-/// junk or oversized headers cannot mint unbounded rate-limit keys (or rows, with Postgres).
-pub fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
-    let forwarded = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|xff| xff.split(',').next())
-        .and_then(|first| first.trim().parse::<IpAddr>().ok());
-    if let Some(ip) = forwarded {
-        return ip.to_string();
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    let (network, prefix) = match cidr.trim().split_once('/') {
+        Some((network, prefix)) => (network, prefix.parse::<u32>().ok()),
+        None => return cidr.trim().parse::<IpAddr>().ok() == Some(ip),
+    };
+    let Some(prefix) = prefix else { return false };
+    match (ip, network.parse::<IpAddr>().ok()) {
+        (IpAddr::V4(ip), Some(IpAddr::V4(network))) if prefix <= 32 => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            u32::from(ip) & mask == u32::from(network) & mask
+        }
+        (IpAddr::V6(ip), Some(IpAddr::V6(network))) if prefix <= 128 => {
+            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            u128::from(ip) & mask == u128::from(network) & mask
+        }
+        _ => false,
     }
-    match peer {
-        Some(addr) => addr.ip().to_string(),
-        None => "unknown".to_string(),
+}
+
+fn is_trusted_proxy(ip: IpAddr) -> bool {
+    std::env::var("TRUSTED_PROXY_CIDRS")
+        .ok()
+        .is_some_and(|value| value.split(',').any(|cidr| ip_in_cidr(ip, cidr)))
+}
+
+/// Resolve the client address while honoring forwarding headers only from configured proxies.
+pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let Some(peer_ip) = peer.map(|addr| addr.ip()) else {
+        return "unknown".to_string();
+    };
+    if !is_trusted_proxy(peer_ip) {
+        return peer_ip.to_string();
     }
+
+    let Some(xff) = headers.get("x-forwarded-for").and_then(|value| value.to_str().ok()) else {
+        return peer_ip.to_string();
+    };
+    let forwarded: Option<Vec<IpAddr>> = xff
+        .split(',')
+        .map(|value| value.trim().parse::<IpAddr>().ok())
+        .collect();
+    let Some(forwarded) = forwarded else {
+        return peer_ip.to_string();
+    };
+    forwarded
+        .into_iter()
+        .rev()
+        .find(|ip| !is_trusted_proxy(*ip))
+        .unwrap_or(peer_ip)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -272,15 +310,31 @@ mod tests {
         assert!(rl.check("1.2.3.4", "test", 1, window).await);
     }
 
-    #[test]
-    fn client_ip_prefers_forwarded_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_ip(&headers, None), "9.9.9.9");
+    #[tokio::test]
+    async fn poisoned_lock_recovers_for_later_requests() {
+        let store = MemoryRateLimitStore::default();
+        let buckets = Arc::clone(&store.buckets);
+        let _ = std::thread::spawn(move || {
+            let _guard = buckets.lock().unwrap();
+            panic!("poison the counter map");
+        })
+        .join();
 
+        assert_eq!(store.count("1.2.3.4", "auth", Duration::from_secs(60)), 1);
+    }
+
+    #[test]
+    fn client_ip_uses_socket_peer_without_a_trusted_proxy() {
         let empty = HeaderMap::new();
         let peer = "127.0.0.1:5000".parse().ok();
         assert_eq!(client_ip(&empty, peer), "127.0.0.1");
         assert_eq!(client_ip(&empty, None), "unknown");
+    }
+
+    #[test]
+    fn cidr_matching_supports_ipv4_and_ipv6() {
+        assert!(ip_in_cidr("10.2.3.4".parse().unwrap(), "10.0.0.0/8"));
+        assert!(!ip_in_cidr("11.2.3.4".parse().unwrap(), "10.0.0.0/8"));
+        assert!(ip_in_cidr("2001:db8::1".parse().unwrap(), "2001:db8::/32"));
     }
 }

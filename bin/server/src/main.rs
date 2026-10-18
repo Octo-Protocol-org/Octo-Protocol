@@ -5,6 +5,8 @@
 // Can be split for scale — ingest cursor makes the worker restart-safe and rerunnable.
 #![forbid(unsafe_code)]
 
+mod mainnet_guard;
+
 use anyhow::{Context, Result};
 use octo_api::rate_limit::{RateLimitBackend, RateLimiter};
 use octo_api::{build_router, AppState};
@@ -15,6 +17,7 @@ use octo_store::{Store, StoreConfig};
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::future::IntoFuture;
+use std::fmt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +27,21 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();
 
+    // Migrator-role entry point: needs only DATABASE_URL, never the app's secrets.
+    if std::env::args().nth(1).as_deref() == Some("--migrate-only") {
+        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let store = Store::connect(&url).await.context("connect to database")?;
+        store.migrate().await.context("run migrations")?;
+        tracing::info!("migrations applied; exiting (--migrate-only)");
+        return Ok(());
+    }
+
     let cfg = Config::from_env()?;
+    // Fail closed before touching the DB; exit directly so the operator sees exactly one fatal line.
+    if let Err(e) = cfg.ensure_safe_for_network() {
+        tracing::error!(network = cfg.network.as_str(), "{e}");
+        std::process::exit(1);
+    }
     tracing::info!(network = cfg.network.as_str(), bind = %cfg.bind_addr, "starting octo-server");
 
     // Database.
@@ -42,8 +59,14 @@ async fn main() -> Result<()> {
     let store = Store::connect_with(&cfg.database_url, db)
         .await
         .context("connect to database")?;
-    store.migrate().await.context("run migrations")?;
-    tracing::info!("database connected and migrated");
+    // A least-privilege runtime role can't run DDL; migrations then run separately as the
+    // migrator role (see docs/postgres-roles.md).
+    if cfg.run_migrations {
+        store.migrate().await.context("run migrations")?;
+        tracing::info!("database connected and migrated");
+    } else {
+        tracing::info!("database connected (RUN_MIGRATIONS=false, skipping migrations)");
+    }
 
     // Resilience config (shared between API Horizon client and ingest HorizonPayments client).
     let resilience = cfg.resilience.clone();
@@ -82,6 +105,11 @@ async fn main() -> Result<()> {
     let rate_limiter = RateLimiter::for_backend(cfg.rate_limit_backend, store.clone());
     state = state.with_rate_limiter(rate_limiter.clone());
     tracing::info!(backend = cfg.rate_limit_backend.as_str(), "rate limiter configured");
+    // Fail at boot, not at first signature, on a broken RNG or a key that can't open our data.
+    octo_api::self_test::run(&state)
+        .await
+        .map_err(|e| anyhow::anyhow!("startup crypto self-test failed: {e}"))?;
+    tracing::info!("startup crypto self-test passed");
 
     // Ingest supervisor (background task) — uses its own HorizonPayments client with the same
     // resilience config (separate circuit-breaker instance so ingest and API failures are counted
@@ -281,6 +309,9 @@ struct Config {
     /// tick) before the process force-exits. `SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 25 — keep it
     /// below the orchestrator's kill deadline (Kubernetes `terminationGracePeriodSeconds`: 30).
     shutdown_drain_timeout: Duration,
+    /// `RUN_MIGRATIONS`, default true. Set false when the server connects as a runtime role that
+    /// lacks DDL rights and migrations are applied separately by the migrator role.
+    run_migrations: bool,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -293,7 +324,47 @@ struct Config {
     resilience: ResilienceConfig,
 }
 
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("database_url", &"[REDACTED]")
+            .field("network", &self.network)
+            .field("horizon_url", &self.horizon_url)
+            .field("friendbot_url", &self.friendbot_url)
+            .field("public_app_url", &self.public_app_url)
+            .field("public_api_url", &self.public_api_url)
+            .field("resend_api_key", &"[REDACTED]")
+            .field("email_from_address", &self.email_from_address)
+            .field("master_key", &"[REDACTED]")
+            .field("master_key_next", &self.master_key_next.as_ref().map(|_| "[REDACTED]"))
+            .field("jwt_secret", &"[REDACTED]")
+            .field("bind_addr", &self.bind_addr)
+            .field("ingest_interval_secs", &self.ingest_interval_secs)
+            .field("ingest_page_limit", &self.ingest_page_limit)
+            .field("shutdown_drain_timeout", &self.shutdown_drain_timeout)
+            .field("resilience", &self.resilience)
+            .finish()
+    }
+}
+
 impl Config {
+    /// Reject placeholder/low-entropy secrets and plaintext URLs when running on mainnet.
+    fn ensure_safe_for_network(&self) -> Result<(), mainnet_guard::UnsafeMainnetConfig> {
+        mainnet_guard::check(
+            self.network,
+            &mainnet_guard::MainnetCheck {
+                jwt_secret: &self.jwt_secret,
+                master_key: &self.master_key,
+                master_key_next: self.master_key_next.as_ref(),
+                resend_api_key: &self.resend_api_key,
+                horizon_url: &self.horizon_url,
+                public_app_url: &self.public_app_url,
+                public_api_url: self.public_api_url.as_deref(),
+            },
+        )
+    }
+
     fn from_env() -> Result<Config> {
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
         let store = StoreConfig::from_env()?;
@@ -374,6 +445,12 @@ impl Config {
                 .unwrap_or(25),
         );
 
+        let run_migrations = match std::env::var("RUN_MIGRATIONS").ok().as_deref() {
+            None | Some("true") | Some("1") => true,
+            Some("false") | Some("0") => false,
+            Some(other) => anyhow::bail!("RUN_MIGRATIONS must be true or false, got {other:?}"),
+        };
+
         let resilience = ResilienceConfig::from_env();
 
         Ok(Config {
@@ -395,6 +472,7 @@ impl Config {
             ingest_page_limit,
             ingest_lock_retry,
             shutdown_drain_timeout,
+            run_migrations,
             resilience,
         })
     }

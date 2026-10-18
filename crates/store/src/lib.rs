@@ -185,6 +185,48 @@ impl Store {
         Ok(row)
     }
 
+    /// Return the active per-email authentication lock, if any.
+    pub async fn auth_locked_until(
+        &self,
+        email: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT locked_until FROM auth_lockouts WHERE email = lower($1) AND locked_until > now()",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    /// Record a failed login. Five failures in fifteen minutes trigger an exponentially longer lock.
+    pub async fn record_auth_failure(&self, email: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO auth_lockouts (email, failed_attempts) VALUES (lower($1), 1)
+            ON CONFLICT (email) DO UPDATE SET
+                failed_attempts = CASE WHEN auth_lockouts.window_started < now() - interval '15 minutes' THEN 1 ELSE auth_lockouts.failed_attempts + 1 END,
+                window_started = CASE WHEN auth_lockouts.window_started < now() - interval '15 minutes' THEN now() ELSE auth_lockouts.window_started END,
+                lockout_count = CASE WHEN auth_lockouts.failed_attempts + 1 >= 5 THEN auth_lockouts.lockout_count + 1 ELSE auth_lockouts.lockout_count END,
+                locked_until = CASE WHEN auth_lockouts.failed_attempts + 1 >= 5 THEN now() + make_interval(secs => 60 * (1 << LEAST(auth_lockouts.lockout_count, 6))) ELSE auth_lockouts.locked_until END,
+                updated_at = now()
+            "#,
+        )
+        .bind(email)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear failed-attempt state after successful authentication or an administrative unlock.
+    pub async fn reset_auth_failures(&self, email: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM auth_lockouts WHERE email = lower($1)")
+            .bind(email)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Mark a user's email as verified.
     pub async fn mark_email_verified(&self, user_id: Uuid) -> Result<(), StoreError> {
         sqlx::query("UPDATE users SET email_verified_at = now() WHERE id = $1")
@@ -328,20 +370,47 @@ impl Store {
         wallet_id: Uuid,
         prefix: &str,
         key_hash: &str,
+        scopes: &[String],
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<ApiKey, StoreError> {
         sqlx::query_as::<_, ApiKey>(
             r#"
-            INSERT INTO api_keys (wallet_id, prefix, key_hash)
-            VALUES ($1, $2, $3)
+            INSERT INTO api_keys (wallet_id, prefix, key_hash, scopes, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (wallet_id)
             DO UPDATE SET prefix = EXCLUDED.prefix, key_hash = EXCLUDED.key_hash,
-                          created_at = now()
+                          scopes = EXCLUDED.scopes, expires_at = EXCLUDED.expires_at,
+                          last_used_at = NULL, created_at = now()
             RETURNING *
             "#,
         )
         .bind(wallet_id)
         .bind(prefix)
         .bind(key_hash)
+        .bind(scopes)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::Database)
+    }
+
+    pub async fn create_api_key(
+        &self,
+        wallet_id: Uuid,
+        prefix: &str,
+        key_hash: &str,
+        scopes: &[String],
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ApiKey, StoreError> {
+        sqlx::query_as::<_, ApiKey>(
+            "INSERT INTO api_keys (wallet_id, prefix, key_hash, scopes, expires_at) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        )
+        .bind(wallet_id)
+        .bind(prefix)
+        .bind(key_hash)
+        .bind(scopes)
+        .bind(expires_at)
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::Database)
@@ -356,14 +425,25 @@ impl Store {
         Ok(row)
     }
 
-    /// Look up the wallet that owns a key by its hash (for API-key authentication later).
-    pub async fn wallet_id_for_key_hash(&self, key_hash: &str) -> Result<Option<Uuid>, StoreError> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT wallet_id FROM api_keys WHERE key_hash = $1")
-                .bind(key_hash)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|r| r.0))
+    /// Validate an unexpired API key and atomically record its latest use.
+    pub async fn use_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>, StoreError> {
+        let row = sqlx::query_as::<_, ApiKey>(
+            "UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1 \
+             AND (expires_at IS NULL OR expires_at > now()) RETURNING *",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn rehash_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Delete (revoke) the API key for a wallet. Returns `Ok(())` even if no key existed.
@@ -643,6 +723,19 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// The newest wallet on `network` that carries a server-sealed seed, if any.
+    ///
+    /// Used by the startup self-test to prove the configured master key opens real data.
+    pub async fn latest_sealed_wallet(&self, network: &str) -> Result<Option<Wallet>, StoreError> {
+        Ok(sqlx::query_as::<_, Wallet>(
+            "SELECT * FROM wallets WHERE network = $1 AND sealed_ciphertext IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(network)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// Atomically swap the sealed seed material for a single wallet after a reseal/key-rotation.
     ///
     /// The caller (typically `bin/migrate-keys`) opens the old seed with the old master key,
@@ -918,6 +1011,35 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Link a quarantined deposit to an address without ever replacing an existing attribution.
+    pub async fn attribute_quarantined_deposit(
+        &self,
+        transaction_id: Uuid,
+        address_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE transactions SET address_id = $2 WHERE id = $1 AND address_id IS NULL",
+        )
+        .bind(transaction_id)
+        .bind(address_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return only deposits awaiting attribution for a wallet, newest first.
+    pub async fn list_quarantined_transactions(
+        &self,
+        wallet_id: Uuid,
+    ) -> Result<Vec<Transaction>, StoreError> {
+        Ok(sqlx::query_as::<_, Transaction>(
+            "SELECT * FROM transactions WHERE wallet_id = $1 AND direction = 'deposit' AND address_id IS NULL ORDER BY created_at DESC, id DESC",
+        )
+        .bind(wallet_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Paginated version of [`list_transactions`]: returns at most `limit` rows, newest first.
