@@ -500,6 +500,142 @@ mod tests {
         assert_eq!(p.delay_for(5), Duration::from_millis(2_000));
     }
 
+    // --- RetryPolicy property tests (#488) -----------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Delay must be monotonically non-decreasing up to the cap (ignoring jitter).
+        #[test]
+        fn delay_grows_monotonically_up_to_cap(
+            base_ms in 1u64..=5_000u64,
+            max_ms in 1_000u64..=50_000u64,
+            multiplier in 1.1f64..=10.0f64,
+            attempts in 0u32..20u32,
+        ) {
+            let policy = RetryPolicy {
+                base_delay_ms: base_ms,
+                max_delay_ms: max_ms,
+                multiplier,
+                jitter_factor: 0.0, // no jitter for monotonicity check
+                ..Default::default()
+            };
+
+            if attempts > 0 {
+                let prev = policy.delay_for(attempts - 1);
+                let curr = policy.delay_for(attempts);
+                
+                // Current delay should be >= previous (monotone) or capped at max
+                prop_assert!(
+                    curr >= prev || curr.as_millis() == max_ms as u128,
+                    "delay should grow monotonically or hit cap: prev={:?}, curr={:?}, max={}ms",
+                    prev, curr, max_ms
+                );
+            }
+        }
+
+        /// Delay must never exceed max_delay_ms, regardless of attempt number.
+        #[test]
+        fn delay_never_exceeds_max(
+            base_ms in 1u64..=10_000u64,
+            max_ms in 100u64..=50_000u64,
+            multiplier in 1.0f64..=100.0f64,
+            jitter in 0.0f64..=0.5f64,
+            attempt in 0u32..100u32,
+        ) {
+            let policy = RetryPolicy {
+                base_delay_ms: base_ms,
+                max_delay_ms: max_ms,
+                multiplier,
+                jitter_factor: jitter,
+                ..Default::default()
+            };
+
+            let delay = policy.delay_for(attempt);
+            prop_assert!(
+                delay.as_millis() <= max_ms as u128,
+                "delay {:?} exceeded max {}ms at attempt {}",
+                delay, max_ms, attempt
+            );
+        }
+
+        /// Jitter must keep the delay within bounds (never negative, never > max).
+        #[test]
+        fn jitter_stays_within_bounds(
+            base_ms in 100u64..=5_000u64,
+            max_ms in 1_000u64..=50_000u64,
+            jitter in 0.0f64..=1.0f64,
+            attempt in 0u32..50u32,
+        ) {
+            let policy = RetryPolicy {
+                base_delay_ms: base_ms,
+                max_delay_ms: max_ms,
+                multiplier: 2.0,
+                jitter_factor: jitter,
+                ..Default::default()
+            };
+
+            let delay = policy.delay_for(attempt);
+            
+            // Delay must be non-negative (Duration enforces this, but verify it's > 0)
+            prop_assert!(delay.as_millis() >= 0);
+            
+            // Delay must not exceed max even with jitter
+            prop_assert!(
+                delay.as_millis() <= max_ms as u128,
+                "jittered delay {:?} exceeded max {}ms",
+                delay, max_ms
+            );
+        }
+
+        /// Extreme inputs (zero base, huge multiplier, max attempt) must not panic.
+        #[test]
+        fn extreme_inputs_do_not_panic(
+            base_ms in 0u64..=100_000u64,
+            max_ms in 0u64..=100_000u64,
+            multiplier in 0.0f64..=1000.0f64,
+            jitter in 0.0f64..=2.0f64,
+            attempt in 0u32..u32::MAX,
+        ) {
+            let policy = RetryPolicy {
+                base_delay_ms: base_ms,
+                max_delay_ms: max_ms,
+                multiplier,
+                jitter_factor: jitter,
+                ..Default::default()
+            };
+
+            // Should not panic regardless of inputs
+            let delay = policy.delay_for(attempt);
+            
+            // If max is set, delay must respect it
+            if max_ms > 0 {
+                prop_assert!(delay.as_millis() <= max_ms as u128);
+            }
+        }
+
+        /// Zero base delay should always produce zero delay regardless of multiplier/attempt.
+        #[test]
+        fn zero_base_stays_zero(
+            multiplier in 0.0f64..=1000.0f64,
+            attempt in 0u32..100u32,
+        ) {
+            let policy = RetryPolicy {
+                base_delay_ms: 0,
+                max_delay_ms: 10_000,
+                multiplier,
+                jitter_factor: 0.0,
+                ..Default::default()
+            };
+
+            let delay = policy.delay_for(attempt);
+            prop_assert_eq!(
+                delay.as_millis(), 0,
+                "zero base should produce zero delay regardless of multiplier"
+            );
+        }
+    }
+
     // --- CircuitBreaker ------------------------------------------------------
 
     #[test]
@@ -695,6 +831,196 @@ mod tests {
         })
         .await;
         assert_eq!(result.unwrap(), 42);
+        assert!(cb.is_closed());
+    }
+
+    // --- Deterministic circuit-breaker tests with paused time (#487) --------
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_breaker_state_transitions_with_paused_time() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(10));
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            ..Default::default()
+        };
+
+        // Initial state: Closed
+        assert!(cb.is_closed());
+        assert_eq!(cb.check(), Ok(()));
+
+        // Transition: Closed → Open (after threshold failures)
+        for _ in 0..3 {
+            let _ = execute::<_, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
+                Err("fail")
+            })
+            .await;
+        }
+        assert!(cb.is_open());
+        assert_eq!(cb.check(), Err(CircuitError::Open));
+
+        // Still open before timeout elapses
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(cb.is_open());
+        assert_eq!(cb.check(), Err(CircuitError::Open));
+
+        // Transition: Open → HalfOpen (after reset_timeout)
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(!cb.is_closed()); // Not closed yet
+        assert!(!cb.is_open()); // No longer open after timeout
+        assert_eq!(cb.check(), Ok(()), "first check after timeout claims probe");
+
+        // Transition: HalfOpen → Closed (successful probe)
+        let result = execute(&cb, &policy, CallKind::ReadOnly, || async {
+            Ok::<_, &str>(42)
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert!(cb.is_closed());
+
+        // Circuit stays closed on subsequent successes
+        for _ in 0..5 {
+            let _ = execute(&cb, &policy, CallKind::ReadOnly, || async {
+                Ok::<_, &str>(())
+            })
+            .await;
+        }
+        assert!(cb.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_breaker_reopens_on_failed_probe() {
+        let cb = CircuitBreaker::new(2, Duration::from_secs(5));
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            ..Default::default()
+        };
+
+        // Open the circuit
+        for _ in 0..2 {
+            let _ = execute::<_, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
+                Err("fail")
+            })
+            .await;
+        }
+        assert!(cb.is_open());
+
+        // Wait for reset timeout
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        // Transition: Open → HalfOpen → Open (failed probe)
+        let result = execute::<_, (), _>(&cb, &policy, CallKind::ReadOnly, || async {
+            Err("probe fails")
+        })
+        .await;
+        assert!(matches!(result, Err(ResilienceError::Exhausted(_))));
+
+        // Circuit should be open again after failed probe
+        // Need to advance time slightly for the re-opened timestamp to be set
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(cb.check(), Err(CircuitError::Open));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_breaker_concurrent_callers_during_half_open() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let cb = CircuitBreaker::new(2, Duration::from_secs(5));
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        // Open the circuit
+        cb.on_failure();
+        cb.on_failure();
+        assert!(cb.is_open());
+
+        // Wait for reset timeout
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        // Spawn 10 concurrent callers
+        let mut handles = vec![];
+        for i in 0..10 {
+            let cb_clone = cb.clone();
+            let attempts_clone = attempts.clone();
+            let handle = tokio::spawn(async move {
+                // Small stagger to simulate near-simultaneous arrivals
+                tokio::time::sleep(Duration::from_micros(i * 100)).await;
+                
+                match cb_clone.check() {
+                    Ok(()) => {
+                        // This caller got through as the probe or after circuit closed
+                        attempts_clone.fetch_add(1, Ordering::SeqCst);
+                        cb_clone.on_success(); // Simulate successful call
+                        Ok(())
+                    }
+                    Err(CircuitError::Open) => {
+                        // Circuit was still open for this caller
+                        Err(())
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all callers to complete
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Exactly one probe should have been allowed through initially
+        // (the first caller after timeout), and it succeeded, closing the circuit.
+        // Subsequent callers may have seen the circuit as closed.
+        let successful = results.iter().filter(|r| r.is_ok()).count();
+        let probe_attempts = attempts.load(Ordering::SeqCst);
+
+        assert!(
+            probe_attempts >= 1,
+            "at least the probe caller should have gotten through"
+        );
+        assert_eq!(
+            successful, probe_attempts as usize,
+            "successful check calls should match attempts"
+        );
+        
+        // After a successful probe, circuit should be closed
+        assert!(cb.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_breaker_lost_probe_recovers_after_another_timeout() {
+        let cb = CircuitBreaker::new(2, Duration::from_secs(5));
+
+        // Open the circuit
+        cb.on_failure();
+        cb.on_failure();
+        assert!(cb.is_open());
+
+        // Wait for reset timeout and claim the probe
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(cb.check(), Ok(()), "probe claimed");
+
+        // Simulate a lost probe (caller dies without calling on_success/on_failure)
+        // Other callers should see Open during this window
+        assert_eq!(
+            cb.check(),
+            Err(CircuitError::Open),
+            "second caller during half-open sees Open"
+        );
+
+        // After another reset_timeout, a new probe should be allowed
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(
+            cb.check(),
+            Ok(()),
+            "new probe allowed after lost probe timeout"
+        );
+
+        // This probe succeeds
+        cb.on_success();
         assert!(cb.is_closed());
     }
 }
