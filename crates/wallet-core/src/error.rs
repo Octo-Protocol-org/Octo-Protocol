@@ -59,6 +59,10 @@ pub enum WalletError {
     #[error("invalid amount")]
     InvalidAmount,
 
+    /// A memo value was invalid (text too long, hash wrong size, etc.).
+    #[error("invalid memo")]
+    InvalidMemo,
+
     /// Building or signing the transaction failed.
     #[error("transaction signing failed")]
     Signing,
@@ -98,6 +102,7 @@ mod tests {
     const ALL_VARIANTS: &[(WalletError, &str)] = &[
         (WalletError::InvalidMnemonic, "invalid mnemonic phrase"),
         (WalletError::InvalidChecksum, "invalid mnemonic checksum"),
+        (WalletError::InvalidSeedLength, "invalid seed length"),
         (
             WalletError::WeakSeed,
             "entropy strength is insufficient",
@@ -115,6 +120,7 @@ mod tests {
             "native asset codes cannot be used as credit asset codes",
         ),
         (WalletError::InvalidAmount, "invalid amount"),
+        (WalletError::InvalidMemo, "invalid memo"),
         (WalletError::Signing, "transaction signing failed"),
         (WalletError::SeedDecryption, "seed decryption failed"),
         (WalletError::InvalidXdr, "invalid transaction XDR"),
@@ -138,7 +144,7 @@ mod tests {
     #[test]
     fn every_walleterror_variant_has_an_explicit_display_message_containing_no_secret_material() {
         // Guard against a variant being added without an entry in `ALL_VARIANTS`.
-        assert_eq!(ALL_VARIANTS.len(), 15, "update ALL_VARIANTS for new variants");
+        assert_eq!(ALL_VARIANTS.len(), 17, "update ALL_VARIANTS for new variants");
 
         for (error, expected) in ALL_VARIANTS {
             let display = error.to_string();

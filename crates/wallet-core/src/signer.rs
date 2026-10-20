@@ -110,6 +110,18 @@ impl StellarNetwork {
     }
 }
 
+/// Typed memo for a payment.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone)]
+pub enum MemoType<'a> {
+    /// `MEMO_TEXT`: up to 28 bytes of UTF-8 text.
+    Text(&'a str),
+    /// `MEMO_ID`: nonnegative 64-bit integer.
+    Id(u64),
+    /// `MEMO_HASH`: 32-byte hash.
+    Hash([u8; 32]),
+}
+
 /// A single payment to build and sign from the master account.
 ///
 /// **Test fixture only** since the non-custodial cutover: production code has no server-held
@@ -123,7 +135,10 @@ pub struct PaymentRequest<'a> {
     pub stroops: i64,
     /// `None` => native XLM. `Some((code, issuer_g))` => a credit asset.
     pub asset: Option<(&'a str, &'a str)>,
+    /// Optional typed memo (TEXT, ID, or HASH).
+    pub memo: Option<MemoType<'a>>,
     /// Optional nonnegative Stellar `MEMO_ID`; the `u64` type matches XDR and excludes negatives.
+    /// **Deprecated**: use `memo: Some(MemoType::Id(id))` instead. Kept for backwards compatibility.
     pub memo_id: Option<u64>,
     /// The master account's current sequence number (fetched from Horizon by the caller).
     pub sequence: i64,
@@ -224,9 +239,28 @@ pub fn sign_payment(
 
     let mut builder = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
         .with_time_bounds(configured_time_bounds());
-    if let Some(id) = req.memo_id {
+    
+    // Apply memo: prefer the new `memo` field, fall back to deprecated `memo_id` for compatibility.
+    if let Some(memo_type) = &req.memo {
+        match memo_type {
+            MemoType::Text(text) => {
+                if text.len() > 28 {
+                    return Err(WalletError::InvalidMemo);
+                }
+                builder = builder.with_memo(Memo::new_text(text).map_err(|_| WalletError::InvalidMemo)?);
+            }
+            MemoType::Id(id) => {
+                builder = builder.with_memo(Memo::new_id(*id));
+            }
+            MemoType::Hash(hash) => {
+                builder = builder.with_memo(Memo::new_hash(*hash).map_err(|_| WalletError::InvalidMemo)?);
+            }
+        }
+    } else if let Some(id) = req.memo_id {
+        // Backwards compatibility path
         builder = builder.with_memo(Memo::new_id(id));
     }
+    
     let mut tx = builder
         .add_operation(payment)
         .into_transaction()
@@ -1548,3 +1582,188 @@ mod tests {
         assert!(matches!(res, Err(WalletError::InvalidDerivationPath)));
     }
 }
+
+    // ── Memo type tests (issue #474) ──────────────────────────────────────────
+
+    #[test]
+    fn sign_payment_memo_text() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Text("exchange deposit")),
+                memo_id: None,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                assert!(matches!(
+                    e.tx.memo,
+                    stellar_base::xdr::Memo::Text(_)
+                ));
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_text_rejects_over_28_bytes() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let long_text = "this is way too long for stellar memo";
+        assert!(long_text.len() > 28);
+        
+        let result = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Text(long_text)),
+                memo_id: None,
+                sequence: 1,
+            },
+        );
+        assert!(matches!(result, Err(WalletError::InvalidMemo)));
+    }
+
+    #[test]
+    fn sign_payment_memo_hash() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let hash = [0xab; 32];
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Hash(hash)),
+                memo_id: None,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match e.tx.memo {
+                    stellar_base::xdr::Memo::Hash(h) => assert_eq!(h.0, hash),
+                    _ => panic!("expected MEMO_HASH"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_id_via_new_api() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Id(12345)),
+                memo_id: None,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match e.tx.memo {
+                    stellar_base::xdr::Memo::Id(id) => assert_eq!(id, 12345),
+                    _ => panic!("expected MEMO_ID"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_id_deprecated_field_still_works() {
+        // Backwards compatibility: the old memo_id field should still work
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: None,
+                memo_id: Some(67890),
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match e.tx.memo {
+                    stellar_base::xdr::Memo::Id(id) => assert_eq!(id, 67890),
+                    _ => panic!("expected MEMO_ID"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_field_takes_precedence_over_memo_id() {
+        // When both are provided, the new memo field wins
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Text("priority")),
+                memo_id: Some(99999), // This should be ignored
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                assert!(matches!(e.tx.memo, stellar_base::xdr::Memo::Text(_)));
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }

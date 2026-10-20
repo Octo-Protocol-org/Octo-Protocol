@@ -330,6 +330,100 @@ mod tests {
         assert_eq!(store.count("1.2.3.4", "auth", Duration::from_secs(60)), 1);
     }
 
+    #[tokio::test]
+    async fn concurrent_hits_respect_exact_limit() {
+        // Issue #482: spawn many tasks hitting the same bucket and verify the exact allowed count.
+        let rl = RateLimiter::default();
+        let window = Duration::from_secs(60);
+        let limit = 10u32;
+        let concurrent_requests = 50;
+
+        // Spawn many concurrent tasks all hitting the same bucket
+        let handles: Vec<_> = (0..concurrent_requests)
+            .map(|_| {
+                let rl = rl.clone();
+                tokio::spawn(async move {
+                    rl.check("concurrent-key", "test", limit, window).await
+                })
+            })
+            .collect();
+
+        let results: Vec<bool> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Exactly `limit` requests should succeed
+        let allowed = results.iter().filter(|&&success| success).count();
+        assert_eq!(
+            allowed, limit as usize,
+            "exactly {limit} concurrent requests should be allowed"
+        );
+        
+        // The rest should be rejected
+        let rejected = results.iter().filter(|&&success| !success).count();
+        assert_eq!(
+            rejected,
+            (concurrent_requests - limit as usize),
+            "remaining requests should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_drops_expired_entries_at_threshold() {
+        // Issue #482: fill past SWEEP_THRESHOLD and verify expired entries are dropped.
+        let store = MemoryRateLimitStore::default();
+        let short_window = Duration::from_millis(10);
+
+        // Fill up to just over the threshold with different keys
+        for i in 0..SWEEP_THRESHOLD + 100 {
+            store.count(&format!("key-{i}"), "test", short_window);
+        }
+
+        // Verify we have many entries
+        let before_count = store.buckets.lock().unwrap().len();
+        assert!(
+            before_count > SWEEP_THRESHOLD,
+            "should have filled past threshold"
+        );
+
+        // Wait for windows to expire
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Trigger a sweep by adding one more entry (the count method sweeps at threshold)
+        store.count("trigger-sweep", "test", Duration::from_secs(60));
+
+        // Verify expired entries were removed
+        let after_count = store.buckets.lock().unwrap().len();
+        assert!(
+            after_count < before_count,
+            "sweep should have removed expired entries (before: {before_count}, after: {after_count})"
+        );
+        assert!(
+            after_count <= SWEEP_THRESHOLD + 10,
+            "most expired entries should be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_removes_expired_buckets() {
+        let rl = RateLimiter::default();
+        let short_window = Duration::from_millis(10);
+
+        // Create several buckets with short windows
+        for i in 0..50 {
+            assert!(rl.check(&format!("key-{i}"), "test", 1, short_window).await);
+        }
+
+        // Wait for expiry
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Prune should remove expired entries
+        let removed = rl.prune().await.unwrap();
+        assert!(removed > 0, "prune should have removed expired buckets");
+    }
+
     #[test]
     fn client_ip_uses_socket_peer_without_a_trusted_proxy() {
         let empty = HeaderMap::new();
