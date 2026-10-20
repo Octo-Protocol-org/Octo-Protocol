@@ -113,6 +113,9 @@ pub async fn relay_signed_transaction(
     wallet: &octo_store::Wallet,
     signed_xdr: &str,
 ) -> ApiResult<RelayOutcome> {
+    // Hold the account lock across validation, the Horizon submit, and persistence.
+    // This makes concurrent withdrawal requests observe the post-submit sequence.
+    let _sequence_guard = state.sequence_lock(wallet.stellar_account_g.clone()).await;
     // Pure validation: v1 envelope, ≥1 signature, source == this wallet, op allowlist.
     let payment = validate_signed_xdr(signed_xdr, &wallet.stellar_account_g)?;
 

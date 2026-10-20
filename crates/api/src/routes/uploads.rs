@@ -17,6 +17,13 @@ use sha2::{Digest, Sha256};
 /// Folder every payment-link image lands in, so uploads can't scatter across the account.
 const UPLOAD_FOLDER: &str = "octo/payment-links";
 
+/// Build the canonical Cloudinary signature for the fixed upload parameter set. Keeping this
+/// pure makes the exact signed payload testable without credentials or an HTTP server.
+pub fn cloudinary_signature(folder: &str, timestamp: i64, api_secret: &str) -> String {
+    let to_sign = format!("folder={folder}&timestamp={timestamp}{api_secret}");
+    hex::encode(Sha256::digest(to_sign.as_bytes()))
+}
+
 #[derive(Debug, Serialize)]
 pub struct UploadSignature {
     pub cloud_name: String,
@@ -50,11 +57,7 @@ pub async fn upload_signature(
     // Cloudinary validates both SHA-1 (its SDK default) and SHA-256; SHA-256 is used here as the
     // stronger option — the client must not send any param that isn't signed below, or the
     // signature check fails, which is exactly what pins uploads to this folder.
-    let to_sign = format!(
-        "folder={}&timestamp={}{}",
-        UPLOAD_FOLDER, timestamp, cfg.api_secret
-    );
-    let signature = hex::encode(Sha256::digest(to_sign.as_bytes()));
+    let signature = cloudinary_signature(UPLOAD_FOLDER, timestamp, &cfg.api_secret);
 
     Ok(Envelope::ok(UploadSignature {
         cloud_name: cfg.cloud_name,
@@ -63,4 +66,17 @@ pub async fn upload_signature(
         folder: UPLOAD_FOLDER.to_string(),
         signature,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cloudinary_signature;
+
+    #[test]
+    fn cloudinary_signature_matches_known_answer() {
+        assert_eq!(
+            cloudinary_signature("octo/payment-links", 1_700_000_000, "test-secret"),
+            "dc35a5c6293acd15c03beb32429415160bcb09f30e7a10d7ffa933c69908a443"
+        );
+    }
 }
