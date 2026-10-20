@@ -11,7 +11,7 @@ use octo_store::{AuditChainKey, Store, AUDIT_CHAIN_KEY_LEN};
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::sync::Arc;
-use std::{fmt, fmt::Formatter};
+use std::{collections::HashMap, fmt, fmt::Formatter};
 use zeroize::Zeroizing;
 
 /// Cloneable, shared API state.
@@ -70,6 +70,8 @@ struct Inner {
     /// Cloudinary credentials for signed image uploads; `None` when unconfigured, in which case
     /// the upload endpoint reports that the feature is off rather than failing obscurely.
     cloudinary: Option<CloudinaryConfig>,
+    /// Serializes submissions that share a Stellar account sequence.
+    sequence_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// Cloudinary credentials, read from the environment at startup.
@@ -234,6 +236,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 rate_limiter: crate::rate_limit::RateLimiter::default(),
                 cloudinary: CloudinaryConfig::from_env(),
+                sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 store,
                 master_key,
                 master_key_next,
@@ -273,6 +276,17 @@ impl AppState {
         Ok(key)
     }
 
+    /// Acquire the process-local lock for a source account before reading its sequence and
+    /// submitting a transaction. This prevents concurrent requests from signing/submitting the
+    /// same sequence; Horizon remains the final authority after process restarts.
+    pub async fn sequence_lock(&self, source_account: impl Into<String>) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = source_account.into();
+        let lock = {
+            let mut locks = self.inner.sequence_locks.lock().await;
+            locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        };
+        lock.lock_owned().await
+    }
     pub fn store(&self) -> &Store {
         &self.inner.store
     }

@@ -245,6 +245,9 @@ pub async fn sponsor(
 ) -> ApiResult<(StatusCode, Json<Envelope<SponsorResponse>>)> {
     // Login JWT or API key, scoped to this wallet.
     authorize_wallet_scope(&headers, &state, wallet_id, "sponsor").await?;
+    // Serialize fee-bump submissions for this wallet so two callers cannot pass the same
+    // sequence preflight concurrently. The guard is held through Horizon submission.
+    let _sequence_guard = state.sequence_lock(wallet_id.to_string()).await;
 
     let req: SponsorRequest = parse_optional(&body)?;
     let Preflight {
