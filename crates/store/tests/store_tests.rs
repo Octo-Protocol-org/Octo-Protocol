@@ -1587,3 +1587,85 @@ async fn idempotency_key_claims_replays_and_rejects_mismatches() {
         IdempotencyClaim::Claimed
     );
 }
+
+// ---------------------------------------------------------------------------
+// #491 — Concurrent deposit insert dedup across pool connections
+// ---------------------------------------------------------------------------
+
+/// Spin up `concurrency` tasks that all try to insert the **same** `horizon_op_id` at the same
+/// time, each on its own pooled connection.  Exactly one row must land and exactly one webhook
+/// enqueue (i.e. `Ok(Some(_))`) must be returned; every other attempt must be a benign
+/// `Ok(None)` (the unique-index dedup path), never an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_deposit_insert_dedup_across_connections() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let tx_hash = Uuid::new_v4().to_string();
+    let horizon_op_id = format!("{tx_hash}-0");
+
+    let dep = NewDeposit {
+        wallet_id,
+        address_id: None,
+        asset_code: "USDC".into(),
+        asset_issuer: Some("GISSUER".into()),
+        amount_stroops: 10_000_000,
+        source_account: Some("Gsender".into()),
+        destination_account: Some("Gdest".into()),
+        stellar_tx_hash: tx_hash.clone(),
+        operation_index: 0,
+        horizon_op_id: horizon_op_id.clone(),
+        ledger: Some(999),
+        memo_id: None,
+    };
+
+    // Fan out 20 concurrent tasks — enough to stress the unique-index dedup path across the
+    // pool while staying well within a typical test Postgres connection limit.
+    const CONCURRENCY: usize = 20;
+    let mut handles = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let store = store.clone();
+        let dep = dep.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .record_deposit(&dep)
+                .await
+                .expect("record_deposit must never return Err on a dedup race")
+        }));
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
+
+    let inserted: Vec<_> = results.iter().filter(|r| r.is_some()).collect();
+    let deduped: Vec<_> = results.iter().filter(|r| r.is_none()).collect();
+
+    assert_eq!(
+        inserted.len(),
+        1,
+        "exactly one task must win the insert; got {}: {:?}",
+        inserted.len(),
+        inserted
+    );
+    assert_eq!(
+        deduped.len(),
+        CONCURRENCY - 1,
+        "every other task must get the silent dedup (Ok(None)); got {}",
+        deduped.len()
+    );
+
+    // One row in the ledger — no phantom double-credits.
+    let rows = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .expect("list transactions");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one transaction row must exist after {} concurrent inserts",
+        CONCURRENCY
+    );
+    assert_eq!(rows[0].horizon_op_id.as_deref(), Some(horizon_op_id.as_str()));
+}
