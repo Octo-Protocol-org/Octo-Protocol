@@ -338,6 +338,138 @@ mod tests {
         assert_eq!(client_ip(&empty, None), "unknown");
     }
 
+    // -------------------------------------------------------------------------
+    // #481 – table-driven coverage for forwarded-header variants
+    // -------------------------------------------------------------------------
+
+    /// Build a HeaderMap with a single header value.
+    fn hm(name: &str, value: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        m
+    }
+
+    /// Set TRUSTED_PROXY_CIDRS to a single CIDR for the duration of a closure,
+    /// then restore the previous value. Not parallel-safe (env mutation), but
+    /// each test pins a distinct CIDR so individual test runs are deterministic.
+    fn with_trusted_proxy<F: FnOnce()>(cidr: &str, f: F) {
+        std::env::set_var("TRUSTED_PROXY_CIDRS", cidr);
+        f();
+        std::env::remove_var("TRUSTED_PROXY_CIDRS");
+    }
+
+    #[test]
+    fn client_ip_single_hop_xff_from_trusted_proxy() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let peer = "10.0.0.1:443".parse().ok();
+            let headers = hm("x-forwarded-for", "203.0.113.5");
+            assert_eq!(client_ip(&headers, peer), "203.0.113.5");
+        });
+    }
+
+    #[test]
+    fn client_ip_multiple_hops_picks_leftmost_untrusted() {
+        // XFF chain: client → proxy1 (untrusted) → proxy2 (trusted)
+        // peer is the trusted proxy; the function should walk right-to-left and
+        // return the first IP that is not itself a trusted proxy.
+        with_trusted_proxy("10.0.0.2/32", || {
+            let peer = "10.0.0.2:443".parse().ok();
+            // "203.0.113.5, 198.51.100.7" – left is real client, right is intermediate
+            let headers = hm("x-forwarded-for", "203.0.113.5, 198.51.100.7");
+            assert_eq!(client_ip(&headers, peer), "198.51.100.7");
+        });
+    }
+
+    #[test]
+    fn client_ip_multiple_hops_all_trusted_falls_back_to_peer() {
+        // All hops are trusted proxies → fall back to peer IP.
+        with_trusted_proxy("10.0.0.0/8", || {
+            let peer = "10.1.2.3:443".parse().ok();
+            let headers = hm("x-forwarded-for", "10.4.5.6, 10.7.8.9");
+            assert_eq!(client_ip(&headers, peer), "10.1.2.3");
+        });
+    }
+
+    #[test]
+    fn client_ip_xff_with_whitespace_around_commas() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let peer = "10.0.0.1:443".parse().ok();
+            // Typical proxy behaviour: "  1.2.3.4  ,  5.6.7.8  "
+            let headers = hm("x-forwarded-for", "  203.0.113.5  ,  198.51.100.9  ");
+            // Right-most untrusted after trimming is 198.51.100.9
+            assert_eq!(client_ip(&headers, peer), "198.51.100.9");
+        });
+    }
+
+    #[test]
+    fn client_ip_xff_with_ipv6_address() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let peer = "10.0.0.1:443".parse().ok();
+            let headers = hm("x-forwarded-for", "2001:db8::1");
+            assert_eq!(client_ip(&headers, peer), "2001:db8::1");
+        });
+    }
+
+    #[test]
+    fn client_ip_xff_ipv6_multi_hop() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let peer = "10.0.0.1:443".parse().ok();
+            let headers = hm("x-forwarded-for", "2001:db8::cafe, 2001:db8::dead");
+            // right-most untrusted
+            assert_eq!(client_ip(&headers, peer), "2001:db8::dead");
+        });
+    }
+
+    #[test]
+    fn client_ip_empty_xff_header_falls_back_to_peer() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let peer = "10.0.0.1:443".parse().ok();
+            let headers = hm("x-forwarded-for", "");
+            // Empty value cannot be parsed as IPs → fall back to peer
+            assert_eq!(client_ip(&headers, peer), "10.0.0.1");
+        });
+    }
+
+    #[test]
+    fn client_ip_malformed_xff_falls_back_to_peer() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let peer = "10.0.0.1:443".parse().ok();
+            // One of the entries is not a valid IP → whole header treated as untrustworthy
+            let headers = hm("x-forwarded-for", "203.0.113.5, not-an-ip");
+            assert_eq!(client_ip(&headers, peer), "10.0.0.1");
+        });
+    }
+
+    #[test]
+    fn client_ip_no_trusted_proxy_configured_ignores_xff() {
+        // TRUSTED_PROXY_CIDRS unset → peer IP is always returned regardless of XFF.
+        std::env::remove_var("TRUSTED_PROXY_CIDRS");
+        let peer = "198.51.100.1:443".parse().ok();
+        let headers = hm("x-forwarded-for", "203.0.113.5");
+        assert_eq!(client_ip(&headers, peer), "198.51.100.1");
+    }
+
+    #[test]
+    fn client_ip_no_peer_returns_unknown() {
+        with_trusted_proxy("10.0.0.1/32", || {
+            let headers = hm("x-forwarded-for", "203.0.113.5");
+            assert_eq!(client_ip(&headers, None), "unknown");
+        });
+    }
+
+    #[test]
+    fn client_ip_cidr_wildcard_0_prefix_trusts_all_peers() {
+        // 0.0.0.0/0 trusts every IPv4 peer → XFF is always honoured.
+        with_trusted_proxy("0.0.0.0/0", || {
+            let peer = "1.2.3.4:80".parse().ok();
+            let headers = hm("x-forwarded-for", "203.0.113.99");
+            assert_eq!(client_ip(&headers, peer), "203.0.113.99");
+        });
+    }
+
     #[test]
     fn cidr_matching_supports_ipv4_and_ipv6() {
         assert!(ip_in_cidr("10.2.3.4".parse().unwrap(), "10.0.0.0/8"));

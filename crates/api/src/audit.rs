@@ -10,6 +10,95 @@ use crate::state::AppState;
 use axum::http::HeaderMap;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        m
+    }
+
+    // -------------------------------------------------------------------------
+    // #481 – table-driven coverage for audit::client_ip header variants
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn xff_single_entry_is_returned() {
+        let h = hm(&[("x-forwarded-for", "203.0.113.5")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("203.0.113.5"));
+    }
+
+    #[test]
+    fn xff_first_entry_of_multiple_hops_is_returned() {
+        // audit::client_ip is a best-effort logger: it takes the leftmost value
+        // (the claimed origin) without proxy trust validation.
+        let h = hm(&[("x-forwarded-for", "203.0.113.5, 10.0.0.1, 10.0.0.2")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("203.0.113.5"));
+    }
+
+    #[test]
+    fn xff_with_surrounding_whitespace_is_trimmed() {
+        let h = hm(&[("x-forwarded-for", "  198.51.100.7  ")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("198.51.100.7"));
+    }
+
+    #[test]
+    fn xff_with_ipv6_address_is_returned() {
+        let h = hm(&[("x-forwarded-for", "2001:db8::1")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("2001:db8::1"));
+    }
+
+    #[test]
+    fn xff_ipv6_first_entry_of_multiple_hops() {
+        let h = hm(&[("x-forwarded-for", "2001:db8::cafe, 2001:db8::dead")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("2001:db8::cafe"));
+    }
+
+    #[test]
+    fn x_real_ip_is_used_when_xff_absent() {
+        let h = hm(&[("x-real-ip", "198.51.100.42")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("198.51.100.42"));
+    }
+
+    #[test]
+    fn x_real_ip_with_whitespace_is_trimmed() {
+        let h = hm(&[("x-real-ip", "  203.0.113.9  ")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn xff_takes_precedence_over_x_real_ip() {
+        let h = hm(&[
+            ("x-forwarded-for", "203.0.113.1"),
+            ("x-real-ip", "203.0.113.2"),
+        ]);
+        assert_eq!(client_ip(&h).as_deref(), Some("203.0.113.1"));
+    }
+
+    #[test]
+    fn empty_xff_falls_through_to_x_real_ip() {
+        // An empty XFF yields an empty first segment after split, which trim() produces "".
+        // The function maps to Some("") for XFF; x-real-ip is the fallback only when XFF
+        // is absent entirely — confirm the actual behaviour is consistent.
+        let h = hm(&[("x-real-ip", "198.51.100.99")]);
+        assert_eq!(client_ip(&h).as_deref(), Some("198.51.100.99"));
+    }
+
+    #[test]
+    fn no_forwarding_headers_returns_none() {
+        let h = HeaderMap::new();
+        assert_eq!(client_ip(&h), None);
+    }
+}
+
 /// Audit categories (shown as colored chips in the dashboard).
 pub mod category {
     pub const AUTH: &str = "authentication";

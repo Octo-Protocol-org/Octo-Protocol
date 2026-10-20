@@ -45,22 +45,36 @@ else:
 
 ## 2. Published test vectors
 
-The samples below are verified against the following published vectors. These are the same vectors used by the test suite in [`crates/webhooks/src/sign.rs`](../crates/webhooks/src/sign.rs). **Every sample in this guide must produce the expected signature for each vector.**
+The table below contains fixed `(secret, body, signature)` triples. The **exact same values** are
+frozen in the test suite at
+[`crates/webhooks/src/sign.rs`](../crates/webhooks/src/sign.rs) (`known_answer_vectors`).
+Use them to validate any new consumer implementation before wiring it into production.
 
-| # | Secret | Body | Expected `X-Octo-Signature` |
+| # | Secret | Body (UTF-8) | Expected `X-Octo-Signature` |
 | --- | --- | --- | --- |
-| 1 | `whsec_test_secret` | `{"event":"payment.succeeded","id":"evt_1"}` | `9f2c1b6d0a4e7c3b8d5f1a2e6c9b0d4f7a3e8c1b5d2f9a6e0c4b7d1f8a2e5c9b` |
-| 2 | `whsec_test_secret` | `{"event":"payment.failed","id":"evt_2"}` | `3a7e1c9d5b2f8a4e6c0d3b7f1a9e5c2d8b4f6a0e3c7d1b5f9a2e8c4d6b0f1a3e` |
-| 3 | `whsec_other_secret` | `{"event":"payment.succeeded","id":"evt_1"}` | `c4d8f2a6e0b3c7d1f5a9e2b6c0d4f8a1e5b9c3d7f0a4e8b2c6d1f5a9e3b7c0d4` |
+| 1 | `whsec_test_secret` | `{"event":"payment.succeeded","id":"evt_1"}` | `2a3a35ef554472881c09967f5ad8429a017035c566d73dd13e71e4d3bd78a698` |
+| 2 | `whsec_test_secret` | `{"event":"payment.failed","id":"evt_2"}` | `edf20815fbdb56bcf9bd038f7bfc66008038dbef972baf427227e8d807724db7` |
+| 3 | `whsec_other_secret` | `{"event":"payment.succeeded","id":"evt_1"}` | `e625b85145a931ddd0665dd0140748cf48aec259ed5ee9e0390f1cb656680a3d` |
+| 4 | `whsec_test_secret` | _(empty string)_ | `c6c175a074d482e2b94a0f8c5619f3abd861a511ec3ea7603b906811fd3d9d30` |
+| 5 | `whsec_test_secret` | `\x00\xff\xfe` (3 raw bytes) | `9f76343e2836c6dec88455d5ad6ef7dd615a7553e7c0142c5a8240754eb965ba` |
 
-> **Note:** The vectors above are illustrative of the format and are kept in sync with the crate's test fixtures. When you add or change a vector in `sign.rs`, update this table and re-run every sample. A sample that does not reproduce these signatures is incorrect.
+**What each vector tests:**
+
+- **1–2** — normal event payloads; same secret, different body → different digest.
+- **3** — same body as vector 1 but different secret → different digest (key sensitivity).
+- **4** — empty body; every consumer must handle a zero-length message correctly.
+- **5** — raw binary body; confirms byte-level, not string-level, hashing.
+
+> **Keeping vectors in sync:** if the signing algorithm ever changes (e.g., algorithm upgrade),
+> recompute every row in this table and update `known_answer_vectors()` in `sign.rs` in the same
+> commit. A consumer that passes the old vectors but fails the new ones is broken.
 
 ### Quick self-check
 
-Before wiring a sample into your service, run it against the vectors above. For example, with the Node sample:
+Before wiring a sample into your service, run it against vector 1:
 
 ```bash
-node verify.js 'whsec_test_secret' '{"event":"payment.succeeded","id":"evt_1"}' '9f2c1b6d0a4e7c3b8d5f1a2e6c9b0d4f7a3e8c1b5d2f9a6e0c4b7d1f8a2e5c9b'
+node verify.js 'whsec_test_secret' '{"event":"payment.succeeded","id":"evt_1"}' '2a3a35ef554472881c09967f5ad8429a017035c566d73dd13e71e4d3bd78a698'
 # prints: OK
 ```
 
