@@ -349,4 +349,241 @@ mod tests {
         assert!(b.text.contains("o'brien&co@b.test"));
         assert!(b.html.contains("o&#x27;brien&amp;co@b.test"));
     }
+
+    // -------------------------------------------------------------------------
+    // #486 – template rendering and HTML-escaping suite
+    // -------------------------------------------------------------------------
+
+    // --- html_escape unit tests ---
+
+    #[test]
+    fn html_escape_encodes_all_five_special_chars() {
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#x27;");
+    }
+
+    #[test]
+    fn html_escape_leaves_safe_chars_unchanged() {
+        let safe = "hello world 123 !@#$%^*()-_=+[]{}|;:,.?/`~";
+        assert_eq!(html_escape(safe), safe);
+    }
+
+    #[test]
+    fn html_escape_handles_empty_string() {
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_handles_string_with_all_special_chars_mixed() {
+        let input = "<script>alert('xss' & \"injection\")</script>";
+        let escaped = html_escape(input);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('\''));
+        assert!(!escaped.contains('"'));
+        assert!(!escaped.contains('&'));
+        // Round-trip: escaped must not contain any raw injection characters
+        assert!(escaped.contains("&lt;") && escaped.contains("&gt;"));
+        assert!(escaped.contains("&#x27;") && escaped.contains("&quot;"));
+        assert!(escaped.contains("&amp;"));
+    }
+
+    #[test]
+    fn html_escape_handles_multibyte_unicode_without_corruption() {
+        let input = "こんにちは <world> & \"友\"";
+        let escaped = html_escape(input);
+        // Unicode chars pass through; only the ASCII specials are substituted.
+        assert!(escaped.contains("こんにちは"));
+        assert!(escaped.contains("友"));
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+    }
+
+    // --- otp_email ---
+
+    #[test]
+    fn otp_email_contains_the_code_verbatim_in_html() {
+        let b = otp_email("987654", "signup");
+        assert!(b.html.contains("987654"));
+        assert!(b.text.contains("987654"));
+    }
+
+    #[test]
+    fn otp_email_renders_all_recognised_purposes() {
+        let purposes = [
+            ("withdrawal", "confirm a withdrawal"),
+            ("password_reset", "reset your password"),
+            ("email_change", "confirm your new email address"),
+            ("account_export", "export your account data"),
+            ("account_delete", "permanently delete your account"),
+            ("signup", "verify your email"),
+            ("unknown_purpose", "verify your email"),
+        ];
+        for (purpose, expected_action) in purposes {
+            let b = otp_email("000000", purpose);
+            assert!(
+                b.html.contains(expected_action),
+                "purpose={purpose}: HTML missing expected action text"
+            );
+            assert!(
+                b.text.contains(expected_action),
+                "purpose={purpose}: plain text missing expected action text"
+            );
+        }
+    }
+
+    #[test]
+    fn otp_email_html_does_not_escape_the_numeric_code() {
+        // The OTP is server-generated digits; no escaping should alter it.
+        let b = otp_email("123456", "signup");
+        assert!(b.html.contains("123456"), "code must appear unmodified in HTML");
+    }
+
+    // --- welcome_email ---
+
+    #[test]
+    fn welcome_email_escapes_special_chars_in_address() {
+        let hostile_addr = "<script>alert(1)</script>@example.com";
+        let b = welcome_email(hostile_addr);
+        assert!(!b.html.contains("<script>"), "raw <script> must not appear in HTML");
+        assert!(b.html.contains("&lt;script&gt;"), "address must be HTML-escaped");
+        // Plain-text part: no HTML escaping, but control chars stripped
+        assert!(b.text.contains("<script>alert(1)</script>@example.com") || b.text.contains("<script>"),
+            "text part should contain the raw address (no HTML escaping)");
+    }
+
+    #[test]
+    fn welcome_email_escapes_ampersand_in_address() {
+        let b = welcome_email("user+tag&test@example.com");
+        assert!(b.html.contains("user+tag&amp;test@example.com"));
+        assert!(b.text.contains("user+tag&test@example.com"));
+    }
+
+    #[test]
+    fn welcome_email_strips_newline_injection_in_text_part() {
+        let b = welcome_email("user@example.com\nX-Header: injected");
+        assert!(!b.text.contains("\nX-Header"), "newline injection must be stripped from text");
+    }
+
+    // --- email_changed_email ---
+
+    #[test]
+    fn email_changed_escapes_html_in_new_address() {
+        let b = email_changed_email("<b>attacker</b>@evil.com");
+        assert!(!b.html.contains("<b>"), "raw tags must not appear in HTML");
+        assert!(b.html.contains("&lt;b&gt;"), "tags must be HTML-escaped");
+    }
+
+    #[test]
+    fn email_changed_strips_carriage_return_in_text() {
+        let b = email_changed_email("user@example.com\r\nBcc: attacker@evil.com");
+        assert!(!b.text.contains('\r'), "CR must be stripped from text part");
+    }
+
+    #[test]
+    fn email_changed_text_part_mentions_the_new_address() {
+        let b = email_changed_email("new@example.com");
+        assert!(b.text.contains("new@example.com"));
+    }
+
+    // --- withdrawal_success_email ---
+
+    #[test]
+    fn withdrawal_success_escapes_hostile_asset_destination_and_hash() {
+        let b = withdrawal_success_email("10.00", "<XSS>", "dest&<>", "hash\"val");
+        assert!(!b.html.contains("<XSS>"), "raw tag in asset must be escaped");
+        assert!(b.html.contains("&lt;XSS&gt;"));
+        assert!(!b.html.contains("dest&<>"));
+        assert!(b.html.contains("dest&amp;&lt;&gt;"));
+        assert!(!b.html.contains("hash\"val"));
+        assert!(b.html.contains("hash&quot;val"));
+    }
+
+    #[test]
+    fn withdrawal_success_text_part_contains_raw_values_without_html_entities() {
+        let b = withdrawal_success_email("5.00", "USDC", "GDEST1234", "txhash");
+        assert!(b.text.contains("USDC"));
+        assert!(b.text.contains("GDEST1234"));
+        assert!(b.text.contains("txhash"));
+        assert!(!b.text.contains("&amp;"), "text part must not contain HTML entities");
+    }
+
+    #[test]
+    fn withdrawal_success_text_strips_newline_injection_in_all_fields() {
+        let b = withdrawal_success_email(
+            "1.00",
+            "USDC\nX-Extra: hdr",
+            "GDEST\rinjected",
+            "hash\ninjected",
+        );
+        assert!(!b.text.contains("X-Extra"), "newline injection in asset must be stripped");
+        assert!(!b.text.contains('\r'), "CR in destination must be stripped");
+        assert!(!b.text.contains("hash\ninjected"), "newline in hash must be stripped");
+    }
+
+    // --- withdrawal_failed_email ---
+
+    #[test]
+    fn withdrawal_failed_escapes_hostile_reason() {
+        let b = withdrawal_failed_email("1.00", "USDC", "GDEST", "<script>alert('fail')</script>");
+        assert!(!b.html.contains("<script>"), "raw script tag in reason must be escaped");
+        assert!(b.html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn withdrawal_failed_text_contains_reason_without_html_escaping() {
+        let b = withdrawal_failed_email("1.00", "USDC", "GDEST", "op_bad_auth & timeout");
+        assert!(b.text.contains("op_bad_auth & timeout"));
+        assert!(!b.text.contains("&amp;"), "text must not HTML-escape the reason");
+    }
+
+    // --- account_deleted_email ---
+
+    #[test]
+    fn account_deleted_email_returns_non_empty_html() {
+        let html = account_deleted_email();
+        assert!(!html.is_empty());
+        assert!(html.contains("deleted"), "should mention deletion");
+    }
+
+    // --- Cross-template: all HTML outputs must close every opened tag ---
+
+    #[test]
+    fn all_templates_produce_html_containing_div_and_closing_div() {
+        let bodies = [
+            otp_email("000000", "signup").html,
+            email_changed_email("a@b.test").html,
+            welcome_email("user@example.com").html,
+            withdrawal_success_email("1.0", "XLM", "GDEST", "abc123").html,
+            withdrawal_failed_email("1.0", "XLM", "GDEST", "error").html,
+            account_deleted_email(),
+        ];
+        for html in &bodies {
+            let opens = html.matches("<div").count();
+            let closes = html.matches("</div>").count();
+            assert_eq!(opens, closes, "unbalanced <div> tags in template output");
+        }
+    }
+
+    // --- extract_otp ---
+
+    #[test]
+    fn extract_otp_returns_none_for_empty_string() {
+        assert_eq!(extract_otp(""), None);
+    }
+
+    #[test]
+    fn extract_otp_returns_none_when_marker_absent() {
+        assert_eq!(extract_otp("<html>no otp here</html>"), None);
+    }
+
+    #[test]
+    fn extract_otp_returns_none_when_code_is_not_all_digits() {
+        // Forge a marker but with a non-digit payload
+        let fake = format!("{}abcdef", "letter-spacing:6px;color:#fff;\">");
+        assert_eq!(extract_otp(&fake), None);
+    }
 }
