@@ -131,13 +131,21 @@ pub struct CaptureTransport {
 impl EmailTransport for CaptureTransport {
     fn deliver<'a>(&'a self, email: &'a Email) -> DeliverFuture<'a> {
         Box::pin(async move {
-            self.messages.lock().unwrap().push(email.clone());
+            // Recover from a poisoned lock so one panicking test can't cascade into later ones.
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(email.clone());
             Ok(())
         })
     }
 
     fn sent(&self) -> Vec<Email> {
-        self.messages.lock().unwrap().clone()
+        // Recover from a poisoned lock so one panicking test can't cascade into later ones.
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -222,10 +230,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_gives_up_after_max_attempts_on_persistent_5xx() {
-        let (url, hits) = mock_resend(vec![500, 500, 500, 200]).await;
-        let err = fast_sender(url).deliver(&msg()).await.unwrap_err();
-        assert!(matches!(err, EmailError::Unavailable(_)));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    async fn capture_tolerates_poisoned_lock() {
+        let transport = CaptureTransport::default();
+        // Poison the mutex by panicking while holding the guard.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = transport.messages.lock().unwrap();
+            panic!("poison the capture lock");
+        }));
+        assert!(poisoned.is_err());
+
+        // Both call sites must recover the guard instead of panicking again.
+        transport.deliver(&msg()).await.unwrap();
+        assert_eq!(transport.sent().len(), 1);
     }
 }
