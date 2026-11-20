@@ -362,3 +362,8 @@ Early development — built step by step. See the workspace crates for what's im
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-649 -->
+- #649: fix(webhooks): Tolerate a poisoned attempt-outcome mutex in the delivery retry closure
