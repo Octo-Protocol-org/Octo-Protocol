@@ -18,8 +18,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MAIN_RS="$ROOT_DIR/bin/server/src/main.rs"
 CONFIG_RS="$ROOT_DIR/crates/store/src/config.rs"
+CRATES_DIR="$ROOT_DIR/crates"
 ENV_EXAMPLE="$ROOT_DIR/.env.example"
 DOC="$ROOT_DIR/docs/environment-variables.md"
+
+# Variables that are only read by tests (or otherwise intentionally not part of
+# the documented runtime configuration). Names listed here are ignored when
+# comparing the code against the doc and .env.example.
+ALLOWLIST=(
+    # test-only variables
+)
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -40,27 +48,60 @@ err() {
 
 : > "$CODE_VARS"
 
-# bin/server/src/main.rs: env::var("NAME") / env::var_os("NAME")
-if [[ -f "$MAIN_RS" ]]; then
-    grep -oE 'env::var(_os)?\("([A-Za-z_][A-Za-z0-9_]*)"\)' "$MAIN_RS" \
+# Extract env::var("NAME") / env::var_os("NAME") and
+# parse_env("NAME", ...) / secs_env("NAME", ...) from a single file.
+scan_file() {
+    local file="$1"
+    grep -oE 'env::var(_os)?\("([A-Za-z_][A-Za-z0-9_]*)"\)' "$file" \
         | sed -E 's/.*\("([A-Za-z_][A-Za-z0-9_]*)"\).*/\1/' \
         >> "$CODE_VARS" || true
+    grep -oE '(parse_env|secs_env)\("([A-Za-z_][A-Za-z0-9_]*)"' "$file" \
+        | sed -E 's/.*\("([A-Za-z_][A-Za-z0-9_]*)"$/\1/' \
+        >> "$CODE_VARS" || true
+}
+
+# bin/server/src/main.rs
+if [[ -f "$MAIN_RS" ]]; then
+    scan_file "$MAIN_RS"
 else
     err "missing file: $MAIN_RS"
     fail=1
 fi
 
-# crates/store/src/config.rs: parse_env("NAME", ...) / secs_env("NAME", ...)
+# crates/store/src/config.rs
 if [[ -f "$CONFIG_RS" ]]; then
-    grep -oE '(parse_env|secs_env)\("([A-Za-z_][A-Za-z0-9_]*)"' "$CONFIG_RS" \
-        | sed -E 's/.*\("([A-Za-z_][A-Za-z0-9_]*)"$/\1/' \
-        >> "$CODE_VARS" || true
+    scan_file "$CONFIG_RS"
 else
     err "missing file: $CONFIG_RS"
     fail=1
 fi
 
+# Every other crate source file under crates/*/src/**, excluding tests.
+if [[ -d "$CRATES_DIR" ]]; then
+    while IFS= read -r -d '' file; do
+        # Skip the store config file, already scanned above.
+        [[ "$file" == "$CONFIG_RS" ]] && continue
+        scan_file "$file"
+    done < <(
+        find "$CRATES_DIR" -type f -name '*.rs' -path '*/src/*' \
+            ! -path '*/src/tests/*' \
+            ! -name '*_test.rs' \
+            ! -name 'tests.rs' \
+            -print0
+    )
+else
+    err "missing directory: $CRATES_DIR"
+    fail=1
+fi
+
 sort -u -o "$CODE_VARS" "$CODE_VARS"
+
+# Drop allowlisted (e.g. test-only) variables.
+if [[ "${#ALLOWLIST[@]}" -gt 0 ]]; then
+    printf '%s\n' "${ALLOWLIST[@]}" | sort -u > "$TMP_DIR/allowlist.txt"
+    comm -23 "$CODE_VARS" "$TMP_DIR/allowlist.txt" > "$TMP_DIR/code_filtered.txt"
+    mv "$TMP_DIR/code_filtered.txt" "$CODE_VARS"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Variables present in .env.example.
