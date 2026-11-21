@@ -106,10 +106,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_inclusive_time_window_and_fee_ceiling_limits() {
+        assert!(SigningPolicy::new(1, 50, 100).is_ok());
+        assert!(SigningPolicy::new(86_400, 50, 100).is_ok());
+    }
+
+    #[test]
     fn rejects_unbounded_or_invalid_signing_settings() {
         assert!(SigningPolicy::new(0, 50, 500).is_err());
         assert!(SigningPolicy::new(86_401, 50, 500).is_err());
         assert!(SigningPolicy::new(300, 75, 500).is_err());
         assert!(SigningPolicy::new(300, 50, 99).is_err());
+    }
+
+    #[test]
+    fn boundary_errors_name_the_offending_variable() {
+        let err = SigningPolicy::new(86_401, 50, 100).unwrap_err();
+        assert!(err.contains("STELLAR_TX_MAX_AGE_SECS"), "{err}");
+        let err = SigningPolicy::new(300, 50, 99).unwrap_err();
+        assert!(err.contains("STELLAR_FEE_CEILING_STROOPS"), "{err}");
     }
 }

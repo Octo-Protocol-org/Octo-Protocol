@@ -1,6 +1,6 @@
 # Environment Variables
 
-This document is the authoritative reference for every environment variable read by the server. It is derived directly from the parsing code in `bin/server/src/main.rs` and `crates/store/src/config.rs`. If you add or change a variable in code, update this table — CI enforces that every variable read by the server is documented here (see [Keeping this document in sync](#keeping-this-document-in-sync)).
+This document is the authoritative reference for every environment variable read by the server. It is derived directly from the parsing code across the codebase: `bin/server/src/main.rs`, `crates/store/src/config.rs`, and every non-test source file under `crates/*/src/**/*.rs`. If you add or change a variable in code, update this table — CI enforces that every variable read by the server is documented here (see [Keeping this document in sync](#keeping-this-document-in-sync)).
 
 ## Reference table
 
@@ -43,9 +43,13 @@ This document is the authoritative reference for every environment variable read
 | `SHUTDOWN_DRAIN_TIMEOUT_SECS` | Seconds to allow in-flight requests to drain during graceful shutdown. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `30` | optional | no |
 | `ALLOWED_ORIGINS` | Comma-separated list of origins permitted by CORS. | none (CORS disabled) | optional | no |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated list of CIDR ranges of trusted reverse proxies, used to resolve client IPs from forwarding headers. | none | optional | no |
-| `HORIZON_MAX_ATTEMPTS` | Maximum number of attempts for Horizon requests before giving up. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `3` | optional | no |
-| `HORIZON_BASE_DELAY_MS` | Base backoff delay in milliseconds between Horizon retries. Must be a non-zero integer `<= HORIZON_MAX_DELAY_MS`; malformed or out-of-range values abort startup. | `100` | optional | no |
-| `HORIZON_MAX_DELAY_MS` | Maximum backoff delay in milliseconds between Horizon retries. Must be a non-zero integer `>= HORIZON_BASE_DELAY_MS`; malformed or out-of-range values abort startup. | `5000` | optional | no |
+| `HORIZON_TIMEOUT_SECS` | Timeout in seconds for requests to the Horizon API. | `30` | optional | no |
+| `HORIZON_MAX_RETRIES` | Maximum number of retry attempts for failed Horizon API requests. | `3` | optional | no |
+| `CLOUDINARY_CLOUD_NAME` | Cloudinary cloud name used for image uploads and delivery. | none | optional | no |
+| `CLOUDINARY_API_KEY` | Cloudinary API key used to authenticate upload requests. | none | optional | yes |
+| `CLOUDINARY_API_SECRET` | Cloudinary API secret used to sign upload requests. | none | optional | yes |
+| `OCTO_API_KEY` | API key for the Octo SMS provider. | none | optional | yes |
+| `OCTO_SENDER_ID` | Sender ID (originator) used for outgoing SMS via Octo. | none | optional | no |
 
 ### Required column values
 
@@ -91,4 +95,4 @@ These checks exist to prevent accidentally running production with development d
 
 ## Keeping this document in sync
 
-Every environment variable read by the server must appear in the table above. A CI check compares the variables read in `bin/server/src/main.rs`, `crates/store/src/config.rs` and `crates/resilience/src/lib.rs` (where `ResilienceConfig::from_env` reads the `HORIZON_*` resilience tuning variables) against the variable names documented here and fails the build when a variable is read in code but undocumented (or documented but no longer read). When adding a variable, add its row in the same change.
+Every environment variable read by the server must appear in the table above. A CI check (`scripts/check-env-docs.sh`, run via `just check-env-docs`) scans `bin/server/src/main.rs`, `crates/store/src/config.rs`, and every non-test source file under `crates/*/src/**/*.rs` for `env::var("NAME")` reads, then compares those names against the variables documented here and against `.env.example`. The build fails when a variable is read in code but undocumented, documented but no longer read, or documented but missing from `.env.example`. Test-only variables are exempted via a small allowlist in the script. When adding a variable, add its row here and to `.env.example` in the same change.

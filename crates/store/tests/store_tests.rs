@@ -1734,3 +1734,32 @@ async fn concurrent_deposit_insert_dedup_across_connections() {
     );
     assert_eq!(rows[0].horizon_op_id.as_deref(), Some(horizon_op_id.as_str()));
 }
+
+#[tokio::test]
+async fn purge_expired_tokens_removes_only_expired_rows() {
+    let Some(store) = store().await else { return };
+    let expired = format!("expired-{}", Uuid::new_v4().simple());
+    let live = format!("live-{}", Uuid::new_v4().simple());
+
+    // Insert one already-expired and one still-live denylist row.
+    sqlx::query(
+        "INSERT INTO token_denylist (token_hash, expires_at) VALUES ($1, now() - interval '1 hour'), ($2, now() + interval '1 hour')",
+    )
+    .bind(&expired)
+    .bind(&live)
+    .execute(store.pool())
+    .await
+    .expect("insert denylist rows");
+
+    let purged = store.purge_expired_tokens().await.expect("purge");
+    assert_eq!(purged, 1, "only the expired row must be purged");
+
+    assert!(
+        !store.is_token_denylisted(&expired).await.expect("check expired"),
+        "the expired token must no longer be denylisted"
+    );
+    assert!(
+        store.is_token_denylisted(&live).await.expect("check live"),
+        "the live token must still be denylisted"
+    );
+}

@@ -322,16 +322,7 @@ impl Config {
             old_key
         };
 
-        // --batch-size N from argv, or DEFAULT_BATCH_SIZE.
-        let batch_size = std::env::args()
-            .skip_while(|a| a != "--batch-size")
-            .nth(1)
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(DEFAULT_BATCH_SIZE);
-        // LIMIT 0 returns an empty page, which the loop would misread as "migration complete".
-        if batch_size <= 0 {
-            anyhow::bail!("--batch-size must be a positive integer");
-        }
+        let batch_size = parse_batch_size(std::env::args())?;
 
         let checkpoint_path = std::env::var("MIGRATE_KEYS_CHECKPOINT")
             .map(PathBuf::from)
@@ -349,6 +340,23 @@ impl Config {
     }
 }
 
+/// Parse `--batch-size N` from argv, defaulting to `DEFAULT_BATCH_SIZE` when the flag is absent.
+/// A present-but-invalid value fails loudly rather than silently falling back to the default.
+fn parse_batch_size(args: impl Iterator<Item = String>) -> Result<i64> {
+    let mut args = args.skip_while(|a| a != "--batch-size");
+    if args.next().is_none() {
+        return Ok(DEFAULT_BATCH_SIZE);
+    }
+    let raw = args
+        .next()
+        .context("--batch-size must be a positive integer")?;
+    // LIMIT 0 returns an empty page, which the loop would misread as "migration complete".
+    match raw.parse::<i64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => anyhow::bail!("--batch-size must be a positive integer"),
+    }
+}
+
 fn decode_key(env_var: &str) -> Result<[u8; MASTER_KEY_LEN]> {
     let b64 = std::env::var(env_var).with_context(|| format!("{env_var} is required"))?;
     let raw = base64::engine::general_purpose::STANDARD
@@ -363,4 +371,51 @@ fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> impl Iterator<Item = String> {
+        items.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn batch_size_absent_uses_default() {
+        assert_eq!(parse_batch_size(args(&[])).unwrap(), DEFAULT_BATCH_SIZE);
+        assert_eq!(
+            parse_batch_size(args(&["--dry-run"])).unwrap(),
+            DEFAULT_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn batch_size_valid_is_parsed() {
+        assert_eq!(parse_batch_size(args(&["--batch-size", "100"])).unwrap(), 100);
+        assert_eq!(
+            parse_batch_size(args(&["--dry-run", "--batch-size", "7"])).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn batch_size_non_numeric_is_rejected() {
+        let err = parse_batch_size(args(&["--batch-size", "abc"])).unwrap_err();
+        assert_eq!(err.to_string(), "--batch-size must be a positive integer");
+    }
+
+    #[test]
+    fn batch_size_missing_value_is_rejected() {
+        let err = parse_batch_size(args(&["--batch-size"])).unwrap_err();
+        assert_eq!(err.to_string(), "--batch-size must be a positive integer");
+    }
+
+    #[test]
+    fn batch_size_non_positive_is_rejected() {
+        for value in ["0", "-5"] {
+            let err = parse_batch_size(args(&["--batch-size", value])).unwrap_err();
+            assert_eq!(err.to_string(), "--batch-size must be a positive integer");
+        }
+    }
 }
