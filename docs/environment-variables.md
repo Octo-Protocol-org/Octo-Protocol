@@ -37,14 +37,15 @@ This document is the authoritative reference for every environment variable read
 | `PUBLIC_API_URL` | Public base URL of the API, used when constructing absolute URLs. | none | optional | no |
 | `RESEND_API_KEY` | API key for the Resend email provider. | none | optional | yes |
 | `EMAIL_FROM_ADDRESS` | From address used for outgoing email. | none | optional | no |
-| `INGEST_INTERVAL_SECS` | Seconds between ingestion polling cycles. | `5` | optional | no |
-| `INGEST_PAGE_LIMIT` | Maximum number of records fetched per ingestion page. | `200` | optional | no |
+| `INGEST_INTERVAL_SECS` | Seconds between ingestion polling cycles. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `5` | optional | no |
+| `INGEST_PAGE_LIMIT` | Maximum number of records fetched per ingestion page. Must be an integer in `1..=200`; malformed or out-of-range values abort startup. | `200` | optional | no |
 | `INGEST_LOCK_RETRY_SECS` | Seconds to wait before retrying acquisition of the ingestion advisory lock. See [ha-topology.md](ha-topology.md). | `10` | optional | no |
-| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | Seconds to allow in-flight requests to drain during graceful shutdown. | `30` | optional | no |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | Seconds to allow in-flight requests to drain during graceful shutdown. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `30` | optional | no |
 | `ALLOWED_ORIGINS` | Comma-separated list of origins permitted by CORS. | none (CORS disabled) | optional | no |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated list of CIDR ranges of trusted reverse proxies, used to resolve client IPs from forwarding headers. | none | optional | no |
-| `OCTO_WEBHOOK_AUTO_DISABLE_AFTER` | Number of consecutive failed webhook deliveries after which an endpoint is automatically disabled. See [webhook-consumer-guide.md](webhook-consumer-guide.md) for the auto-disable behaviour. | value defined by `AUTO_DISABLE_ENV` in `octo-webhooks` | optional | no |
-| `OCTO_ALLOW_LOCAL_WEBHOOKS` | Permits webhook endpoints that point at localhost or private addresses. **Development/test only — never enable in production.** | `false` | optional | no |
+| `HORIZON_MAX_ATTEMPTS` | Maximum number of attempts for Horizon requests before giving up. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `3` | optional | no |
+| `HORIZON_BASE_DELAY_MS` | Base backoff delay in milliseconds between Horizon retries. Must be a non-zero integer `<= HORIZON_MAX_DELAY_MS`; malformed or out-of-range values abort startup. | `100` | optional | no |
+| `HORIZON_MAX_DELAY_MS` | Maximum backoff delay in milliseconds between Horizon retries. Must be a non-zero integer `>= HORIZON_BASE_DELAY_MS`; malformed or out-of-range values abort startup. | `5000` | optional | no |
 
 ### Required column values
 
@@ -55,6 +56,10 @@ This document is the authoritative reference for every environment variable read
 ### Argon2 tuning variables
 
 `ARGON2_MEMORY_KIB`, `ARGON2_ITERATIONS` and `ARGON2_PARALLELISM` are parsed once at startup. When a variable is unset the documented default applies; when it is set it must be a valid integer, otherwise the server refuses to start with an error naming the offending variable. The parsed values are shared by password hashing and the password-hash upgrade check, so a misconfiguration can never be silently replaced by a default.
+
+### Horizon tuning variables
+
+`HORIZON_MAX_ATTEMPTS`, `HORIZON_BASE_DELAY_MS` and `HORIZON_MAX_DELAY_MS` are parsed once at startup. When a variable is unset the documented default applies; when it is set it must be a valid integer within the accepted range, otherwise the server refuses to start with an error naming the offending variable. `HORIZON_MAX_ATTEMPTS` must be at least `1`, both delays must be non-zero, and `HORIZON_BASE_DELAY_MS` must not exceed `HORIZON_MAX_DELAY_MS`. A misconfiguration is never silently replaced by a default.
 
 ### Secret column values
 

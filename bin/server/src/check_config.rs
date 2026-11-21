@@ -53,6 +53,7 @@ impl Summary {
                     cfg.ingest_lock_retry.as_secs()
                 ),
             ),
+            // Validated at startup (>= 1s); printed as-is.
             ("SHUTDOWN_DRAIN_TIMEOUT_SECS", cfg.shutdown_drain_timeout.as_secs().to_string()),
             (
                 "Horizon resilience",

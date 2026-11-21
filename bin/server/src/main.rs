@@ -701,14 +701,14 @@ impl Config {
 
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
-        let ingest_interval_secs = std::env::var("INGEST_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
-        let ingest_page_limit = std::env::var("INGEST_PAGE_LIMIT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50);
+        let ingest_interval_secs = Self::parse_env_or("INGEST_INTERVAL_SECS", 5_u64)?;
+        if ingest_interval_secs < 1 {
+            anyhow::bail!("INGEST_INTERVAL_SECS must be >= 1 (got {ingest_interval_secs})");
+        }
+        let ingest_page_limit = Self::parse_env_or("INGEST_PAGE_LIMIT", 50_u32)?;
+        if !(1..=200).contains(&ingest_page_limit) {
+            anyhow::bail!("INGEST_PAGE_LIMIT must be between 1 and 200 (got {ingest_page_limit})");
+        }
 
         let ingest_lock_retry = match std::env::var("INGEST_LOCK_RETRY_SECS") {
             Ok(raw) => match raw.trim().parse::<u64>() {
@@ -718,12 +718,11 @@ impl Config {
             Err(_) => Supervisor::DEFAULT_LOCK_RETRY,
         };
 
-        let shutdown_drain_timeout = Duration::from_secs(
-            std::env::var("SHUTDOWN_DRAIN_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(25),
-        );
+        let shutdown_drain_secs = Self::parse_env_or("SHUTDOWN_DRAIN_TIMEOUT_SECS", 25_u64)?;
+        if shutdown_drain_secs < 1 {
+            anyhow::bail!("SHUTDOWN_DRAIN_TIMEOUT_SECS must be >= 1 (got {shutdown_drain_secs})");
+        }
+        let shutdown_drain_timeout = Duration::from_secs(shutdown_drain_secs);
 
         let run_migrations = match std::env::var("RUN_MIGRATIONS").ok().as_deref() {
             None | Some("true") | Some("1") => true,
@@ -731,7 +730,8 @@ impl Config {
             Some(other) => anyhow::bail!("RUN_MIGRATIONS must be true or false, got {other:?}"),
         };
 
-        let resilience = ResilienceConfig::from_env();
+        let resilience = ResilienceConfig::from_env()
+            .context("invalid HORIZON_* resilience configuration")?;
         let metrics = MetricsConfig::from_env()?;
         // Fail fast on a malformed ARGON2_* value instead of silently using defaults.
         let argon2 = Argon2Settings::from_env()
