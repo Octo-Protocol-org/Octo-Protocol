@@ -60,6 +60,14 @@ This document is the authoritative reference for every environment variable read
 
 Variables marked **yes** carry credentials or key material. Never commit them, log them, or expose them in error messages. Supply them via your secret manager or environment injection.
 
+## Webhooks
+
+| Variable | Values | Scope |
+|---|---|---|
+| `OCTO_ALLOW_LOCAL_WEBHOOKS` | `1` | Development and tests only. Allows webhook delivery to localhost and other otherwise-blocked local targets. |
+
+Do not set `OCTO_ALLOW_LOCAL_WEBHOOKS=1` on mainnet. Server startup rejects this configuration when `NETWORK` is `mainnet` or `public`.
+
 ## Mainnet startup guard
 
 When `NETWORK=mainnet`, the server runs additional validation at startup and refuses to boot if any check fails:

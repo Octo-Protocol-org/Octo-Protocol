@@ -1,4 +1,4 @@
-# Contributing to octo
+# Contributing Guidelines
 
 Thanks for your interest! This project is built incrementally and values correctness and
 security over speed (it handles crypto keys).
@@ -142,7 +142,6 @@ let horizon = mock_horizon::spawn().await; // returns a base URL
 Use this instead of hitting testnet in tests so the suite stays fast and deterministic.
 
 ## Conventions
-=======
 
 - **Commits:** [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
   `docs:`, `refactor:`, `test:`, `chore:`).
@@ -162,3 +161,9 @@ Foundational design decisions live in [`docs/adr/`](docs/adr/) as Architecture D
 ## Branching
 
 Work on a feature branch; open a PR against `main`. CI must be green before merge.
+
+The basic workflow is:
+
+1. Fork the repo
+2. Create a branch
+3. Submit a PR

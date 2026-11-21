@@ -27,7 +27,7 @@ use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
 use octo_store::{AuditChainKey, AuditChainStatus, Store, StoreConfig};
 use octo_wallet_core::StellarNetwork;
-use octo_webhooks::WebhookSender;
+use octo_webhooks::{allow_local_webhooks, WebhookSender};
 use std::future::IntoFuture;
 use std::fmt;
 use std::time::Duration;
@@ -661,6 +661,7 @@ impl Config {
         // Accepted values: "mainnet" | "public", "testnet" | "test", "standalone".
         let network = StellarNetwork::parse(&network_str)
             .with_context(|| format!("invalid NETWORK: {network_str}"))?;
+        mainnet_guard::ensure_webhook_override_is_safe(network, allow_local_webhooks())?;
 
         let horizon_url = std::env::var("HORIZON_URL")
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
