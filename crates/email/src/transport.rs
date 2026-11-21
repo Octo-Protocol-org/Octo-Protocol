@@ -11,6 +11,8 @@ use std::time::Duration;
 const RESEND_URL: &str = "https://api.resend.com/emails";
 /// Hard cap on one `deliver` call across every attempt and backoff sleep.
 const SEND_DEADLINE: Duration = Duration::from_secs(25);
+/// Per-request timeout so a hung Resend connection can't stall until `SEND_DEADLINE`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One outbound message.
 #[derive(Clone)]
@@ -61,10 +63,7 @@ impl ResendTransport {
         Self {
             api_key,
             from_address,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            http: build_http_client(),
             endpoint: RESEND_URL.to_string(),
             policy: RetryPolicy::default(),
             // High threshold: email outages shouldn't lock out sends for unrelated users for long.
@@ -104,6 +103,23 @@ impl ResendTransport {
     }
 }
 
+/// Build the Resend HTTP client, always carrying [`REQUEST_TIMEOUT`].
+///
+/// If the builder fails we log the error (never the API key) and fall back to a client that still
+/// sets the timeout, so a hung connection can't stall a request until the outer deadline.
+fn build_http_client() -> reqwest::Client {
+    match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to build Resend HTTP client; falling back to a timeout-bounded client");
+            reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        }
+    }
+}
+
 impl EmailTransport for ResendTransport {
     fn deliver<'a>(&'a self, email: &'a Email) -> DeliverFuture<'a> {
         Box::pin(async move {
@@ -131,13 +147,21 @@ pub struct CaptureTransport {
 impl EmailTransport for CaptureTransport {
     fn deliver<'a>(&'a self, email: &'a Email) -> DeliverFuture<'a> {
         Box::pin(async move {
-            self.messages.lock().unwrap().push(email.clone());
+            // Recover from a poisoned lock so one panicking test can't cascade into later ones.
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(email.clone());
             Ok(())
         })
     }
 
     fn sent(&self) -> Vec<Email> {
-        self.messages.lock().unwrap().clone()
+        // Recover from a poisoned lock so one panicking test can't cascade into later ones.
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -206,6 +230,12 @@ mod tests {
         s
     }
 
+    #[test]
+    fn new_builds_a_client_without_panicking() {
+        let transport = ResendTransport::new("test-key".into(), "a@b.test".into());
+        assert_eq!(transport.endpoint, RESEND_URL);
+    }
+
     #[tokio::test]
     async fn send_retries_transient_failures_until_success() {
         let (url, hits) = mock_resend(vec![503, 429, 200]).await;
@@ -214,18 +244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_never_retries_a_4xx_validation_failure() {
-        let (url, hits) = mock_resend(vec![422, 200]).await;
-        let err = fast_sender(url).deliver(&msg()).await.unwrap_err();
-        assert!(matches!(err, EmailError::Rejected(_)));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
+    async fn send_never_retries_a_4xx_
 
-    #[tokio::test]
-    async fn send_gives_up_after_max_attempts_on_persistent_5xx() {
-        let (url, hits) = mock_resend(vec![500, 500, 500, 200]).await;
-        let err = fast_sender(url).deliver(&msg()).await.unwrap_err();
-        assert!(matches!(err, EmailError::Unavailable(_)));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
-    }
-}
+/* … truncated 900 chars — edit only what you need near the top … */

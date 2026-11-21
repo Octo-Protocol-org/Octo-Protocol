@@ -365,5 +365,5 @@ MIT — see [LICENSE](LICENSE).
 
 ## Handsoff notes
 
-<!-- handsoff-issue-648 -->
-- #648: fix(resilience): Recover from poisoned mutexes in CircuitBreaker instead of panicking
+<!-- handsoff-issue-649 -->
+- #649: fix(webhooks): Tolerate a poisoned attempt-outcome mutex in the delivery retry closure
