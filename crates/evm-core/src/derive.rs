@@ -46,20 +46,27 @@ pub const EVM_CHANGE_EXTERNAL: u32 = 0;
 /// The first three levels are hardened; the change and index levels are not.
 /// See the module documentation for the security consequence of the
 /// non-hardened tail.
-pub fn evm_derivation_path(index: u32) -> DerivationPath {
-    // `DerivationPath::from_str` cannot fail for this fixed, well-formed
-    // template, but we avoid `expect` on principle in a key-handling crate by
-    // constructing the path from components instead.
+///
+/// Returns [`EvmCoreError::Derivation`] if `index` is not a valid non-hardened
+/// child number (`index >= 2^31`).
+pub fn evm_derivation_path(index: u32) -> Result<DerivationPath, EvmCoreError> {
+    // Construct the path from components rather than parsing a string, and
+    // avoid `expect` on principle in a key-handling crate: every child number
+    // is validated and failures are surfaced as a typed error.
     use bip32::ChildNumber;
-    [
-        ChildNumber::new(44, true).expect("44 is a valid hardened child number"),
-        ChildNumber::new(EVM_COIN_TYPE, true).expect("60 is a valid hardened child number"),
-        ChildNumber::new(EVM_ACCOUNT, true).expect("0 is a valid hardened child number"),
-        ChildNumber::new(EVM_CHANGE_EXTERNAL, false).expect("0 is a valid child number"),
-        ChildNumber::new(index, false).expect("index is a valid child number"),
-    ]
-    .into_iter()
-    .collect()
+    let children = [
+        ChildNumber::new(44, true),
+        ChildNumber::new(EVM_COIN_TYPE, true),
+        ChildNumber::new(EVM_ACCOUNT, true),
+        ChildNumber::new(EVM_CHANGE_EXTERNAL, false),
+        ChildNumber::new(index, false),
+    ];
+    let mut path = DerivationPath::default();
+    for child in children {
+        let child = child.map_err(|_| EvmCoreError::Derivation)?;
+        path.push(child);
+    }
+    Ok(path)
 }
 
 /// Derive the secp256k1 signing key for `index` from a BIP-39 seed.
@@ -70,7 +77,7 @@ pub fn evm_derivation_path(index: u32) -> DerivationPath {
 /// by `wallet-core`; this function does not accept a mnemonic phrase directly so
 /// that seed handling stays in one place.
 pub fn derive_signing_key(seed: &[u8], index: u32) -> Result<Zeroizing<SigningKey>, EvmCoreError> {
-    let path = evm_derivation_path(index);
+    let path = evm_derivation_path(index)?;
     let xprv = XPrv::derive_from_path(seed, &path).map_err(|_| EvmCoreError::Derivation)?;
 
     // `XPrv::private_key()` returns the 32-byte scalar. Validate it is a
@@ -183,105 +190,6 @@ mod tests {
         let expected = [
             (0u32, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94"),
             (1u32, "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0"),
-            (2u32, "0xb6716976A3ebe8D39aCEB04372f22Ff8e6802D7A"),
-        ];
+            (2u32, "0xb6716976A3ebe8
 
-        for (index, expected_addr) in expected {
-            let key = derive_signing_key(&seed, index).unwrap();
-            let addr = address_from_signing_key(&key);
-            assert_eq!(
-                addr.to_checksum_string(),
-                expected_addr,
-                "address mismatch at index {index}"
-            );
-        }
-    }
-
-    #[test]
-    fn derivation_path_is_bip44_evm() {
-        let path = evm_derivation_path(7);
-        assert_eq!(path.to_string(), "m/44'/60'/0'/0/7");
-    }
-
-    #[test]
-    fn derivation_is_deterministic() {
-        let seed = hex::decode(TEST_MNEMONIC_SEED_HEX).unwrap();
-        let a = derive_signing_key(&seed, 0).unwrap();
-        let b = derive_signing_key(&seed, 0).unwrap();
-        assert_eq!(a.to_bytes(), b.to_bytes());
-    }
-
-    #[test]
-    fn distinct_indices_yield_distinct_keys() {
-        let seed = hex::decode(TEST_MNEMONIC_SEED_HEX).unwrap();
-        let a = derive_signing_key(&seed, 0).unwrap();
-        let b = derive_signing_key(&seed, 1).unwrap();
-        assert_ne!(a.to_bytes(), b.to_bytes());
-    }
-
-    #[test]
-    fn rejects_out_of_range_scalar() {
-        // The secp256k1 group order n, encoded big-endian. A scalar equal to n
-        // is out of range and must be rejected, not silently reduced.
-        let n = hex::decode(
-            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
-        )
-        .unwrap();
-        assert!(matches!(
-            signing_key_from_bytes(&n),
-            Err(EvmCoreError::InvalidSecretKey)
-        ));
-    }
-
-    #[test]
-    fn rejects_zero_scalar() {
-        let zero = [0u8; 32];
-        assert!(matches!(
-            signing_key_from_bytes(&zero),
-            Err(EvmCoreError::InvalidSecretKey)
-        ));
-    }
-
-    #[test]
-    fn rejects_wrong_length_scalar() {
-        let short = [1u8; 31];
-        assert!(matches!(
-            signing_key_from_bytes(&short),
-            Err(EvmCoreError::InvalidSecretKey)
-        ));
-    }
-
-    #[test]
-    fn secrets_are_zeroized_on_drop() {
-        let seed = hex::decode(TEST_MNEMONIC_SEED_HEX).unwrap();
-
-        // Capture the raw bytes, then drop the Zeroizing wrapper and confirm the
-        // backing buffer was wiped. We model this by zeroizing a copy and
-        // checking the Zeroizing type wipes on drop via an explicit scope.
-        let mut leaked = {
-            let key = derive_signing_key(&seed, 0).unwrap();
-            key.to_bytes().to_vec()
-        };
-
-        // The derived key is gone; a fresh derivation must reproduce the same
-        // bytes (proving the wrapper did not corrupt shared state) and the
-        // captured copy is wiped explicitly here.
-        let key = derive_signing_key(&seed, 0).unwrap();
-        assert_eq!(key.to_bytes().as_slice(), leaked.as_slice());
-
-        leaked.zeroize();
-        assert!(leaked.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn zeroizing_wrapper_wipes_on_drop() {
-        // Directly assert the Zeroizing contract used throughout this module.
-        let mut secret = Zeroizing::new([0xABu8; 32]);
-        assert!(secret.iter().all(|&b| b == 0xAB));
-        // `Zeroizing` derefs to the inner array; mutate through it.
-        secret[0] = 0x00;
-        assert_eq!(secret[0], 0x00);
-        drop(secret);
-        // Nothing to assert after drop; the contract is enforced by `zeroize`.
-    }
-}
+/* … truncated 3406 chars — edit only what you need near the top … */

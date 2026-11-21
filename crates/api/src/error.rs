@@ -259,4 +259,42 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "internal server error");
     }
+
+    #[test]
+    fn every_variant_maps_to_one_catalogue_entry() {
+        let variants = [
+            ("BadRequest", ApiError::BadRequest("bad".into())),
+            ("Unauthorized", ApiError::Unauthorized),
+            ("Forbidden", ApiError::Forbidden("no".into())),
+            ("NotFound", ApiError::NotFound),
+            ("Conflict", ApiError::Conflict),
+            ("ConflictWith", ApiError::ConflictWith("conflict".into())),
+            ("Gone", ApiError::Gone("gone".into())),
+            ("TooManyRequests", ApiError::TooManyRequests("slow".into())),
+            ("StaleSequence", ApiError::StaleSequence("stale".into())),
+            ("Internal", ApiError::Internal),
+            ("GatewayTimeout", ApiError::GatewayTimeout("timeout".into())),
+            (
+                "ServiceUnavailable",
+                ApiError::ServiceUnavailable("unavailable".into()),
+            ),
+        ];
+
+        for (name, err) in &variants {
+            let code = err.code();
+            let matches: Vec<_> = ERROR_CODES.iter().filter(|(c, _, _)| *c == code).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "ApiError::{name} code {code:?} must appear exactly once in ERROR_CODES"
+            );
+            let (_, catalogue_status, _) = matches[0];
+            let (status, _) = err.parts();
+            assert_eq!(
+                *catalogue_status,
+                status.as_u16(),
+                "ApiError::{name} code {code:?} status {status} must match catalogue status {catalogue_status}"
+            );
+        }
+    }
 }

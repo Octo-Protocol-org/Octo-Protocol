@@ -8,6 +8,11 @@ This document is the authoritative reference for every environment variable read
 | --- | --- | --- | --- | --- |
 | `NETWORK` | Selects the Stellar network the server targets (`testnet` or `mainnet`). Controls which network passphrase and default endpoints are used, and enables the mainnet startup guard. | `testnet` | always | no |
 | `HORIZON_URL` | Base URL of the Horizon API used to read ledger and account data. | `https://horizon-testnet.stellar.org` (testnet) / `https://horizon.stellar.org` (mainnet) | always | no |
+| `HORIZON_MAX_ATTEMPTS` | Maximum number of attempts (including the first) for read-only Horizon calls before the request fails. | `3` | optional | no |
+| `HORIZON_BASE_DELAY_MS` | Base delay in milliseconds for exponential backoff between Horizon retry attempts. | `200` | optional | no |
+| `HORIZON_MAX_DELAY_MS` | Upper bound in milliseconds on the backoff delay between Horizon retry attempts. | `5000` | optional | no |
+| `HORIZON_CB_FAILURE_THRESHOLD` | Number of consecutive Horizon failures before the circuit breaker opens. | `5` | optional | no |
+| `HORIZON_CB_RESET_TIMEOUT_SECS` | Seconds the circuit breaker stays open before allowing a probe request. | `30` | optional | no |
 | `FRIENDBOT_URL` | Base URL of the Friendbot service used to fund accounts in non-production environments. | `https://friendbot.stellar.org` | optional | no |
 | `DATABASE_URL` | PostgreSQL connection string (host, port, database, user, password). | none | always | yes |
 | `RUN_MIGRATIONS` | Whether the server runs database migrations on startup. See [postgres-roles.md](postgres-roles.md) for the roles required to run migrations. | `false` | optional | no |

@@ -10,16 +10,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use octo_store::IdempotencyClaim;
+use octo_wallet_core::asset::USDC_TESTNET_ISSUER;
 use octo_wallet_core::encode_muxed;
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const USDC_ASSET_CODE: &str = "USDC";
-/// The widely-used testnet USDC issuer (same one the dashboard's trustline flow uses) — v1
-/// payment links are USDC-only, so a submitted payment must actually be this asset, not just
-/// any asset landing at the right address.
-const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 /// Full hosted checkout URL for a payment link's slug.
 fn checkout_url(state: &AppState, slug: &str) -> String {

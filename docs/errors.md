@@ -34,10 +34,13 @@ implementations. The resulting HTTP status is shown below.
 
 | `StoreError` | Resulting `ApiError` | HTTP status |
 | --- | --- | --- |
+| `Conflict` | `Conflict` | 409 Conflict |
+| `NotFound` | `NotFound` | 404 Not Found |
 | `WalletArchived` | `Forbidden` | 403 Forbidden |
+| `InvalidMemoId` | `BadRequest` | 400 Bad Request |
 | `BudgetExceeded` | `TooManyRequests` | 429 Too Many Requests |
-| `StaleSequence` | `BadRequest` | 400 Bad Request |
-| Crypto failures | `Internal` | 500 Internal Server Error |
+| `DuplicateCustomerRef` | `ConflictWith` | 409 Conflict |
+| All other variants (database, migration, audit chain) | `Internal` | 500 Internal Server Error |
 
 ### `From<WalletError>`
 
