@@ -27,6 +27,7 @@ use horizon::{HorizonPayments, PaymentRecord};
 use octo_store::{IngestLeaderLock, NewDeposit, Store, Wallet};
 pub use stream::LiveStreams;
 use stream::StreamSet;
+use octo_wallet_core::asset::USDC_TESTNET_ISSUER;
 use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::collections::HashMap;
@@ -34,11 +35,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-/// The widely-used testnet USDC issuer — must match `crates/api/src/routes/payment_links.rs`'s
-/// constant of the same name (kept separate rather than shared since this crate has no
-/// dependency on `octo-api`).
-const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 /// Shared thread-safe tracker for the last successful poll times of ingestion.
 #[derive(Debug, Clone, Default)]

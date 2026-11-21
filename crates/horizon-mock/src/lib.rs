@@ -51,7 +51,9 @@
 //! ```
 //!
 //! From docker-compose, run the `horizon-mock` binary (see the crate's
-//! `main.rs`); it reads `HORIZON_MOCK_ADDR` (default `0.0.0.0:8000`).
+//! `main.rs`); it reads `HORIZON_MOCK_ADDR` (default `0.0.0.0:8000`). The
+//! binary installs a `tracing` subscriber, so server errors (including bind
+//! failures) are reported through `tracing` rather than raw stderr output.
 
 use std::net::SocketAddr;
 
@@ -256,7 +258,7 @@ pub async fn serve(addr: impl Into<String>) -> std::io::Result<SocketAddr> {
     let local_addr = listener.local_addr()?;
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router()).await {
-            eprintln!("horizon-mock server error: {err}");
+            tracing::error!(error = %err, "horizon-mock server error");
         }
     });
     Ok(local_addr)

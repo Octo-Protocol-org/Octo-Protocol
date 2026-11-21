@@ -82,20 +82,52 @@ pub struct CloudinaryConfig {
     pub api_secret: String,
 }
 
+/// Names of the Cloudinary variables that are unset (missing or empty), in a fixed order.
+/// Pure so it can be unit-tested without touching the process environment.
+fn missing_cloudinary_vars(
+    cloud_name: Option<&str>,
+    api_key: Option<&str>,
+    api_secret: Option<&str>,
+) -> Vec<&'static str> {
+    [
+        ("CLOUDINARY_CLOUD_NAME", cloud_name),
+        ("CLOUDINARY_API_KEY", api_key),
+        ("CLOUDINARY_API_SECRET", api_secret),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_none_or(str::is_empty))
+    .map(|(name, _)| name)
+    .collect()
+}
+
 impl CloudinaryConfig {
     /// Read from `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET`.
-    /// All three must be present, or image uploads stay disabled.
+    /// All three must be present, or image uploads stay disabled. A partial configuration is
+    /// almost certainly a deployment mistake, so warn once naming the missing variables (never
+    /// their values) while keeping uploads disabled.
     fn from_env() -> Option<Self> {
-        let cloud_name = std::env::var("CLOUDINARY_CLOUD_NAME").ok()?;
-        let api_key = std::env::var("CLOUDINARY_API_KEY").ok()?;
-        let api_secret = std::env::var("CLOUDINARY_API_SECRET").ok()?;
-        if cloud_name.is_empty() || api_key.is_empty() || api_secret.is_empty() {
+        let cloud_name = std::env::var("CLOUDINARY_CLOUD_NAME").ok();
+        let api_key = std::env::var("CLOUDINARY_API_KEY").ok();
+        let api_secret = std::env::var("CLOUDINARY_API_SECRET").ok();
+        let missing = missing_cloudinary_vars(
+            cloud_name.as_deref(),
+            api_key.as_deref(),
+            api_secret.as_deref(),
+        );
+        if missing.len() == 3 {
+            return None;
+        }
+        if !missing.is_empty() {
+            tracing::warn!(
+                missing = %missing.join(", "),
+                "Cloudinary is partially configured; image uploads stay disabled"
+            );
             return None;
         }
         Some(Self {
-            cloud_name,
-            api_key,
-            api_secret,
+            cloud_name: cloud_name?,
+            api_key: api_key?,
+            api_secret: api_secret?,
         })
     }
 }
@@ -375,5 +407,79 @@ impl AppState {
 
     pub fn public_api_host(&self) -> Option<&str> {
         self.inner.public_api_host.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_cloudinary_vars;
+
+    #[test]
+    fn no_cloudinary_vars_reports_all_missing() {
+        assert_eq!(
+            missing_cloudinary_vars(None, None, None),
+            vec![
+                "CLOUDINARY_CLOUD_NAME",
+                "CLOUDINARY_API_KEY",
+                "CLOUDINARY_API_SECRET"
+            ]
+        );
+    }
+
+    #[test]
+    fn one_cloudinary_var_reports_the_other_two() {
+        assert_eq!(
+            missing_cloudinary_vars(Some("cloud"), None, None),
+            vec!["CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+        );
+        assert_eq!(
+            missing_cloudinary_vars(None, Some("key"), None),
+            vec!["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_SECRET"]
+        );
+        assert_eq!(
+            missing_cloudinary_vars(None, None, Some("secret")),
+            vec!["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn two_cloudinary_vars_report_the_last_one() {
+        assert_eq!(
+            missing_cloudinary_vars(Some("cloud"), Some("key"), None),
+            vec!["CLOUDINARY_API_SECRET"]
+        );
+        assert_eq!(
+            missing_cloudinary_vars(Some("cloud"), None, Some("secret")),
+            vec!["CLOUDINARY_API_KEY"]
+        );
+        assert_eq!(
+            missing_cloudinary_vars(None, Some("key"), Some("secret")),
+            vec!["CLOUDINARY_CLOUD_NAME"]
+        );
+    }
+
+    #[test]
+    fn all_cloudinary_vars_set_reports_none_missing() {
+        assert!(missing_cloudinary_vars(Some("cloud"), Some("key"), Some("secret")).is_empty());
+    }
+
+    #[test]
+    fn empty_cloudinary_vars_count_as_unset() {
+        assert_eq!(
+            missing_cloudinary_vars(Some(""), Some("key"), Some("secret")),
+            vec!["CLOUDINARY_CLOUD_NAME"]
+        );
+        assert_eq!(
+            missing_cloudinary_vars(Some("cloud"), Some(""), Some("")),
+            vec!["CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+        );
+    }
+
+    #[test]
+    fn missing_names_never_include_values() {
+        let missing = missing_cloudinary_vars(Some("my-cloud"), Some("my-key"), None);
+        assert_eq!(missing, vec!["CLOUDINARY_API_SECRET"]);
+        assert!(missing.iter().all(|name| name.starts_with("CLOUDINARY_")));
+        assert!(!missing.iter().any(|name| name.contains("my-")));
     }
 }

@@ -6,6 +6,10 @@ use crate::error::StoreError;
 use crate::models::Session;
 use crate::Store;
 
+/// Explicit column list for the `sessions` table, matching the [`Session`] model.
+/// Kept in sync with the model so queries don't silently widen when migrations add columns.
+const SESSION_COLUMNS: &str = "id, user_id, user_agent_hash, created_at, last_seen_at, expires_at, revoked_at";
+
 impl Store {
     /// Open a login session. Its id goes into the JWT's `sid` claim.
     pub async fn create_session(
@@ -14,15 +18,16 @@ impl Store {
         user_agent_hash: Option<&str>,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<Session, StoreError> {
-        let row = sqlx::query_as::<_, Session>(
+        let query = format!(
             "INSERT INTO sessions (user_id, user_agent_hash, expires_at)
-             VALUES ($1, $2, $3) RETURNING *",
-        )
-        .bind(user_id)
-        .bind(user_agent_hash)
-        .bind(expires_at)
-        .fetch_one(&self.pool)
-        .await?;
+             VALUES ($1, $2, $3) RETURNING {SESSION_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, Session>(&query)
+            .bind(user_id)
+            .bind(user_agent_hash)
+            .bind(expires_at)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -87,15 +92,16 @@ impl Store {
 
     /// A user's live (unrevoked, unexpired) sessions, most recently used first. Capped at 100.
     pub async fn list_active_sessions(&self, user_id: Uuid) -> Result<Vec<Session>, StoreError> {
-        let rows = sqlx::query_as::<_, Session>(
-            "SELECT * FROM sessions
+        let query = format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions
              WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
              ORDER BY last_seen_at DESC, id
-             LIMIT 100",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+             LIMIT 100"
+        );
+        let rows = sqlx::query_as::<_, Session>(&query)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
