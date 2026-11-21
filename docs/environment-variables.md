@@ -37,10 +37,10 @@ This document is the authoritative reference for every environment variable read
 | `PUBLIC_API_URL` | Public base URL of the API, used when constructing absolute URLs. | none | optional | no |
 | `RESEND_API_KEY` | API key for the Resend email provider. | none | optional | yes |
 | `EMAIL_FROM_ADDRESS` | From address used for outgoing email. | none | optional | no |
-| `INGEST_INTERVAL_SECS` | Seconds between ingestion polling cycles. | `5` | optional | no |
-| `INGEST_PAGE_LIMIT` | Maximum number of records fetched per ingestion page. | `200` | optional | no |
+| `INGEST_INTERVAL_SECS` | Seconds between ingestion polling cycles. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `5` | optional | no |
+| `INGEST_PAGE_LIMIT` | Maximum number of records fetched per ingestion page. Must be an integer in `1..=200`; malformed or out-of-range values abort startup. | `200` | optional | no |
 | `INGEST_LOCK_RETRY_SECS` | Seconds to wait before retrying acquisition of the ingestion advisory lock. See [ha-topology.md](ha-topology.md). | `10` | optional | no |
-| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | Seconds to allow in-flight requests to drain during graceful shutdown. | `30` | optional | no |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | Seconds to allow in-flight requests to drain during graceful shutdown. Must be an integer `>= 1`; malformed or out-of-range values abort startup. | `30` | optional | no |
 | `ALLOWED_ORIGINS` | Comma-separated list of origins permitted by CORS. | none (CORS disabled) | optional | no |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated list of CIDR ranges of trusted reverse proxies, used to resolve client IPs from forwarding headers. | none | optional | no |
 | `HORIZON_TIMEOUT_SECS` | Timeout in seconds for requests to the Horizon API. | `30` | optional | no |
@@ -61,9 +61,21 @@ This document is the authoritative reference for every environment variable read
 
 `ARGON2_MEMORY_KIB`, `ARGON2_ITERATIONS` and `ARGON2_PARALLELISM` are parsed once at startup. When a variable is unset the documented default applies; when it is set it must be a valid integer, otherwise the server refuses to start with an error naming the offending variable. The parsed values are shared by password hashing and the password-hash upgrade check, so a misconfiguration can never be silently replaced by a default.
 
+### Horizon tuning variables
+
+`HORIZON_MAX_ATTEMPTS`, `HORIZON_BASE_DELAY_MS` and `HORIZON_MAX_DELAY_MS` are parsed once at startup. When a variable is unset the documented default applies; when it is set it must be a valid integer within the accepted range, otherwise the server refuses to start with an error naming the offending variable. `HORIZON_MAX_ATTEMPTS` must be at least `1`, both delays must be non-zero, and `HORIZON_BASE_DELAY_MS` must not exceed `HORIZON_MAX_DELAY_MS`. A misconfiguration is never silently replaced by a default.
+
 ### Secret column values
 
 Variables marked **yes** carry credentials or key material. Never commit them, log them, or expose them in error messages. Supply them via your secret manager or environment injection.
+
+## Webhooks
+
+| Variable | Values | Scope |
+|---|---|---|
+| `OCTO_ALLOW_LOCAL_WEBHOOKS` | `1` | Development and tests only. Allows webhook delivery to localhost and other otherwise-blocked local targets. |
+
+Do not set `OCTO_ALLOW_LOCAL_WEBHOOKS=1` on mainnet. Server startup rejects this configuration when `NETWORK` is `mainnet` or `public`.
 
 ## Mainnet startup guard
 

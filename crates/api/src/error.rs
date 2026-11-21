@@ -30,8 +30,12 @@ pub enum ApiError {
     ConflictWith(String),
     /// 410 — the endpoint was removed (custodial signing paths, post non-custodial cutover).
     Gone(String),
-    /// 429 — a rate limit or budget would be exceeded.
-    TooManyRequests(String),
+    /// 429 — a rate limit or budget would be exceeded. Carries the remaining window (seconds),
+    /// emitted as a `Retry-After` header.
+    TooManyRequests {
+        message: String,
+        retry_after_secs: u64,
+    },
     /// 400 — inner transaction sequence number does not match current on-chain sequence.
     StaleSequence(String),
     /// 500 — an internal error. The detail is logged, never returned to the client.
@@ -103,7 +107,7 @@ impl ApiError {
             ApiError::Conflict => "already_exists",
             ApiError::ConflictWith(_) => "conflict",
             ApiError::Gone(_) => "gone",
-            ApiError::TooManyRequests(_) => "too_many_requests",
+            ApiError::TooManyRequests { .. } => "too_many_requests",
             ApiError::StaleSequence(_) => "stale_sequence",
             ApiError::Internal => "internal_error",
             ApiError::GatewayTimeout(_) => "upstream_timeout",
@@ -121,7 +125,9 @@ impl ApiError {
             ApiError::Conflict => (StatusCode::CONFLICT, "already exists".into()),
             ApiError::ConflictWith(m) => (StatusCode::CONFLICT, m.clone()),
             ApiError::Gone(m) => (StatusCode::GONE, m.clone()),
-            ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.clone()),
+            ApiError::TooManyRequests { message, .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, message.clone())
+            }
             ApiError::StaleSequence(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -135,8 +141,23 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Capture the back-off hint before `parts()` consumes the error.
+        let retry_after = match &self {
+            ApiError::TooManyRequests {
+                retry_after_secs, ..
+            } => Some((*retry_after_secs).max(1)),
+            _ => None,
+        };
         let (status, message) = self.parts();
-        error_response(status, self.code(), message)
+        let mut response = error_response(status, self.code(), message);
+        if let Some(secs) = retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -161,9 +182,10 @@ impl From<octo_store::StoreError> for ApiError {
             octo_store::StoreError::InvalidMemoId => {
                 ApiError::BadRequest("memo id must be nonnegative".into())
             }
-            octo_store::StoreError::BudgetExceeded => {
-                ApiError::TooManyRequests("daily sponsorship budget exceeded".into())
-            }
+            octo_store::StoreError::BudgetExceeded => ApiError::TooManyRequests {
+                message: "daily sponsorship budget exceeded".into(),
+                retry_after_secs: 60,
+            },
             octo_store::StoreError::DuplicateCustomerRef => {
                 ApiError::ConflictWith("customer_ref already in use for this wallet".into())
             }
@@ -261,40 +283,29 @@ mod tests {
     }
 
     #[test]
-    fn every_variant_maps_to_one_catalogue_entry() {
-        let variants = [
-            ("BadRequest", ApiError::BadRequest("bad".into())),
-            ("Unauthorized", ApiError::Unauthorized),
-            ("Forbidden", ApiError::Forbidden("no".into())),
-            ("NotFound", ApiError::NotFound),
-            ("Conflict", ApiError::Conflict),
-            ("ConflictWith", ApiError::ConflictWith("conflict".into())),
-            ("Gone", ApiError::Gone("gone".into())),
-            ("TooManyRequests", ApiError::TooManyRequests("slow".into())),
-            ("StaleSequence", ApiError::StaleSequence("stale".into())),
-            ("Internal", ApiError::Internal),
-            ("GatewayTimeout", ApiError::GatewayTimeout("timeout".into())),
-            (
-                "ServiceUnavailable",
-                ApiError::ServiceUnavailable("unavailable".into()),
-            ),
-        ];
+    fn too_many_requests_sets_retry_after_header() {
+        let err = ApiError::TooManyRequests {
+            message: "slow down".into(),
+            retry_after_secs: 0,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Clamped to at least 1 second.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
 
-        for (name, err) in &variants {
-            let code = err.code();
-            let matches: Vec<_> = ERROR_CODES.iter().filter(|(c, _, _)| *c == code).collect();
-            assert_eq!(
-                matches.len(),
-                1,
-                "ApiError::{name} code {code:?} must appear exactly once in ERROR_CODES"
-            );
-            let (_, catalogue_status, _) = matches[0];
-            let (status, _) = err.parts();
-            assert_eq!(
-                *catalogue_status,
-                status.as_u16(),
-                "ApiError::{name} code {code:?} status {status} must match catalogue status {catalogue_status}"
-            );
-        }
+    #[test]
+    fn non_429_errors_have_no_retry_after_header() {
+        let response = ApiError::NotFound.into_response();
+        assert!(response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 }

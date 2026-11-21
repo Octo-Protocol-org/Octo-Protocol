@@ -36,6 +36,7 @@
 //! clearly down), but the retry policy explicitly does not.
 #![forbid(unsafe_code)]
 
+use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -416,30 +417,83 @@ impl Default for ResilienceConfig {
     }
 }
 
+/// Error returned when a `HORIZON_*` tuning variable is unparsable or out of range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    /// Name of the offending environment variable.
+    pub variable: &'static str,
+    /// Human-readable reason the value was rejected.
+    pub reason: String,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {}: {}", self.variable, self.reason)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 impl ResilienceConfig {
-    /// Read configuration from environment variables, falling back to defaults.
+    /// Read configuration from environment variables, falling back to defaults when unset.
     ///
-    /// | Variable | Default | Description |
+    /// Unparsable or out-of-range values are rejected with a [`ConfigError`] naming the variable
+    /// rather than silently defaulting.
+    ///
+    /// | Variable | Default | Accepted range |
     /// |---|---|---|
-    /// | `HORIZON_MAX_ATTEMPTS` | 3 | Retry attempts for read-only calls |
-    /// | `HORIZON_BASE_DELAY_MS` | 200 | Base backoff delay (ms) |
-    /// | `HORIZON_MAX_DELAY_MS` | 5000 | Max backoff delay (ms) |
-    /// | `HORIZON_CB_FAILURE_THRESHOLD` | 5 | Consecutive failures before circuit opens |
-    /// | `HORIZON_CB_RESET_TIMEOUT_SECS` | 30 | Seconds before circuit allows a probe |
-    pub fn from_env() -> Self {
-        fn parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
+    /// | `HORIZON_MAX_ATTEMPTS` | 3 | `>= 1` |
+    /// | `HORIZON_BASE_DELAY_MS` | 200 | `>= 1`, `<= HORIZON_MAX_DELAY_MS` |
+    /// | `HORIZON_MAX_DELAY_MS` | 5000 | `>= 1`, `>= HORIZON_BASE_DELAY_MS` |
+    /// | `HORIZON_CB_FAILURE_THRESHOLD` | 5 | `>= 1` |
+    /// | `HORIZON_CB_RESET_TIMEOUT_SECS` | 30 | `>= 1` |
+    pub fn from_env() -> Result<Self, ConfigError> {
+        fn parse<T: std::str::FromStr>(key: &'static str, default: T) -> Result<T, ConfigError> {
+            match std::env::var(key) {
+                Ok(v) => v.parse().map_err(|_| ConfigError {
+                    variable: key,
+                    reason: "value is not a valid number".to_string(),
+                }),
+                Err(_) => Ok(default),
+            }
         }
-        Self {
-            max_attempts: parse("HORIZON_MAX_ATTEMPTS", 3),
-            base_delay_ms: parse("HORIZON_BASE_DELAY_MS", 200),
-            max_delay_ms: parse("HORIZON_MAX_DELAY_MS", 5_000),
-            cb_failure_threshold: parse("HORIZON_CB_FAILURE_THRESHOLD", 5),
-            cb_reset_timeout_secs: parse("HORIZON_CB_RESET_TIMEOUT_SECS", 30),
+        fn require_min(key: &'static str, value: u64, min: u64) -> Result<(), ConfigError> {
+            if value < min {
+                return Err(ConfigError {
+                    variable: key,
+                    reason: format!("must be >= {min}, got {value}"),
+                });
+            }
+            Ok(())
         }
+
+        let max_attempts: u32 = parse("HORIZON_MAX_ATTEMPTS", 3)?;
+        let base_delay_ms: u64 = parse("HORIZON_BASE_DELAY_MS", 200)?;
+        let max_delay_ms: u64 = parse("HORIZON_MAX_DELAY_MS", 5_000)?;
+        let cb_failure_threshold: u32 = parse("HORIZON_CB_FAILURE_THRESHOLD", 5)?;
+        let cb_reset_timeout_secs: u64 = parse("HORIZON_CB_RESET_TIMEOUT_SECS", 30)?;
+
+        require_min("HORIZON_MAX_ATTEMPTS", u64::from(max_attempts), 1)?;
+        require_min("HORIZON_BASE_DELAY_MS", base_delay_ms, 1)?;
+        require_min("HORIZON_MAX_DELAY_MS", max_delay_ms, 1)?;
+        require_min("HORIZON_CB_FAILURE_THRESHOLD", u64::from(cb_failure_threshold), 1)?;
+        require_min("HORIZON_CB_RESET_TIMEOUT_SECS", cb_reset_timeout_secs, 1)?;
+        if base_delay_ms > max_delay_ms {
+            return Err(ConfigError {
+                variable: "HORIZON_BASE_DELAY_MS",
+                reason: format!(
+                    "must be <= HORIZON_MAX_DELAY_MS ({max_delay_ms}), got {base_delay_ms}"
+                ),
+            });
+        }
+
+        Ok(Self {
+            max_attempts,
+            base_delay_ms,
+            max_delay_ms,
+            cb_failure_threshold,
+            cb_reset_timeout_secs,
+        })
     }
 
     /// Build a [`RetryPolicy`] from this config.
@@ -471,6 +525,104 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
+    // --- ResilienceConfig::from_env -----------------------------------------
+
+    /// Serializes tests that mutate process-wide environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV_KEYS: [&str; 5] = [
+        "HORIZON_MAX_ATTEMPTS",
+        "HORIZON_BASE_DELAY_MS",
+        "HORIZON_MAX_DELAY_MS",
+        "HORIZON_CB_FAILURE_THRESHOLD",
+        "HORIZON_CB_RESET_TIMEOUT_SECS",
+    ];
+
+    /// Run `f` with every `HORIZON_*` variable cleared, restoring the previous values afterwards.
+    fn with_clean_env(f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> = ENV_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in ENV_KEYS {
+            std::env::remove_var(k);
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn config_from_env_uses_defaults_when_unset() {
+        with_clean_env(|| {
+            let cfg = ResilienceConfig::from_env().expect("defaults are valid");
+            assert_eq!(cfg.max_attempts, 3);
+            assert_eq!(cfg.base_delay_ms, 200);
+            assert_eq!(cfg.max_delay_ms, 5_000);
+            assert_eq!(cfg.cb_failure_threshold, 5);
+            assert_eq!(cfg.cb_reset_timeout_secs, 30);
+        });
+    }
+
+    #[test]
+    fn config_from_env_accepts_valid_values() {
+        with_clean_env(|| {
+            std::env::set_var("HORIZON_MAX_ATTEMPTS", "5");
+            std::env::set_var("HORIZON_BASE_DELAY_MS", "100");
+            std::env::set_var("HORIZON_MAX_DELAY_MS", "1000");
+            std::env::set_var("HORIZON_CB_FAILURE_THRESHOLD", "2");
+            std::env::set_var("HORIZON_CB_RESET_TIMEOUT_SECS", "10");
+            let cfg = ResilienceConfig::from_env().expect("valid values accepted");
+            assert_eq!(cfg.max_attempts, 5);
+            assert_eq!(cfg.base_delay_ms, 100);
+            assert_eq!(cfg.max_delay_ms, 1_000);
+            assert_eq!(cfg.cb_failure_threshold, 2);
+            assert_eq!(cfg.cb_reset_timeout_secs, 10);
+        });
+    }
+
+    #[test]
+    fn config_from_env_rejects_malformed_value() {
+        with_clean_env(|| {
+            std::env::set_var("HORIZON_MAX_ATTEMPTS", "not-a-number");
+            let err = ResilienceConfig::from_env().expect_err("malformed value rejected");
+            assert_eq!(err.variable, "HORIZON_MAX_ATTEMPTS");
+        });
+    }
+
+    #[test]
+    fn config_from_env_rejects_zero_attempts() {
+        with_clean_env(|| {
+            std::env::set_var("HORIZON_MAX_ATTEMPTS", "0");
+            let err = ResilienceConfig::from_env().expect_err("zero attempts rejected");
+            assert_eq!(err.variable, "HORIZON_MAX_ATTEMPTS");
+        });
+    }
+
+    #[test]
+    fn config_from_env_rejects_inverted_delays() {
+        with_clean_env(|| {
+            std::env::set_var("HORIZON_BASE_DELAY_MS", "5000");
+            std::env::set_var("HORIZON_MAX_DELAY_MS", "100");
+            let err = ResilienceConfig::from_env().expect_err("inverted delays rejected");
+            assert_eq!(err.variable, "HORIZON_BASE_DELAY_MS");
+        });
+    }
+
+    #[test]
+    fn config_from_env_rejects_zero_threshold() {
+        with_clean_env(|| {
+            std::env::set_var("HORIZON_CB_FAILURE_THRESHOLD", "0");
+            let err = ResilienceConfig::from_env().expect_err("zero threshold rejected");
+            assert_eq!(err.variable, "HORIZON_CB_FAILURE_THRESHOLD");
+        });
+    }
+
     // --- RetryPolicy ---------------------------------------------------------
 
     #[test]
@@ -498,6 +650,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.delay_for(5), Duration::from_millis(2_000));
+    }
+
+    #[test]
+    fn delay_stays_within_jitter_band() {
+        let p = RetryPolicy {
+            base_delay_ms: 100,
+            multiplier: 2.0,
+            max_delay_ms: 10_000,
+            jitter_factor: 0.2,
+            ..Default::default()
+        };
+        for attempt in 0..10 {
+            let expected = (100.0 * 2f64.powi(attempt as i32)).min(10_000.0);
+            let half_band = expected * p.jitter_factor / 2.0;
+            let delay = p.delay_for(attempt).as_millis() as f64;
+            assert!(
+                delay >= expected - half_band && delay <= expected + half_band,
+                "attempt {attempt}: delay {delay}ms outside jitter band [{}, {}]",
+                expected - half_band,
+                expected + half_band
+            );
+            assert!(
+                delay <= p.max_delay_ms as f64,
+                "attempt {attempt}: delay {delay}ms exceeds max {}ms",
+                p.max_delay_ms
+            );
+        }
+    }
+
+    #[test]
+    fn zero_jitter_matches_exponential_delay() {
+        let p = RetryPolicy {
+            base_delay_ms: 100,
+            multiplier: 2.0,
+            max_delay_ms: 10_000,
+            jitter_factor: 0.0,
+            ..Default::default()
+        };
+        for attempt in 0..10 {
+            let expected = (100u64 * 2u64.pow(attempt)).min(10_000);
+            assert_eq!(
+                p.delay_for(attempt),
+                Duration::from_millis(expected),
+                "attempt {attempt}: zero jitter must equal the exponential delay"
+            );
+        }
     }
 
     // --- RetryPolicy property tests (#488) -----------------------------------

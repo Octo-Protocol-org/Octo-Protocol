@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # Octo Seed
 //!
 //! Idempotent demo-data seeder for local and staging environments.

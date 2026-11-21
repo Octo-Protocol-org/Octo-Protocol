@@ -582,6 +582,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PaymentIntentResponse'
+        "429":
+          description: >
+            Rate limit exceeded (`too_many_requests`). The `Retry-After` header carries the
+            remaining window in whole seconds; wait at least that long before retrying.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/pay/{slug}/payments/{payment_id}:
     get:
       summary: Poll a payment's status
@@ -657,6 +668,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SubmitPaymentResponse'
+        "429":
+          description: >
+            Rate limit exceeded (`too_many_requests`). The `Retry-After` header carries the
+            remaining window in whole seconds; wait at least that long before retrying.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/uploads/signature:
     post:
       summary: Get a signed Cloudinary upload signature
@@ -717,6 +739,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/WebhookResponse'
 components:
+  headers:
+    RetryAfter:
+      description: >
+        Seconds to wait before retrying, as a positive integer (the remaining rate-limit
+        window). Present on every 429 `too_many_requests` response.
+      schema:
+        type: integer
+        minimum: 1
+        example: 30
   schemas:
     Envelope:
       type: object
@@ -972,6 +1003,8 @@ components:
       description: >
         Every error response, including framework rejections, unknown routes and the body-size
         limit. Branch on `code` (stable, never renamed or reused); `message` is for humans.
+        A `too_many_requests` (429) response also carries a `Retry-After` header with the
+        remaining window in whole seconds.
       required:
         - statusCode
         - code
@@ -1011,7 +1044,7 @@ components:
             gone: { status: 410, meaning: The endpoint or resource has been permanently removed or closed. }
             payload_too_large: { status: 413, meaning: The request body exceeds the 64 KiB limit. }
             unsupported_media_type: { status: 415, meaning: The request body has an unsupported Content-Type. }
-            too_many_requests: { status: 429, meaning: A rate limit or budget would be exceeded. }
+            too_many_requests: { status: 429, meaning: "A rate limit or budget would be exceeded. The response carries a Retry-After header with the remaining window in seconds." }
             internal_error: { status: 500, meaning: "An internal error occurred; details are logged, never returned." }
             service_unavailable: { status: 503, meaning: "A server-side capability is not configured or temporarily unavailable; the request itself was valid." }
             upstream_timeout: { status: 504, meaning: "An upstream dependency (e.g. Horizon) did not answer in time." }
@@ -1407,52 +1440,4 @@ components:
         - data
       properties:
         statusCode:
-          type: integer
-        message:
-          type: string
-        data:
-          type: object
-          required:
-            - operations
-            - base_fee_stroops
-            - recommended_fee_stroops
-            - estimated_fee_stroops
-            - base_reserve_stroops
-            - min_reserve_stroops
-            - native_balance_stroops
-            - fee_covered
-            - max_withdrawable_stroops
-          properties:
-            operations:
-              type: integer
-            base_fee_stroops:
-              type: integer
-            recommended_fee_stroops:
-              type: integer
-            estimated_fee_stroops:
-              type: integer
-            base_reserve_stroops:
-              type: integer
-            min_reserve_stroops:
-              type: integer
-            native_balance_stroops:
-              type: integer
-            asset_code:
-              type: string
-              nullable: true
-            asset_issuer:
-              type: string
-              nullable: true
-            asset_balance_stroops:
-              type: integer
-              nullable: true
-            fee_covered:
-              type: boolean
-            max_withdrawable_stroops:
-              type: integer
-            amount_stroops:
-              type: integer
-              nullable: true
-            sufficient:
-              type: boolean
-              nullable: true
+          type:

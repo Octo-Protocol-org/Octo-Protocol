@@ -479,8 +479,7 @@ pub fn is_safe_url(url: &str) -> bool {
         return false;
     }
     // Dev/test escape hatch: allow loopback/private targets only when explicitly opted in.
-    let allow_local = std::env::var("OCTO_ALLOW_LOCAL_WEBHOOKS").as_deref() == Ok("1");
-    if allow_local {
+    if allow_local_webhooks() {
         return true;
     }
     let Ok(parsed) = reqwest::Url::parse(url) else {
@@ -498,6 +497,10 @@ pub fn is_safe_url(url: &str) -> bool {
     }
 }
 
+pub fn allow_local_webhooks() -> bool {
+    std::env::var("OCTO_ALLOW_LOCAL_WEBHOOKS").as_deref() == Ok("1")
+}
+
 /// Hostname blocklist; a trailing root dot (`localhost.`) resolves identically so is ignored.
 fn is_public_hostname(host: &str) -> bool {
     let host = host.trim_end_matches('.');
@@ -508,7 +511,8 @@ fn is_public_hostname(host: &str) -> bool {
 }
 
 /// IPv4: reject unspecified/"this network" (0/8), loopback, private, link-local (incl. cloud
-/// metadata 169.254.169.254), CGNAT (100.64/10), broadcast and multicast.
+/// metadata 169.254.169.254), CGNAT (100.64/10), reserved/documentation ranges, broadcast and
+/// multicast.
 fn is_public_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
     !(a == 0
@@ -516,6 +520,12 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_private()
         || ip.is_link_local()
         || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && ip.octets()[2] == 0)
+        || (a == 192 && b == 0 && ip.octets()[2] == 2)
+        || (a == 198 && b == 51 && ip.octets()[2] == 100)
+        || (a == 203 && b == 0 && ip.octets()[2] == 113)
+        || (a == 198 && (18..=19).contains(&b))
+        || a >= 240
         || ip.is_broadcast()
         || ip.is_multicast())
 }
@@ -537,115 +547,6 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         || (first & 0xffc0) == 0xfe80
         || (first & 0xfe00) == 0xfc00
         || ip.is_multicast())
-}
-
-/// Hostname blocklist; a trailing root dot (`localhost.`) resolves identically so is ignored.
-fn is_public_hostname(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    !(host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local"))
-}
-
-/// Helper to parse IPv4 addresses in dotted-decimal, octal, hex, or raw integer representations.
-fn parse_ipv4_lenient(s: &str) -> Option<std::net::Ipv4Addr> {
-    // Raw integer IPv4 representation (e.g. 2130706433 or 0).
-    if let Ok(num) = s.parse::<u32>() {
-        return Some(std::net::Ipv4Addr::from(num));
-    }
-    // Raw hex integer IPv4 representation (e.g. 0x7f000001).
-    if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        if let Ok(num) = u32:
-}
-
-/// Helper to parse IPv4 addresses in dotted-decimal, octal, hex, or raw integer representations.
-fn parse_ipv4_lenient(s: &str) -> Option<std::net::Ipv4Addr> {
-    // Raw integer IPv4 representation (e.g. 2130706433 or 0).
-    if let Ok(num) = s.parse::<u32>() {
-        return Some(std::net::Ipv4Addr::from(num));
-    }
-    // Raw hex integer IPv4 representation (e.g. 0x7f000001).
-    if let Some(hex_str) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        if let Ok(num) = u32::from_str_radix(hex_str, 16) {
-            return Some(std::net::Ipv4Addr::from(num));
-        }
-    }
-    // Dotted 4-octet representation with potential decimal, octal, or hex segments.
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() == 4 {
-        let mut octets = [0u8; 4];
-        for (i, part) in parts.iter().enumerate() {
-            let val = if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
-                u32::from_str_radix(hex, 16).ok()?
-            } else if part.len() > 1 && part.starts_with('0') {
-                u32::from_str_radix(part, 8).ok()?
-            } else {
-                part.parse::<u32>().ok()?
-            };
-            if val > 255 {
-                return None;
-            }
-            octets[i] = val as u8;
-        }
-        return Some(std::net::Ipv4Addr::from(octets));
-    }
-    None
-}
-
-/// Returns true if an IPv4 address is in a private, loopback, link-local, unspecified, or broadcast range.
-fn is_unsafe_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    // 0.0.0.0/8 (unspecified / this network)
-    octets[0] == 0
-    // 127.0.0.0/8 (loopback)
-    || octets[0] == 127
-    // 10.0.0.0/8 (private)
-    || octets[0] == 10
-    // 172.16.0.0/12 (private: 172.16.x.x - 172.31.x.x)
-    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-    // 192.168.0.0/16 (private)
-    || (octets[0] == 192 && octets[1] == 168)
-    // 169.254.0.0/16 (link-local, cloud metadata)
-    || (octets[0] == 169 && octets[1] == 254)
-    // 100.64.0.0/10 (carrier-grade NAT)
-    || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-    // Broadcast 255.255.255.255
-    || ip.is_broadcast()
-}
-
-/// Returns true if an IPv6 address is in a private, loopback, link-local, unspecified, or mapped unsafe range.
-fn is_unsafe_ipv6(ip: std::net::Ipv6Addr) -> bool {
-    // Loopback ::1
-    if ip.is_loopback() {
-        return true;
-    }
-    // Unspecified ::
-    if ip.is_unspecified() {
-        return true;
-    }
-    // IPv4-mapped IPv6 address (e.g. ::ffff:127.0.0.1 or ::ffff:7f00:1)
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        if is_unsafe_ipv4(v4) {
-            return true;
-        }
-    }
-    // IPv4-compatible IPv6 address (deprecated, e.g. ::127.0.0.1)
-    if let Some(v4) = ip.to_ipv4() {
-        if is_unsafe_ipv4(v4) {
-            return true;
-        }
-    }
-    let segs = ip.segments();
-    // Link-local: fe80::/10 (fe80..febf)
-    if (segs[0] & 0xffc0) == 0xfe80 {
-        return true;
-    }
-    // Unique-local: fc00::/7 (fc00..fdff)
-    if (segs[0] & 0xfe00) == 0xfc00 {
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -672,6 +573,23 @@ mod tests {
         assert!(is_safe_url("http://172.15.0.1/x"));
         assert!(is_safe_url("http://172.32.0.1/x"));
         assert!(is_safe_url("https://93.184.216.34/webhook"));
+    }
+
+    #[test]
+    fn reserved_ipv4_ranges_are_rejected() {
+        for url in [
+            "http://192.0.0.1/hook",
+            "http://192.0.2.1/hook",
+            "http://198.51.100.1/hook",
+            "http://203.0.113.1/hook",
+            "http://198.18.0.1/hook",
+            "http://198.19.255.255/hook",
+            "http://240.0.0.1/hook",
+            "http://255.255.255.254/hook",
+        ] {
+            assert!(!is_safe_url(url), "{url} should be rejected");
+        }
+        assert!(is_safe_url("https://8.8.8.8/hook"));
     }
 
     // --- IPv4 Literal Forms (Dotted, Decimal, Hex, Octal) ---

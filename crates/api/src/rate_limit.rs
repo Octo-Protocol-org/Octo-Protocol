@@ -50,6 +50,13 @@ pub const CSV_EXPORT_WINDOW: Duration = Duration::from_secs(60);
 /// Boxed future so [`RateLimitStore`] stays object-safe without an `async-trait` dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Whole seconds left until `expires`, rounded up and never zero (a `Retry-After` of 0 is useless).
+fn remaining_secs(expires: Instant, now: Instant) -> u64 {
+    let left = expires.saturating_duration_since(now);
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    secs.max(1)
+}
+
 /// A backend that counts hits per `(key, class)` fixed window.
 pub trait RateLimitStore: Send + Sync {
     /// Record one hit and return the hits in the current window, this one included.
@@ -78,6 +85,16 @@ pub struct MemoryRateLimitStore {
 impl MemoryRateLimitStore {
     /// Synchronous hit counter shared by the trait impl and the [`RateLimiter`] fallback path.
     fn count(&self, key: &str, class: &'static str, window: Duration) -> u64 {
+        self.count_with_remaining(key, class, window).0
+    }
+
+    /// Like [`Self::count`], but also returns the seconds left in the current fixed window.
+    fn count_with_remaining(
+        &self,
+        key: &str,
+        class: &'static str,
+        window: Duration,
+    ) -> (u64, u64) {
         let now = Instant::now();
         let mut buckets = self
             .buckets
@@ -95,7 +112,7 @@ impl MemoryRateLimitStore {
             *entry = (now + window, 0);
         }
         entry.1 = entry.1.saturating_add(1);
-        entry.1
+        (entry.1, remaining_secs(entry.0, now))
     }
 
     fn prune_expired(&self) -> u64 {
@@ -220,14 +237,32 @@ impl RateLimiter {
 
     /// Record a hit for `(key, class)`; false when the fixed window's limit is exceeded.
     pub async fn check(&self, key: &str, class: &'static str, limit: u32, window: Duration) -> bool {
-        let hits = match self.backend.hit(key, class, window).await {
-            Ok(hits) => hits,
+        self.check_with_retry_after(key, class, limit, window)
+            .await
+            .is_ok()
+    }
+
+    /// Like [`Self::check`], but on rejection returns the seconds left in the fixed window so
+    /// callers can emit a `Retry-After` header.
+    pub async fn check_with_retry_after(
+        &self,
+        key: &str,
+        class: &'static str,
+        limit: u32,
+        window: Duration,
+    ) -> Result<(), u64> {
+        let (hits, retry_after) = match self.backend.hit(key, class, window).await {
+            Ok(hits) => (hits, remaining_secs(Instant::now() + window, Instant::now())),
             Err(e) => {
                 tracing::warn!(error = ?e, class, "rate-limit backend failed; using per-process fallback");
-                self.fallback.count(key, class, window)
+                self.fallback.count_with_remaining(key, class, window)
             }
         };
-        hits <= u64::from(limit)
+        if hits <= u64::from(limit) {
+            Ok(())
+        } else {
+            Err(retry_after)
+        }
     }
 
     /// Prune expired windows in the backend and the fallback. Run periodically.
@@ -335,6 +370,19 @@ mod tests {
         assert!(rl.check("5.6.7.8", "test", 5, window).await);
         // A different class on the same IP has its own bucket too.
         assert!(rl.check("1.2.3.4", "other", 5, window).await);
+    }
+
+    #[tokio::test]
+    async fn check_with_retry_after_reports_positive_remaining_window() {
+        let rl = RateLimiter::default();
+        let window = Duration::from_secs(60);
+        assert!(rl.check_with_retry_after("1.2.3.4", "test", 1, window).await.is_ok());
+        let retry_after = rl
+            .check_with_retry_after("1.2.3.4", "test", 1, window)
+            .await
+            .unwrap_err();
+        assert!(retry_after > 0, "Retry-After must be a positive integer");
+        assert!(retry_after <= window.as_secs());
     }
 
     #[tokio::test]

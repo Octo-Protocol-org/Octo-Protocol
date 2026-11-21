@@ -1,8 +1,4 @@
-//! Startup guard: refuse to run on mainnet with placeholder/low-entropy secrets or plaintext URLs.
-//!
-//! Every problem is collected into one error so an operator fixes the whole config in one pass.
-//! Messages name the offending variable only — never its value.
-
+use anyhow::{bail, Result};
 use octo_wallet_core::StellarNetwork;
 use std::fmt;
 
@@ -33,6 +29,16 @@ const PLACEHOLDER_MARKERS: &[&str] = &[
     "supersecret",
     "xxxxxxxx",
 ];
+
+pub fn ensure_webhook_override_is_safe(
+    network: StellarNetwork,
+    allow_local_webhooks: bool,
+) -> Result<()> {
+    if network == StellarNetwork::Public && allow_local_webhooks {
+        bail!("OCTO_ALLOW_LOCAL_WEBHOOKS must not be set when NETWORK=mainnet");
+    }
+    Ok(())
+}
 
 /// The subset of server config whose safety depends on the network.
 pub struct MainnetCheck<'a> {
@@ -183,6 +189,16 @@ mod tests {
     fn assert_rejected(cfg: MainnetCheck<'_>, needle: &str) {
         let err = check(StellarNetwork::Public, &cfg).expect_err("config should be rejected");
         assert!(err.to_string().contains(needle), "{needle:?} not in {err}");
+    }
+
+    #[test]
+    fn rejects_local_webhook_override_on_mainnet() {
+        assert!(ensure_webhook_override_is_safe(StellarNetwork::Public, true).is_err());
+    }
+
+    #[test]
+    fn allows_local_webhook_override_on_testnet() {
+        assert!(ensure_webhook_override_is_safe(StellarNetwork::Testnet, true).is_ok());
     }
 
     #[test]

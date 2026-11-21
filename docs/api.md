@@ -362,7 +362,7 @@ See also [errors.md](errors.md) for the per-code remedies.
 
 ## Rate Limits
 
-The API enforces fixed-window rate limiting on unauthenticated and authentication endpoints to protect against brute-force and resource-exhaustion attacks. When a rate limit is exceeded, the server responds with HTTP `429 Too Many Requests`. No `Retry-After` header is guaranteed: back off with an exponential delay of your own (see [errors.md](errors.md)).
+The API enforces fixed-window rate limiting on unauthenticated and authentication endpoints to protect against brute-force and resource-exhaustion attacks. When a rate limit is exceeded, the server responds with HTTP `429 Too Many Requests` and a `Retry-After: <seconds>` header carrying the remaining seconds in the current window (a positive integer). Honour it: wait at least that long before retrying, then fall back to an exponential delay of your own (see [errors.md](errors.md)).
 
 Counters are shared across replicas through Postgres by default (`RATE_LIMIT_BACKEND=postgres`), so limits hold regardless of how many instances run and survive restarts; see `docs/ha-topology.md`. Per-IP keys use the first `X-Forwarded-For` hop only when it parses as an IP address.
 

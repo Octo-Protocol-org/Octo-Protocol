@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Backfill tool for fixing operation_index values in existing deposit rows.
 //!
 //! This tool safely backfills the correct operation_index for deposits that were recorded

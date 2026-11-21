@@ -961,6 +961,49 @@ async fn migrate_applies_exactly_the_expected_version_set() {
 }
 
 #[tokio::test]
+async fn otp_locks_out_after_max_wrong_attempts() {
+    let Some(store) = store().await else { return };
+    let user_id = fresh_user(&store).await;
+    let purpose = "login";
+
+    // Synthetic hashes only — no real secrets or personal data.
+    store
+        .create_otp(user_id, purpose, "correct-hash", None, 300)
+        .await
+        .expect("create otp");
+
+    // Five wrong attempts each fail with InvalidOtp.
+    for _ in 0..5 {
+        let res = store
+            .verify_and_consume_otp(user_id, purpose, "wrong-hash")
+            .await;
+        assert!(
+            matches!(res, Err(StoreError::InvalidOtp)),
+            "wrong attempt must be InvalidOtp, got {res:?}"
+        );
+    }
+
+    // The sixth attempt — even with the correct hash — is locked out.
+    let locked = store
+        .verify_and_consume_otp(user_id, purpose, "correct-hash")
+        .await;
+    assert!(
+        matches!(locked, Err(StoreError::InvalidOtp)),
+        "correct hash after max wrong attempts must still be InvalidOtp, got {locked:?}"
+    );
+
+    // A fresh OTP for the same user works.
+    store
+        .create_otp(user_id, purpose, "fresh-hash", None, 300)
+        .await
+        .expect("create fresh otp");
+    store
+        .verify_and_consume_otp(user_id, purpose, "fresh-hash")
+        .await
+        .expect("fresh otp must verify");
+}
+
+#[tokio::test]
 async fn upsert_gas_sponsorship_config_works() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
