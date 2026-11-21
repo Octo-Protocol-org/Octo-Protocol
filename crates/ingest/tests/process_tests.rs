@@ -76,6 +76,8 @@ fn base_record(id: &str) -> PaymentRecord {
         asset_issuer: None,
         amount: Some("5.0000000".into()),
         starting_balance: None,
+        balance_id: None,
+        claimant: None,
         transaction: None,
     }
 }
@@ -191,7 +193,7 @@ async fn failed_tx_is_skipped() {
 
     let mut rec = base_record("op-failed-1");
     rec.transaction_successful = false;
-    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::FailedTransaction);
     assert_eq!(
         store
             .list_transactions(wallet_id, 100, None)
@@ -389,4 +391,340 @@ async fn exact_payment_link_deposit_confirms() {
         .await
         .unwrap();
     assert_eq!(payment.status, "confirmed");
+}
+
+/// A fresh, decodable Horizon TOID (random ledger and tx order, first operation) and its ledger.
+fn unique_toid() -> (String, i64) {
+    let r = Uuid::new_v4().as_u128();
+    let ledger = 1 + (r % 50_000_000) as u64;
+    let tx_order = 1 + ((r >> 64) % 1_000) as u64;
+    (((ledger << 32) | (tx_order << 12) | 1).to_string(), ledger as i64)
+}
+
+/// A Horizon-shaped path payment that spent 100 XLM and delivered 9.5 USDC to `to_muxed`.
+fn path_payment_record(kind: &str, to_muxed: Option<String>) -> PaymentRecord {
+    let (toid, ledger) = unique_toid();
+    serde_json::from_value(serde_json::json!({
+        "id": toid,
+        "paging_token": toid,
+        "type": kind,
+        "transaction_successful": true,
+        "transaction_hash": format!("pathhash-{}", Uuid::new_v4().simple()),
+        "from": "GPATHSENDER",
+        "to": BASE,
+        "to_muxed": to_muxed,
+        "asset_type": "credit_alphanum4",
+        "asset_code": "USDC",
+        "asset_issuer": USDC_TESTNET_ISSUER,
+        "amount": "9.5000000",
+        "source_asset_type": "native",
+        "source_amount": "100.0000000",
+        "transaction": { "ledger": ledger },
+    }))
+    .expect("path payment fixture")
+}
+
+#[tokio::test]
+async fn path_payment_deposits_are_recorded_once_with_the_received_amount() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    for kind in ["path_payment_strict_send", "path_payment_strict_receive"] {
+        let addr = store
+            .allocate_address(
+                wallet_id,
+                |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+                Some(kind),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let rec = path_payment_record(kind, Some(addr.muxed_address.clone()));
+
+        assert_eq!(
+            ingestor.process(&rec).await.unwrap(),
+            Processed::Recorded { attributed: true },
+            "{kind}"
+        );
+        // Dedup by operation id still holds for path payments.
+        assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Duplicate, "{kind}");
+
+        let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
+        let row = txs
+            .iter()
+            .find(|t| t.address_id == Some(addr.id))
+            .expect("deposit row");
+        assert_eq!(row.amount_stroops, 95_000_000, "{kind}: destination amount, not source");
+        assert_eq!(row.asset_code, "USDC", "{kind}: destination asset, not source");
+        assert_eq!(
+            txs.iter().filter(|t| t.address_id == Some(addr.id)).count(),
+            1,
+            "{kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn self_path_payment_conversion_is_not_a_deposit() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // The master account converting its own XLM into USDC must not look like incoming funds.
+    let mut rec = path_payment_record("path_payment_strict_send", None);
+    rec.from = Some(BASE.into());
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A `claim_claimable_balance` by our master account of `balance_id`.
+fn claim_record(balance_id: &str) -> PaymentRecord {
+    let (toid, ledger) = unique_toid();
+    serde_json::from_value(serde_json::json!({
+        "id": toid,
+        "paging_token": toid,
+        "type": "claim_claimable_balance",
+        "transaction_successful": true,
+        "transaction_hash": format!("claimhash-{}", Uuid::new_v4().simple()),
+        "source_account": BASE,
+        "balance_id": balance_id,
+        "claimant": BASE,
+        "transaction": { "ledger": ledger },
+    }))
+    .expect("claim fixture")
+}
+
+/// Mount Horizon's claim effects and balance history: `creator` made the balance with `memo_id`.
+async fn mock_claim_horizon(
+    rec: &PaymentRecord,
+    balance_id: &str,
+    creator: &str,
+    memo_id: i64,
+) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/operations/{}/effects", rec.id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [
+                { "type": "claimable_balance_claimed", "balance_id": balance_id,
+                  "asset": format!("USDC:{USDC_TESTNET_ISSUER}"), "amount": "12.0000000" },
+                { "type": "account_credited", "account": BASE, "asset_type": "credit_alphanum4",
+                  "asset_code": "USDC", "asset_issuer": USDC_TESTNET_ISSUER, "amount": "12.0000000" },
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/claimable_balances/{balance_id}/operations")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [{
+                "type": "create_claimable_balance",
+                "source_account": creator,
+                "transaction": { "memo_type": "id", "memo": memo_id.to_string() },
+            }]}
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn unique_balance_id() -> String {
+    format!("00000000{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+#[tokio::test]
+async fn claimable_balance_claim_creates_a_single_attributed_deposit() {
+    let Some((store, _, wallet_id)) = setup().await else {
+        return;
+    };
+    let addr = store
+        .allocate_address(
+            wallet_id,
+            |id| encode_muxed(BASE, id as u64).map_err(|_| ()),
+            Some("cust-claim"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let balance_id = unique_balance_id();
+    let rec = claim_record(&balance_id);
+    let server = mock_claim_horizon(&rec, &balance_id, "GCREATOR", addr.muxed_id).await;
+    let ingestor = Ingestor::new(store.clone(), &server.uri(), wallet_id, BASE.to_string());
+
+    assert_eq!(
+        ingestor.process(&rec).await.unwrap(),
+        Processed::Recorded { attributed: true }
+    );
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Duplicate);
+
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
+    assert_eq!(txs.len(), 1, "one claim → one deposit row");
+    assert_eq!(txs[0].address_id, Some(addr.id));
+    assert_eq!(txs[0].amount_stroops, 120_000_000);
+    assert_eq!(txs[0].asset_code, "USDC");
+    assert_eq!(txs[0].source_account.as_deref(), Some("GCREATOR"), "origin is the creator");
+    assert_eq!(txs[0].memo_id, Some(addr.muxed_id));
+}
+
+#[tokio::test]
+async fn reclaiming_our_own_claimable_balance_is_not_a_deposit() {
+    let Some((store, _, wallet_id)) = setup().await else {
+        return;
+    };
+    let balance_id = unique_balance_id();
+    let rec = claim_record(&balance_id);
+    let server = mock_claim_horizon(&rec, &balance_id, BASE, 1).await;
+    let ingestor = Ingestor::new(store.clone(), &server.uri(), wallet_id, BASE.to_string());
+
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn claim_by_another_account_is_skipped_without_calling_horizon() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+    // `ingestor` points at an unreachable Horizon, so any lookup here would error, not skip.
+    let mut rec = claim_record(&unique_balance_id());
+    rec.claimant = Some("GSOMEOTHERACCOUNT".into());
+    assert_eq!(ingestor.process(&rec).await.unwrap(), Processed::Skipped);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Every crediting operation type, each from a failed transaction, with a valid TOID.
+fn failed_fixtures() -> Vec<PaymentRecord> {
+    let mut payment = path_payment_record("path_payment_strict_send", None);
+    payment.kind = "payment".into();
+    let mut create = path_payment_record("path_payment_strict_send", None);
+    create.kind = "create_account".into();
+    create.starting_balance = Some("5.0000000".into());
+    let mut all = vec![
+        payment,
+        create,
+        path_payment_record("path_payment_strict_send", None),
+        path_payment_record("path_payment_strict_receive", None),
+        claim_record(&unique_balance_id()),
+    ];
+    for rec in &mut all {
+        rec.transaction_successful = false;
+    }
+    all
+}
+
+// Invariant #449: failed payments never create deposits, whatever the operation type.
+#[tokio::test]
+async fn invariant_failed_transactions_never_create_deposits() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+    // `ingestor` targets an unreachable Horizon: a failed claim must not even attempt a lookup.
+    for rec in failed_fixtures() {
+        assert_eq!(
+            ingestor.process(&rec).await.unwrap(),
+            Processed::FailedTransaction,
+            "{}",
+            rec.kind
+        );
+    }
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+// Invariant #449 end to end: a failed payment served by Horizon is passed over, not credited.
+#[tokio::test]
+async fn invariant_failed_payment_from_horizon_creates_no_deposit_row() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let Some((store, _, wallet_id)) = setup().await else {
+        return;
+    };
+    let mut failed = path_payment_record("path_payment_strict_send", None);
+    failed.kind = "payment".into();
+    failed.transaction_successful = false;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{BASE}/operations")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [failed] }
+        })))
+        .mount(&server)
+        .await;
+    let ingestor = Ingestor::new(store.clone(), &server.uri(), wallet_id, BASE.to_string());
+
+    assert_eq!(ingestor.poll_once(10).await.unwrap(), 1);
+    assert!(store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+    // The cursor still moves past it, so a failed op is never re-fetched forever.
+    assert_eq!(
+        store.get_cursor(wallet_id).await.unwrap().as_deref(),
+        Some(failed.paging_token.as_str())
+    );
+}
+
+#[tokio::test]
+async fn deposit_after_link_expiry_is_recorded_but_not_matched() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // The intent was opened while the link was live; the deadline passed before funds landed.
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let (muxed, link_id, intent_id) =
+        make_usdc_payment_link_expiring(&store, wallet_id, 100_000_000, Some(past)).await;
+    let rec = usdc_record("op-late-expired-1", muxed, "10.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "pending", "a late deposit must not confirm the intent");
+    assert!(payment.transaction_id.is_none());
+}
+
+#[tokio::test]
+async fn deposit_after_link_cancel_is_recorded_but_not_matched() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
+    let (_, cancelled) = store.cancel_payment_link(wallet_id, link_id).await.unwrap();
+    assert_eq!(cancelled.len(), 1);
+    let rec = usdc_record("op-late-cancelled-1", muxed, "10.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "cancelled");
+    assert!(payment.transaction_id.is_none());
 }

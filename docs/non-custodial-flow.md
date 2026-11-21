@@ -104,8 +104,8 @@ sequenceDiagram
     B->>B: unlockWallet(password) → decrypt backup → Keypair (in memory only)
     B->>API: GET /v1/wallets/:id/signing-info
     API->>N: fetch account sequence number
-    API-->>B: { sequence, network_passphrase, base_fee }
-    B->>B: buildSignedPayment(keypair, info, …) → SIGN locally → XDR
+    API-->>B: { sequence, network_passphrase, base_fee_stroops, max_time }
+    B->>B: build tx with max_time bound → SIGN locally → XDR
     Note over B: signature created on-device; key never sent
     B->>API: POST /v1/wallets/:id/submit-signed { transaction_xdr }
     API->>API: validate (v1 envelope, ≥1 signature, source==wallet, op allowlist)
@@ -118,7 +118,11 @@ sequenceDiagram
 ```
 
 Trustlines (e.g. adding USDC) follow the same shape with `buildSignedChangeTrust` instead of
-`buildSignedPayment`.
+`buildSignedPayment`. Payment and trustline envelopes must set their time-bound `max_time` to the
+absolute timestamp returned by signing info. That timestamp is calculated using
+`STELLAR_TX_MAX_AGE_SECS` (default five minutes). The returned per-operation fee is selected from
+the configured Horizon `/fee_stats` percentile, capped by `STELLAR_FEE_CEILING_STROOPS`, and falls
+back to the network base fee if Horizon fee stats cannot be read.
 
 ---
 

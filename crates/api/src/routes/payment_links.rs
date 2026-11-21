@@ -1,22 +1,22 @@
 //! Payment links: shareable public URLs that accept a USDC deposit.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use octo_store::IdempotencyClaim;
+use octo_wallet_core::asset::USDC_TESTNET_ISSUER;
 use octo_wallet_core::encode_muxed;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const USDC_ASSET_CODE: &str = "USDC";
-/// The widely-used testnet USDC issuer (same one the dashboard's trustline flow uses) — v1
-/// payment links are USDC-only, so a submitted payment must actually be this asset, not just
-/// any asset landing at the right address.
-const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 /// Full hosted checkout URL for a payment link's slug.
 fn checkout_url(state: &AppState, slug: &str) -> String {
@@ -33,10 +33,40 @@ pub struct PaymentLinkView {
     pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
     pub active: bool,
+    /// "active" | "inactive" | "expired" | "cancelled" — see [`octo_store::PaymentLink::status_at`].
+    pub status: &'static str,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub cancelled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub collected_usdc_stroops: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub url: String,
 }
+
+impl PaymentLinkView {
+    fn new(state: &AppState, link: octo_store::PaymentLink, collected_usdc_stroops: i64) -> Self {
+        let url = checkout_url(state, &link.slug);
+        let status = link.status_at(chrono::Utc::now());
+        PaymentLinkView {
+            id: link.id,
+            slug: link.slug,
+            name: link.name,
+            description: link.description,
+            image_url: link.image_url,
+            redirect_url: link.redirect_url,
+            amount_usdc_stroops: link.amount_usdc_stroops,
+            active: link.active,
+            status,
+            expires_at: link.expires_at,
+            cancelled_at: link.cancelled_at,
+            collected_usdc_stroops,
+            created_at: link.created_at,
+            url,
+        }
+    }
+}
+
+/// Longest deadline, in days, a merchant may set on a link.
+const MAX_LINK_LIFETIME_DAYS: i64 = 365;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CreatePaymentLinkRequest {
@@ -45,21 +75,120 @@ pub struct CreatePaymentLinkRequest {
     pub image_url: Option<String>,
     pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
+    /// Optional RFC 3339 deadline, in the future and at most [`MAX_LINK_LIFETIME_DAYS`] away.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Idempotency scope for payment link creation; keys are namespaced per wallet and scope.
+const CREATE_LINK_IDEMPOTENCY_SCOPE: &str = "payment_link.create";
+
 /// `POST /v1/wallets/:id/payment-links`
+///
+/// Honours an optional `Idempotency-Key` header (#453): a retry with the same key and body
+/// replays the original `201` response instead of creating a second link, the same key with a
+/// different body is `409`, and keys expire after `IDEMPOTENCY_KEY_TTL_SECS` (24h).
 pub async fn create_payment_link(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
     body: Bytes,
-) -> ApiResult<(StatusCode, Json<Envelope<PaymentLinkView>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
-    let req: CreatePaymentLinkRequest = parse_optional(&body)?;
+) -> ApiResult<Response> {
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
+    let Some(key) = idempotency_key(&headers)? else {
+        let view = create_link(&state, wallet_id, &body).await?;
+        return Ok(Envelope::created(view).into_response());
+    };
+
+    let store = state.store();
+    let request_hash = hex::encode(Sha256::digest(&body));
+    let scope = CREATE_LINK_IDEMPOTENCY_SCOPE;
+    match store
+        .claim_idempotency_key(wallet_id, scope, &key, &request_hash)
+        .await?
+    {
+        IdempotencyClaim::Claimed => match create_link(&state, wallet_id, &body).await {
+            Ok(view) => {
+                let response = serde_json::to_value(&view).map_err(crate::error::internal)?;
+                // On failure the claim stays in progress: retries get 409, never a duplicate.
+                if let Err(e) = store
+                    .complete_idempotency_key(wallet_id, scope, &key, 201, &response)
+                    .await
+                {
+                    tracing::warn!(error = ?e, "failed to store idempotent response");
+                }
+                Ok(Envelope::created(view).into_response())
+            }
+            Err(e) => {
+                // Nothing was created, so free the key for a corrected retry.
+                if let Err(release) = store.release_idempotency_key(wallet_id, scope, &key).await {
+                    tracing::warn!(error = ?release, "failed to release idempotency key");
+                }
+                Err(e)
+            }
+        },
+        IdempotencyClaim::Replay {
+            status_code,
+            response,
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::CREATED);
+            let mut resp = (
+                status,
+                Json(Envelope {
+                    status_code,
+                    message: status.canonical_reason().unwrap_or("OK").into(),
+                    data: response,
+                }),
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert("idempotent-replayed", HeaderValue::from_static("true"));
+            Ok(resp)
+        }
+        IdempotencyClaim::Mismatch => Err(ApiError::ConflictWith(
+            "Idempotency-Key was already used with a different request body".into(),
+        )),
+        IdempotencyClaim::InProgress => Err(ApiError::ConflictWith(
+            "a request with this Idempotency-Key is still in progress; retry shortly".into(),
+        )),
+    }
+}
+
+/// Read an optional `Idempotency-Key`: 1-255 visible ASCII characters, otherwise `400`.
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = raw.to_str().unwrap_or_default();
+    let valid = (1..=255).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_graphic());
+    if !valid {
+        return Err(ApiError::BadRequest(
+            "Idempotency-Key must be 1-255 visible ASCII characters".into(),
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+/// Validate the request, allocate the link's address and insert the link.
+async fn create_link(
+    state: &AppState,
+    wallet_id: Uuid,
+    body: &Bytes,
+) -> ApiResult<PaymentLinkView> {
+    let req: CreatePaymentLinkRequest = parse_optional(body)?;
     let name = req
         .name
         .filter(|n| !n.is_empty())
         .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
+    // Same checks as PATCH: the redirect is served to payers on the public pay page.
+    if let Some(url) = req.redirect_url.as_deref() {
+        validate_redirect_url(url)?;
+    }
+    if let Some(amount) = req.amount_usdc_stroops {
+        validate_link_amount(amount)?;
+    }
+    if let Some(expires_at) = req.expires_at {
+        validate_link_expiry(expires_at, chrono::Utc::now())?;
+    }
 
     let wallet = state.store().get_wallet(wallet_id).await?;
     let base = wallet.stellar_account_g.clone();
@@ -88,24 +217,11 @@ pub async fn create_payment_link(
             image_url: req.image_url.as_deref(),
             redirect_url: req.redirect_url.as_deref(),
             amount_usdc_stroops: req.amount_usdc_stroops,
+            expires_at: req.expires_at,
         })
         .await?;
 
-    let url = checkout_url(&state, &link.slug);
-    let (code, json) = Envelope::created(PaymentLinkView {
-        id: link.id,
-        slug: link.slug,
-        name: link.name,
-        description: link.description,
-        image_url: link.image_url,
-        redirect_url: link.redirect_url,
-        amount_usdc_stroops: link.amount_usdc_stroops,
-        active: link.active,
-        collected_usdc_stroops: 0,
-        created_at: link.created_at,
-        url,
-    });
-    Ok((code, json))
+    Ok(PaymentLinkView::new(state, link, 0))
 }
 
 /// `GET /v1/wallets/:id/payment-links`
@@ -144,20 +260,8 @@ pub async fn list_payment_links(
     let views = items
         .into_iter()
         .map(|l| {
-            let url = checkout_url(&state, &l.slug);
-            PaymentLinkView {
-                id: l.id,
-                slug: l.slug,
-                name: l.name,
-                description: l.description,
-                image_url: l.image_url,
-                redirect_url: l.redirect_url,
-                amount_usdc_stroops: l.amount_usdc_stroops,
-                active: l.active,
-                collected_usdc_stroops: totals.get(&l.id).copied().unwrap_or(0),
-                created_at: l.created_at,
-                url,
-            }
+            let collected = totals.get(&l.id).copied().unwrap_or(0);
+            PaymentLinkView::new(&state, l, collected)
         })
         .collect();
 
@@ -182,20 +286,7 @@ pub async fn get_payment_link(
     authorize_wallet(&headers, &state, wallet_id).await?;
     let link = state.store().get_payment_link(wallet_id, link_id).await?;
     let collected = state.store().sum_payment_link_collected(link.id).await?;
-    let url = checkout_url(&state, &link.slug);
-    Ok(Envelope::ok(PaymentLinkView {
-        id: link.id,
-        slug: link.slug,
-        name: link.name,
-        description: link.description,
-        image_url: link.image_url,
-        redirect_url: link.redirect_url,
-        amount_usdc_stroops: link.amount_usdc_stroops,
-        active: link.active,
-        collected_usdc_stroops: collected,
-        created_at: link.created_at,
-        url,
-    }))
+    Ok(Envelope::ok(PaymentLinkView::new(&state, link, collected)))
 }
 
 #[derive(Debug, Serialize)]
@@ -278,7 +369,7 @@ pub async fn set_payment_link_active(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<PaymentLinkView>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: SetPaymentLinkActiveRequest = parse_optional(&body)?;
     let active = req
         .active
@@ -286,22 +377,172 @@ pub async fn set_payment_link_active(
     let link = state
         .store()
         .set_payment_link_active(wallet_id, link_id, active)
-        .await?;
+        .await
+        .map_err(|e| match e {
+            octo_store::StoreError::Conflict => {
+                ApiError::ConflictWith("payment link is cancelled and cannot be reactivated".into())
+            }
+            other => other.into(),
+        })?;
     let collected = state.store().sum_payment_link_collected(link.id).await?;
-    let url = checkout_url(&state, &link.slug);
-    Ok(Envelope::ok(PaymentLinkView {
-        id: link.id,
-        slug: link.slug,
-        name: link.name,
-        description: link.description,
-        image_url: link.image_url,
-        redirect_url: link.redirect_url,
-        amount_usdc_stroops: link.amount_usdc_stroops,
-        active: link.active,
-        collected_usdc_stroops: collected,
-        created_at: link.created_at,
-        url,
-    }))
+    Ok(Envelope::ok(PaymentLinkView::new(&state, link, collected)))
+}
+
+/// Editable fields of an unpaid link. Omit a field to keep it; send `null` to clear it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePaymentLinkRequest {
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub redirect_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub amount_usdc_stroops: Option<Option<i64>>,
+}
+
+/// `PATCH /v1/wallets/:id/payment-links/:link_id` — edit an unpaid link (#455).
+///
+/// Only `description`, `redirect_url` and `amount_usdc_stroops` are editable; slug and name are
+/// not (unknown fields are rejected). Once any payment is pending or has landed the link is
+/// immutable and this returns 409. Edits are audit-logged.
+pub async fn update_payment_link(
+    State(state): State<AppState>,
+    Path((wallet_id, link_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<PaymentLinkView>>> {
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
+    let req: UpdatePaymentLinkRequest = parse_optional(&body)?;
+    if req.description.is_none() && req.redirect_url.is_none() && req.amount_usdc_stroops.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "provide at least one of description, redirect_url, amount_usdc_stroops".into(),
+        ));
+    }
+
+    // An empty string clears a text field, like `null`.
+    let description = req.description.map(|d| d.filter(|s| !s.trim().is_empty()));
+    let redirect_url = req.redirect_url.map(|u| u.filter(|s| !s.is_empty()));
+    if let Some(Some(url)) = redirect_url.as_ref() {
+        validate_redirect_url(url)?;
+    }
+    if let Some(Some(amount)) = req.amount_usdc_stroops {
+        validate_link_amount(amount)?;
+    }
+
+    let link = state
+        .store()
+        .update_unpaid_payment_link(
+            wallet_id,
+            link_id,
+            octo_store::PaymentLinkUpdate {
+                description: description.as_ref().map(|d| d.as_deref()),
+                redirect_url: redirect_url.as_ref().map(|u| u.as_deref()),
+                amount_usdc_stroops: req.amount_usdc_stroops,
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            octo_store::StoreError::Conflict => ApiError::ConflictWith(
+                "payment link has a pending or completed payment and can no longer be edited"
+                    .into(),
+            ),
+            other => other.into(),
+        })?;
+
+    if let Some(uid) = state.store().get_wallet(wallet_id).await?.user_id {
+        crate::audit::record(
+            &state,
+            uid,
+            "edited a payment link",
+            crate::audit::category::PAYMENT_LINK,
+            Some(&link.id.to_string()),
+            &headers,
+        )
+        .await;
+    }
+
+    let collected = state.store().sum_payment_link_collected(link.id).await?;
+    Ok(Envelope::ok(PaymentLinkView::new(&state, link, collected)))
+}
+
+/// `POST /v1/wallets/:id/payment-links/:link_id/cancel` — permanently close a link (#454).
+///
+/// Idempotent. Pending intents flip to `cancelled` and each fires `payment_link.cancelled`; any
+/// deposit landing afterwards is a late deposit and is not matched (see `docs/api.md`).
+pub async fn cancel_payment_link(
+    State(state): State<AppState>,
+    Path((wallet_id, link_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<PaymentLinkView>>> {
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
+    let (link, cancelled) = state.store().cancel_payment_link(wallet_id, link_id).await?;
+
+    for payment in &cancelled {
+        let event = octo_webhooks::Event {
+            event_type: "payment_link.cancelled".to_string(),
+            data: serde_json::json!({
+                "payment_link_id": link.id,
+                "payment_id": payment.id,
+                "slug": link.slug,
+                "payer_name": payment.payer_name,
+                "payer_email": payment.payer_email,
+                "amount_usdc_stroops": payment.amount_usdc_stroops,
+            }),
+        };
+        state.webhooks().dispatch(wallet_id, &event).await;
+    }
+
+    if let Some(uid) = state.store().get_wallet(wallet_id).await?.user_id {
+        crate::audit::record(
+            &state,
+            uid,
+            "cancelled a payment link",
+            crate::audit::category::PAYMENT_LINK,
+            Some(&link.id.to_string()),
+            &headers,
+        )
+        .await;
+    }
+
+    let collected = state.store().sum_payment_link_collected(link.id).await?;
+    Ok(Envelope::ok(PaymentLinkView::new(&state, link, collected)))
+}
+
+/// A link deadline must be in the future and no more than [`MAX_LINK_LIFETIME_DAYS`] away.
+fn validate_link_expiry(
+    expires_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ApiError> {
+    if expires_at <= now {
+        return Err(ApiError::BadRequest("expires_at must be in the future".into()));
+    }
+    if expires_at > now + chrono::Duration::days(MAX_LINK_LIFETIME_DAYS) {
+        return Err(ApiError::BadRequest(
+            format!("expires_at must be at most {MAX_LINK_LIFETIME_DAYS} days from now"),
+        ));
+    }
+    Ok(())
+}
+
+/// Gate every payer-facing action: paused links are hidden, closed ones answer `410` (#454).
+fn ensure_payable(link: &octo_store::PaymentLink) -> Result<(), ApiError> {
+    match link.status_at(chrono::Utc::now()) {
+        "cancelled" => Err(ApiError::Gone("payment link has been cancelled".into())),
+        "expired" => Err(ApiError::Gone("payment link has expired".into())),
+        "inactive" => Err(ApiError::NotFound),
+        _ => Ok(()),
+    }
+}
+
+/// A link's fixed amount must be positive and within the per-intent cap.
+fn validate_link_amount(amount: i64) -> Result<(), ApiError> {
+    if amount <= 0 || amount > MAX_PAYMENT_INTENT_AMOUNT {
+        return Err(ApiError::BadRequest(format!(
+            "amount_usdc_stroops must be between 1 and {MAX_PAYMENT_INTENT_AMOUNT}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -311,7 +552,11 @@ pub struct PublicPaymentLinkView {
     pub image_url: Option<String>,
     pub redirect_url: Option<String>,
     pub amount_usdc_stroops: Option<i64>,
-    pub deposit_address: String,
+    /// "active" | "expired" | "cancelled". Paused (inactive) links stay a 404.
+    pub status: &'static str,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `None` once the link is closed, so a payer is never handed an address that won't match.
+    pub deposit_address: Option<String>,
     pub asset_code: String,
 }
 
@@ -320,7 +565,7 @@ pub struct PublicPaymentLinkView {
 /// These endpoints have no credential to throttle on, so IP is the only available key. Intent
 /// creation is much tighter than the read paths: each intent allocates a muxed address and
 /// inserts a row, so unbounded calls are a cheap way to bloat the table.
-fn check_public_rate_limit(
+async fn check_public_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -332,6 +577,7 @@ fn check_public_rate_limit(
     if state
         .rate_limiter()
         .check(&ip, class, limit, window)
+        .await
     {
         Ok(())
     } else {
@@ -355,23 +601,31 @@ pub async fn get_public_payment_link(
         "pay_read",
         crate::rate_limit::PAY_READ_LIMIT,
         crate::rate_limit::PAY_READ_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
-    if !link.active {
+    let status = link.status_at(chrono::Utc::now());
+    if status == "inactive" {
         return Err(ApiError::NotFound);
     }
-    let address = state
-        .store()
-        .get_address(link.address_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let deposit_address = if status == "active" {
+        let address = state
+            .store()
+            .get_address(link.address_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        Some(address.muxed_address)
+    } else {
+        None
+    };
     Ok(Envelope::ok(PublicPaymentLinkView {
         name: link.name,
         description: link.description,
         image_url: link.image_url,
         redirect_url: link.redirect_url,
         amount_usdc_stroops: link.amount_usdc_stroops,
-        deposit_address: address.muxed_address,
+        status,
+        expires_at: link.expires_at,
+        deposit_address,
         asset_code: USDC_ASSET_CODE.into(),
     }))
 }
@@ -405,11 +659,9 @@ pub async fn create_payment_intent(
         "pay_intent",
         crate::rate_limit::PAY_INTENT_LIMIT,
         crate::rate_limit::PAY_INTENT_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
-    if !link.active {
-        return Err(ApiError::NotFound);
-    }
+    ensure_payable(&link)?;
     let req: CreatePaymentIntentRequest = parse_optional(&body)?;
 
     // A fixed-amount link ignores whatever the payer sends; a flexible one requires a positive amount.
@@ -459,7 +711,7 @@ pub async fn create_payment_intent(
 
 #[derive(Debug, Serialize)]
 pub struct PaymentStatusView {
-    /// "pending" | "confirmed" | "expired" | "underpaid" | "overpaid".
+    /// "pending" | "confirmed" | "expired" | "underpaid" | "overpaid" | "cancelled".
     pub status: String,
     pub transaction_id: Option<Uuid>,
     /// The amount this intent expects. Always present, so the frontend can render a mismatch
@@ -485,7 +737,7 @@ pub async fn get_payment_status(
         "pay_status",
         crate::rate_limit::PAY_STATUS_LIMIT,
         crate::rate_limit::PAY_STATUS_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     let payment = state
         .store()
@@ -499,8 +751,13 @@ pub async fn get_payment_status(
             .map(|tx| tx.amount_stroops),
         None => None,
     };
+    // A still-pending intent on a closed link is already dead; don't wait for the expiry sweep.
+    let status = match link.status_at(chrono::Utc::now()) {
+        closed @ ("expired" | "cancelled") if payment.status == "pending" => closed.to_string(),
+        _ => payment.status,
+    };
     Ok(Envelope::ok(PaymentStatusView {
-        status: payment.status,
+        status,
         transaction_id: payment.transaction_id,
         expected_usdc_stroops: payment.amount_usdc_stroops,
         received_usdc_stroops,
@@ -530,12 +787,10 @@ pub async fn public_signing_info(
         "pay_signing_info",
         crate::rate_limit::PAY_SIGNING_INFO_LIMIT,
         crate::rate_limit::PAY_SIGNING_INFO_WINDOW,
-    )?;
-    // Confirms the link exists/is active before doing any Horizon work on the caller's behalf.
+    ).await?;
+    // Confirms the link exists/is payable before doing any Horizon work on the caller's behalf.
     let link = state.store().get_payment_link_by_slug(&slug).await?;
-    if !link.active {
-        return Err(ApiError::NotFound);
-    }
+    ensure_payable(&link)?;
 
     let account = match params.account {
         Some(a) => a,
@@ -548,11 +803,14 @@ pub async fn public_signing_info(
         }
     };
     let sequence = state.horizon().account_sequence(&account).await?;
+    let signing_policy = state.signing_policy();
+    let base_fee_stroops = crate::routes::submit::selected_signing_fee(&state).await;
     Ok(Envelope::ok(crate::routes::submit::SigningInfo {
         account,
         sequence,
         network_passphrase: state.network().passphrase().to_string(),
-        base_fee_stroops: 100,
+        base_fee_stroops,
+        max_time: signing_policy.max_time(),
     }))
 }
 
@@ -588,23 +846,29 @@ pub async fn submit_payment(
         "pay_submit",
         crate::rate_limit::PAY_SUBMIT_LIMIT,
         crate::rate_limit::PAY_SUBMIT_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
-    if !link.active {
-        return Err(ApiError::NotFound);
-    }
+    ensure_payable(&link)?;
     let req: SubmitPaymentRequest = parse_optional(&body)?;
 
     // Each payment intent gets its own muxed address (see `create_payment_intent`), so the
     // expected destination is the intent's address. Falling back to the link's own address keeps
     // pre-per-intent clients working.
     let address_id = match req.payment_id {
-        Some(payment_id) => state
-            .store()
-            .get_payment_link_payment(link.id, payment_id)
-            .await?
-            .address_id
-            .unwrap_or(link.address_id),
+        Some(payment_id) => {
+            let payment = state
+                .store()
+                .get_payment_link_payment(link.id, payment_id)
+                .await?;
+            // Relaying funds for a settled, expired or cancelled intent would land unmatched.
+            if payment.status != "pending" {
+                return Err(ApiError::ConflictWith(format!(
+                    "payment is {} and can no longer be paid",
+                    payment.status
+                )));
+            }
+            payment.address_id.unwrap_or(link.address_id)
+        }
         None => link.address_id,
     };
     let address = state
@@ -710,6 +974,35 @@ fn validate_slug(input: &str) -> Result<String, ApiError> {
     }
 
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests_issue_453 {
+    use super::*;
+
+    fn with_key(value: &[u8]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("idempotency-key", HeaderValue::from_bytes(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn missing_key_is_optional() {
+        assert_eq!(idempotency_key(&HeaderMap::new()).unwrap(), None);
+    }
+
+    #[test]
+    fn valid_key_is_returned() {
+        let key = idempotency_key(&with_key(b"order-42_retry.1")).unwrap();
+        assert_eq!(key.as_deref(), Some("order-42_retry.1"));
+    }
+
+    #[test]
+    fn invalid_keys_are_rejected() {
+        assert!(idempotency_key(&with_key(b"has space")).is_err());
+        assert!(idempotency_key(&with_key(b"")).is_err());
+        assert!(idempotency_key(&with_key("k".repeat(256).as_bytes())).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -884,185 +1177,24 @@ mod tests_issue_254 {
     }
 }
 
-fn validate_slug(input: &str) -> Result<String, ApiError> {
-    let normalized = input.trim().to_lowercase();
-
-    if normalized.is_empty() {
-        return Err(ApiError::BadRequest("slug cannot be empty".into()));
-    }
-
-    if normalized.len() < 3 {
-        return Err(ApiError::BadRequest("slug must be at least 3 characters long".into()));
-    }
-
-    if normalized.len() > 64 {
-        return Err(ApiError::BadRequest("slug must be at most 64 characters long".into()));
-    }
-
-    let reserved = ["api", "admin", "health"];
-    if reserved.contains(&normalized.as_str()) {
-        return Err(ApiError::BadRequest(format!("slug '{}' is reserved", normalized)));
-    }
-
-    if !normalized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-        return Err(ApiError::BadRequest(
-            "slug must contain only lowercase letters, digits, and hyphens".into(),
-        ));
-    }
-
-    Ok(normalized)
-}
-
-fn validate_redirect_url(url: &str) -> Result<(), ApiError> {
-    if url.is_empty() {
-        return Ok(());
-    }
-
-    match url::Url::parse(url) {
-        Ok(parsed) => {
-            let scheme = parsed.scheme();
-            if scheme != "http" && scheme != "https" {
-                return Err(ApiError::BadRequest(
-                    "redirect_url must use http:// or https:// scheme".into(),
-                ));
-            }
-            Ok(())
-        }
-        Err(_) => Err(ApiError::BadRequest(
-            "redirect_url must be a valid absolute URL".into(),
-        )),
-    }
-}
-
-const MAX_PAYMENT_INTENT_AMOUNT: i64 = 10_000_000_000;
-
 #[cfg(test)]
-mod tests {
+mod tests_issue_454 {
     use super::*;
+    use chrono::{Duration, Utc};
 
     #[test]
-    fn validate_slug_accepts_valid_slug() {
-        assert_eq!(validate_slug("valid-slug").unwrap(), "valid-slug");
+    fn expiry_must_be_in_the_future() {
+        let now = Utc::now();
+        assert!(validate_link_expiry(now, now).is_err());
+        assert!(validate_link_expiry(now - Duration::seconds(1), now).is_err());
+        assert!(validate_link_expiry(now + Duration::minutes(5), now).is_ok());
     }
 
     #[test]
-    fn validate_slug_normalizes_casing() {
-        assert_eq!(validate_slug("VALID-SLUG").unwrap(), "valid-slug");
-    }
-
-    #[test]
-    fn validate_slug_trims_whitespace() {
-        assert_eq!(validate_slug("  valid-slug  ").unwrap(), "valid-slug");
-    }
-
-    #[test]
-    fn validate_slug_rejects_invalid_characters() {
-        assert!(validate_slug("invalid_slug").is_err());
-        assert!(validate_slug("invalid slug").is_err());
-        assert!(validate_slug("invalid.slug").is_err());
-        assert!(validate_slug("invalid/slug").is_err());
-    }
-
-    #[test]
-    fn validate_slug_rejects_slug_under_3_characters() {
-        assert!(validate_slug("ab").is_err());
-        assert!(validate_slug("a").is_err());
-    }
-
-    #[test]
-    fn validate_slug_rejects_slug_over_64_characters() {
-        let long_slug = "a".repeat(65);
-        assert!(validate_slug(&long_slug).is_err());
-    }
-
-    #[test]
-    fn validate_slug_accepts_slug_at_64_character_boundary() {
-        let slug_64 = "a".repeat(64);
-        assert_eq!(validate_slug(&slug_64).unwrap().len(), 64);
-    }
-
-    #[test]
-    fn validate_slug_rejects_reserved_words() {
-        assert!(validate_slug("api").is_err());
-        assert!(validate_slug("admin").is_err());
-        assert!(validate_slug("health").is_err());
-        assert!(validate_slug("API").is_err());
-        assert!(validate_slug("Admin").is_err());
-    }
-
-    #[test]
-    fn validate_slug_accepts_digit_and_hyphen_combinations() {
-        assert!(validate_slug("test-123").is_ok());
-        assert!(validate_slug("123-test").is_ok());
-        assert!(validate_slug("123").is_ok());
-    }
-
-    #[test]
-    fn validate_redirect_url_accepts_empty_url() {
-        assert!(validate_redirect_url("").is_ok());
-    }
-
-    #[test]
-    fn validate_redirect_url_accepts_https_url() {
-        assert!(validate_redirect_url("https://example.com").is_ok());
-        assert!(validate_redirect_url("https://example.com/path").is_ok());
-        assert!(validate_redirect_url("https://example.com:8080/path?query=1").is_ok());
-    }
-
-    #[test]
-    fn validate_redirect_url_accepts_http_url() {
-        assert!(validate_redirect_url("http://example.com").is_ok());
-        assert!(validate_redirect_url("http://localhost:8000").is_ok());
-    }
-
-    #[test]
-    fn validate_redirect_url_rejects_javascript_scheme() {
-        assert!(validate_redirect_url("javascript:alert('xss')").is_err());
-    }
-
-    #[test]
-    fn validate_redirect_url_rejects_data_scheme() {
-        assert!(validate_redirect_url("data:text/html,<h1>xss</h1>").is_err());
-    }
-
-    #[test]
-    fn validate_redirect_url_rejects_invalid_url() {
-        assert!(validate_redirect_url("not a url").is_err());
-        assert!(validate_redirect_url("ht!tp://invalid").is_err());
-    }
-
-    #[test]
-    fn validate_redirect_url_rejects_relative_url() {
-        assert!(validate_redirect_url("/path/to/page").is_err());
-        assert!(validate_redirect_url("path/to/page").is_err());
-    }
-
-    #[test]
-    fn payment_intent_amount_cap_constant_is_set() {
-        assert_eq!(MAX_PAYMENT_INTENT_AMOUNT, 10_000_000_000);
-    }
-
-    #[test]
-    fn validate_amount_positive() {
-        assert!(1 > 0);
-        assert!(100_000 > 0);
-    }
-
-    #[test]
-    fn validate_amount_within_bounds() {
-        let amount = 1_000_000_000;
-        assert!(amount > 0 && amount <= MAX_PAYMENT_INTENT_AMOUNT);
-    }
-
-    #[test]
-    fn validate_amount_rejects_exceeding_cap() {
-        let amount = MAX_PAYMENT_INTENT_AMOUNT + 1;
-        assert!(amount > MAX_PAYMENT_INTENT_AMOUNT);
-    }
-
-    #[test]
-    fn validate_amount_accepts_at_cap_boundary() {
-        let amount = MAX_PAYMENT_INTENT_AMOUNT;
-        assert!(amount == MAX_PAYMENT_INTENT_AMOUNT);
+    fn expiry_is_capped() {
+        let now = Utc::now();
+        let cap = Duration::days(MAX_LINK_LIFETIME_DAYS);
+        assert!(validate_link_expiry(now + cap, now).is_ok());
+        assert!(validate_link_expiry(now + cap + Duration::seconds(1), now).is_err());
     }
 }

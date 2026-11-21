@@ -116,6 +116,8 @@ async fn deposit_fires_signed_webhook() {
         asset_issuer: None,
         amount: Some("3.5000000".into()),
         starting_balance: None,
+        balance_id: None,
+        claimant: None,
         transaction: None,
     };
     ingestor.process(&rec).await.unwrap();

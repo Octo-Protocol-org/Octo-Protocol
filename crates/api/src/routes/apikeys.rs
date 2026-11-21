@@ -17,12 +17,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Minimum accepted `expires_in_days` for a generated API key.
+const API_KEY_EXPIRY_MIN_DAYS: u32 = 1;
+/// Maximum accepted `expires_in_days` for a generated API key.
+const API_KEY_EXPIRY_MAX_DAYS: u32 = 365;
+
 /// Optional body for `generate_key`. An empty body is valid for first-time generation.
 #[derive(Debug, Default, Deserialize)]
 pub struct GenerateKeyRequest {
     /// Must be `true` to rotate an existing key (which immediately invalidates the old one).
     #[serde(default)]
     pub confirm: Option<bool>,
+    pub scopes: Option<Vec<String>>,
+    pub expires_in_days: Option<u32>,
 }
 
 /// Returned once when a key is generated — includes the full secret.
@@ -41,6 +48,9 @@ pub struct ApiKeyInfo {
     pub configured: bool,
     /// Non-secret display prefix, e.g. "octo_sk_test_ab12".
     pub prefix: Option<String>,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Confirm the authenticated user owns the wallet; returns the wallet network.
@@ -64,6 +74,10 @@ fn hash_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
+fn checksum(value: &str) -> String {
+    hash_key(value)[..8].to_string()
+}
+
 /// `POST /v1/wallets/:id/api-key` — generate the wallet's API key, or rotate it with
 /// `{"confirm": true}`. Without confirmation an existing key is never replaced (409), so a
 /// double-click or retried request can't silently break every integration using the old key.
@@ -76,6 +90,26 @@ pub async fn generate_key(
     let wallet = owned_wallet(&state, &headers, id).await?;
     let req: GenerateKeyRequest = parse_optional(&body)?;
     let rotate = req.confirm == Some(true);
+    let mut scopes = req
+        .scopes
+        .unwrap_or_else(|| vec!["read".into(), "write".into(), "sponsor".into()]);
+    if scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|scope| !matches!(scope.as_str(), "read" | "write" | "sponsor"))
+    {
+        return Err(ApiError::BadRequest("invalid API key scopes".into()));
+    }
+    if let Some(days) = req.expires_in_days {
+        if !(API_KEY_EXPIRY_MIN_DAYS..=API_KEY_EXPIRY_MAX_DAYS).contains(&days) {
+            return Err(ApiError::BadRequest(
+                "expires_in_days must be between 1 and 365".into(),
+            ));
+        }
+    }
+    let expires_at = req
+        .expires_in_days
+        .map(|days| chrono::Utc::now() + chrono::Duration::days(i64::from(days)));
 
     // octo_sk_<network>_<32 hex chars>
     let mut raw = [0u8; 16];
@@ -85,16 +119,21 @@ pub async fn generate_key(
     } else {
         "test"
     };
-    let api_key = format!("octo_sk_{net}_{}", hex::encode(raw));
+    let key_body = format!("octo_sk_{net}_{}", hex::encode(raw));
+    let api_key = format!("{key_body}_{}", checksum(&key_body));
     // Display prefix: scheme + first 4 random chars.
     let prefix = format!("octo_sk_{net}_{}", &hex::encode(raw)[..4]);
 
     // Insert-only unless rotation is confirmed: atomic on wallet_id, so no check-then-write race.
     let (store, key_hash) = (state.store(), hash_key(&api_key));
     let stored = if rotate {
-        store.upsert_api_key(id, &prefix, &key_hash).await
+        store
+            .upsert_api_key(id, &prefix, &key_hash, &scopes, expires_at)
+            .await
     } else {
-        store.create_api_key(id, &prefix, &key_hash).await
+        store
+            .create_api_key(id, &prefix, &key_hash, &scopes, expires_at)
+            .await
     };
     match stored {
         Ok(_) => {}
@@ -103,7 +142,7 @@ pub async fn generate_key(
                 "an API key already exists; pass confirm=true to rotate it".into(),
             ))
         }
-        Err(_) => return Err(ApiError::Internal),
+        Err(e) => return Err(crate::error::internal(e)),
     }
 
     if let Some(uid) = wallet.user_id {
@@ -144,7 +183,7 @@ pub async fn delete_key(
         .store()
         .delete_api_key(id)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
 
     if let Some(uid) = wallet.user_id {
         crate::audit::record(
@@ -172,10 +211,13 @@ pub async fn get_key(
         .store()
         .get_api_key(id)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
     Ok(Envelope::ok(ApiKeyInfo {
         wallet_id: id,
         configured: key.is_some(),
-        prefix: key.map(|k| k.prefix),
+        prefix: key.map(|k| k.prefix.clone()),
+        scopes: key.map(|k| k.scopes.clone()).unwrap_or_default(),
+        last_used_at: key.and_then(|k| k.last_used_at),
+        expires_at: key.and_then(|k| k.expires_at),
     }))
 }

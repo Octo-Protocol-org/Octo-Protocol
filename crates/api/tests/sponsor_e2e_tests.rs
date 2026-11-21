@@ -1046,3 +1046,119 @@ async fn sponsor_rejects_for_a_client_custody_wallet_with_no_gas_tank() {
         json["message"]
     );
 }
+
+// --- #463: sponsorship dry run ------------------------------------------------------------
+
+async fn sponsored_row_count(state: &AppState, wallet_id: &str) -> i64 {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sponsored_transactions WHERE wallet_id = $1::uuid")
+            .bind(wallet_id)
+            .fetch_one(state.store().pool())
+            .await
+            .unwrap();
+    n
+}
+
+#[tokio::test]
+async fn sponsor_validate_accepts_without_mutating_state() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsorship"),
+            r#"{"enabled":true,"daily_budget_stroops":10000}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let xdr = random_payment_xdr(&master_g);
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":200}}"#);
+    let validate_uri = format!("/v1/wallets/{wallet_id}/sponsor/validate");
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(post_json_auth(&validate_uri, &body, &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["data"]["verdict"], "accepted");
+        assert_eq!(json["data"]["projected_fee_stroops"], 200);
+        assert_eq!(json["data"]["budget_remaining_stroops"], 9800);
+    }
+    // Repeating the dry run neither reserved budget nor recorded the inner hash.
+    assert_eq!(sponsored_row_count(&state, &wallet_id).await, 0);
+
+    // The real call still succeeds afterwards: the dry run did not claim the dedup key.
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn sponsor_validate_reports_the_real_endpoints_rejection() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsorship"),
+            r#"{"enabled":true,"per_tx_fee_cap_stroops":500}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = format!(
+        r#"{{"transaction_xdr":"{}","max_base_fee_stroops":501}}"#,
+        random_payment_xdr(&master_g)
+    );
+    let validate = app
+        .clone()
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor/validate"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(validate.status(), StatusCode::OK);
+    let verdict = body_json(validate).await;
+
+    let real = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    let real_status = real.status();
+    let real_json = body_json(real).await;
+
+    assert_eq!(verdict["data"]["verdict"], "rejected");
+    assert_eq!(verdict["data"]["rejection_status"], real_status.as_u16());
+    assert_eq!(verdict["data"]["reason"], real_json["message"]);
+    assert_eq!(verdict["data"]["rejection_code"], real_json["code"]);
+    assert_eq!(sponsored_row_count(&state, &wallet_id).await, 0);
+}

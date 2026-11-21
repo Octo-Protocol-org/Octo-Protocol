@@ -1,0 +1,12 @@
+[package]
+name = "octo-metrics"
+description = "Process-wide Prometheus metrics (text exposition) with bounded-cardinality labels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately dependency-free: std only, so metrics never widen the supply-chain surface.
+[dependencies]

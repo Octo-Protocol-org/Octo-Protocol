@@ -8,11 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[features]
-test-fixtures = []
-
 [dependencies]
 chrono.workspace = true
+octo-resilience.workspace = true
+tokio.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
@@ -20,3 +19,6 @@ rand.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

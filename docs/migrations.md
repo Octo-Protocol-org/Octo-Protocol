@@ -19,7 +19,7 @@ This document serves as the single changelog-style decision index tracking every
 | `wallets` | `ingest_cursor` | `wallet_id` | `CASCADE` | Horizon sync cursor has a 1:1 lifecycle with the wallet. |
 | `users` | `wallets` | `user_id` | `SET NULL` | Preserves non-custodial wallets if an admin or dashboard user account is deleted. |
 | `wallets` | `api_keys` | `wallet_id` | `CASCADE` | API keys derive their permissions solely from the parent wallet. |
-| `users` | `audit_logs` | `user_id` | `CASCADE` | User-scoped audit events; system-level logs are archived independently. |
+| `users` | `audit_logs` | `user_id` | `CASCADE` | User-scoped audit events; system-level logs are archived independently. Since `0026` the cascade is the only non-retention path that may delete audit rows. |
 | `wallets` | `gas_sponsorship_configs` | `wallet_id` | `CASCADE` | Sponsorship configuration is a 1:1 extension of the sponsoring wallet. |
 | `wallets` | `sponsored_transactions` | `wallet_id` | `RESTRICT` | Fee-bump ledger must be preserved for audit and daily budget calculations. |
 | `wallets` | `withdrawal_allowlist_configs` | `wallet_id` | `CASCADE` | Anti-fraud toggle tied directly to wallet lifecycle. |
@@ -45,6 +45,7 @@ This document serves as the single changelog-style decision index tracking every
 | `0006` | `0006_audit_logs.sql` | `audit_logs` | Append-only table referencing `users(id) ON DELETE CASCADE`, tracking action, category, target, and IP. | Persistent audit trail for compliance and user visibility across dashboard operations. |
 | `0007` | `0007_gas_sponsorship.sql` | `gas_sponsorship_configs`, `sponsored_transactions` | Config `ON DELETE CASCADE`; `sponsored_transactions` `ON DELETE RESTRICT`, `UNIQUE (inner_tx_hash)`. | Enables fee-bump sponsorship with daily budget tracking and prevents duplicate inner transaction sponsorships. |
 | `0008` | `0008_scheme_version.sql` | `wallets` | Added `sealed_scheme SMALLINT NOT NULL DEFAULT 1`. | Explicit cipher/KDF version tag enabling zero-downtime key rotation via `bin/migrate-keys`. |
+| `0027` | `0027_api_key_lifecycle.sql` | `api_keys` | Added scopes, last-used timestamps, and optional expiry with supporting constraints/index. | Enables least-privilege keys and lifecycle enforcement without storing raw credentials. |
 | `0009` | `0009_token_denylist.sql` | `token_denylist` | SHA-256 hash of revoked JWTs with `expires_at` timestamp. | Stateless JWT revocation on logout without storing raw token strings in database. |
 | `0010` | `0010_sponsored_tx_status_index.sql` | `sponsored_transactions` | Replaced `(wallet_id, created_at)` with composite `(wallet_id, status, created_at DESC)`. | Aligns indexing with actual query filters (`wallet_id` + `status`) in hot fee-budget checks. |
 | `0011` | `0011_sponsored_and_audit_indexing.sql` | `sponsored_transactions`, `audit_logs` | Partial index for pending fee reservations; `pg_trgm` extension and GIN trigram index on audit logs. | Accelerates rolling daily budget CTEs and enables fast ILIKE search over audit actions/targets. |
@@ -58,6 +59,56 @@ This document serves as the single changelog-style decision index tracking every
 | `0019` | `0019_email_otp.sql` | `email_otps` | Table referencing `users(id) ON DELETE CASCADE`; code hash; purpose CHECK; optional `tx_hash_bound`. | Rate-limited email OTP verification for registration and high-risk withdrawal authorizations. |
 | `0020` | `0020_username.sql` | `users` | Added `username TEXT` with unique partial index on `lower(username)`. | Case-insensitive unique display handles distinct from email addresses. |
 | `0021` | `0021_soft_delete_webhook_endpoints.sql` | `webhook_endpoints` | Added `deleted_at TIMESTAMPTZ` and filtered indices on `(wallet_id)` where `deleted_at IS NULL`. | Soft-delete endpoint path (Issue #338) preventing accidental cascade-purges of `webhook_deliveries` logs. |
+| `0026` | `0026_audit_logs_append_only.sql` | `audit_logs`; functions `audit_logs_retention_allowed`, `audit_logs_block_mutation`, `audit_logs_block_truncate` | `BEFORE UPDATE OR DELETE` row trigger and `BEFORE TRUNCATE` statement trigger raise `insufficient_privilege`. Bypass only for members of `octo_audit_retention` (created out-of-band) or a `DELETE` whose owning `users` row is already gone (FK cascade). Functions pin `search_path = pg_catalog, pg_temp` and schema-qualify `users` via `TG_TABLE_SCHEMA`. | Issue #438: append-only was a convention. A temp table can't spoof the checks; signup rollback still cascades. See `docs/postgres-roles.md`. |
+| `0028` | `0028_rate_limit_buckets.sql` | `rate_limit_buckets` | `UNLOGGED`; PK `(key, class)`; index on `expires_at`; no foreign keys. | Shared fixed-window counters so API rate limits hold across replicas and restarts (Issue #445). Unlogged because losing counters on a Postgres crash only resets windows early. |
+| `0032` | `0032_payment_link_expiry_cancel.sql` | `payment_links`, `payment_link_payments` | Added nullable `expires_at` and `cancelled_at` to `payment_links`; widened the payment status CHECK with `'cancelled'`; partial index on `expires_at` for open links. No new foreign keys. | Issue #454: merchants can time-box and cancel links. Both columns are nullable so existing links stay open-ended; `cancelled_at` is write-once (enforced in the store) so a cancelled link can't be revived. |
+| `0032` | `0032_wallet_ingest_streaming.sql` | `wallets.ingest_streaming`, `idx_wallets_ingest_streaming` | `BOOLEAN NOT NULL DEFAULT FALSE`; partial index on `(network, id) WHERE ingest_streaming`; no foreign keys. | Per-wallet opt-in to Horizon SSE ingest (Issue #446). Defaults off so existing wallets keep polling; the partial index keeps the supervisor's streaming-wallet lookup cheap. |
+| `0032` | `0032_wallet_ingest_paused.sql` | `wallets` | Added `ingest_paused BOOLEAN NOT NULL DEFAULT false` and `ingest_paused_at TIMESTAMPTZ`; partial index `idx_wallets_ingest_active (network, id) WHERE ingest_paused = false`. No FK changes. | Issue #450: operators can stop polling a misbehaving wallet without deleting it. `ingest_cursor` is never touched by a pause, so resume continues from the saved paging token without gaps. |
+| `0033` | `0033_transaction_history_filters.sql` | `transactions` | Added `idx_tx_wallet_created (wallet_id, created_at DESC, id DESC)` and `idx_tx_wallet_asset_created (wallet_id, asset_code, created_at DESC, id DESC)`; dropped the now-redundant `idx_tx_wallet`. No FK changes (the `RESTRICT` check on `wallet_id` is still served by the composite's leading column). | Issue #451: filtered history (`from`/`to`/`asset`/`status`) with keyset pagination on `(created_at, id)` is answered by one ordered index scan instead of a sort over every wallet row. |
+| `0034` | `0034_idempotency_keys.sql` | `idempotency_keys` | PK `(wallet_id, scope, key)`; `wallet_id` → `wallets(id) ON DELETE CASCADE`; `key` length CHECK 1-255; SHA-256 `request_hash`; nullable `status_code`/`response` (NULL = in progress); index on `expires_at`. | Issue #453: a retried payment-link create replays the stored response instead of creating a duplicate, and reusing a key with a different body is a conflict. Rows expire after 24h and are purged hourly. They cascade with the wallet because they only cache its own responses. |
+
+---
+
+## Migration Lint Rules
+
+CI runs a migration linter (`scripts/lint-migrations.sh`) on every PR that touches `crates/store/migrations/`. The linter scans each migration file for statements that can lock a hot table or destroy data, and fails the build unless the statement is either safe or explicitly annotated. Run it locally with `just lint-migrations`.
+
+### Flagged statements
+
+| Rule | Pattern | Why it is flagged |
+|---|---|---|
+| `drop-table` | `DROP TABLE ...` | Destroys all rows and dependent objects. |
+| `drop-column` | `ALTER TABLE ... DROP COLUMN ...` | Irreversibly discards data and breaks running code that still selects the column. |
+| `drop-constraint` | `ALTER TABLE ... DROP CONSTRAINT ...` | Silently removes integrity guarantees. |
+| `drop-index` | `DROP INDEX ...` | Can regress hot query paths; also takes an `ACCESS EXCLUSIVE` lock on the table. |
+| `create-index` | `CREATE INDEX ...` (without `CONCURRENTLY`) | Takes a write-blocking `SHARE` lock for the duration of the build. |
+| `alter-type` | `ALTER TABLE ... ALTER COLUMN ... TYPE ...` | Rewrites the whole table under `ACCESS EXCLUSIVE`; on large tables this is a full outage. |
+| `duplicate-prefix` | Two or more migration files sharing the same numeric version prefix (e.g. `0032_*.sql`) | Makes apply order ambiguous: the runner sorts by filename, so the relative order of same-prefix files is alphabetical accident rather than intent. |
+
+`CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are allowed and are the preferred form for any table that may hold production traffic.
+
+### Duplicate version prefixes
+
+Every migration file must have a unique numeric version prefix. The linter lists any prefix shared by more than one file and fails the build, so a new duplicate cannot be merged.
+
+Already-merged duplicates are grandfathered via a small allowlist in the linter (`0021`, `0026`, `0032`). These are historical and must not be extended: a new migration must pick the next unused prefix. Known gap: `0023` and `0024` are missing from the sequence, so the next migration should use `0035` (or the next free number) rather than backfilling them.
+
+### Annotated overrides
+
+When a flagged statement is genuinely required (e.g. a baseline migration that creates a brand-new table, or a deliberate data-destroying cleanup), annotate it with a comment on the line immediately above the statement:
+
+```sql
+-- migration-lint: allow <reason>
+CREATE INDEX idx_wallets_user ON wallets (user_id);
+```
+
+The reason is mandatory and must be non-empty; the linter rejects a bare `-- migration-lint: allow`. The annotation applies only to the next non-comment, non-blank line, so each exception must be documented individually. Reviewers should treat every override as a design decision worth questioning.
+
+### Existing exceptions
+
+| Migration | Statement | Reason |
+|---|---|---|
+| `0001_init.sql` | `CREATE INDEX` on newly created tables | Baseline schema; tables are empty at migration time, so a non-concurrent build cannot block traffic. |
 
 ---
 
@@ -66,3 +117,5 @@ This document serves as the single changelog-style decision index tracking every
 > **Mandatory Rule for PRs:**
 > Any PR that adds a new migration file under `crates/store/migrations/` **must** append a new entry to the decision index table above within the same PR.
 > The entry must document the migration version, filename, target schema objects, foreign key `ON DELETE` rules, constraints, and the design rationale.
+>
+> Any PR that adds a `-- migration-lint: allow` override **must** also add a row to the *Existing exceptions* table above explaining why the flagged statement is safe.

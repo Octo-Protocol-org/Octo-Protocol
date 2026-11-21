@@ -114,6 +114,24 @@ the loop counter did not advance. This is harmless because `record_deposit` is i
 
 ---
 
+### Streaming Mode (Issue #446)
+
+A wallet with `wallets.ingest_streaming = true` (set via `Store::set_ingest_streaming`) also gets a
+Horizon SSE connection to `/accounts/{G}/payments`, opened from the same `ingest_cursor`
+(`"0"` when the wallet has no cursor yet, so history is replayed rather than skipped). Records go
+through the same `Ingestor::process` + `set_cursor` path as polling, so dedup and resume are
+unchanged.
+
+- **Fallback:** while the stream is open the wallet is in `LiveStreams` and `Supervisor::tick`
+  skips it; once the stream closes, errors, or is silent for 60 s it leaves that set and the next
+  tick polls it.
+- **Reconnect backoff:** 1 s doubling to a 5 min cap, plus up to 25 % per-wallet jitter. Only a
+  session that stayed up 30 s resets the backoff, so a flapping connection cannot storm Horizon.
+- **Circuit breaker:** stream connects share the ingest breaker with polling; an open breaker
+  refuses the connect and counts as an unhealthy session.
+- **Bounds:** at most 200 streams per network; SSE lines/events are capped at 1 MiB; streams are
+  owned by the leadership term and stop when the leader lock is lost.
+
 ## Two-Layer Dedup
 
 The store has **two** unique indexes on the `transactions` table. Both are partial — they only

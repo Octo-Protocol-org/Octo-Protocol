@@ -45,18 +45,55 @@ A Cargo workspace; all secret-handling is isolated in `wallet-core` and zeroized
 | [`crates/webhooks`](crates/webhooks) | HMAC-SHA256 signed outbound webhooks + delivery log |
 | [`crates/ingest`](crates/ingest) | Horizon payment streaming + durable cursor → deposit detection |
 | [`crates/api`](crates/api) | axum REST API |
+| [`crates/email`](crates/email) | Transactional email delivery for notifications |
+| [`crates/resilience`](crates/resilience) | Retry, backoff and circuit-breaker primitives |
+| [`crates/metrics`](crates/metrics) | Prometheus metrics registry and HTTP exposition |
+| [`crates/evm-core`](crates/evm-core) | EVM chain primitives and address handling |
+| [`crates/evm-rpc`](crates/evm-rpc) | JSON-RPC client for EVM nodes |
+| [`crates/horizon-mock`](crates/horizon-mock) | Scripted mock Horizon server for offline tests |
 | [`bin/server`](bin/server) | composes `api` + `ingest` into one service |
+| [`bin/seed`](bin/seed) | loads idempotent demo data into the local database |
+| [`bin/horizon-mock`](bin/horizon-mock) | runs the mock Horizon server standalone |
 
 See [docs/architecture.md](docs/architecture.md).
+The persisted encryption compatibility contract is documented in
+[docs/sealed-seed-versioning.md](docs/sealed-seed-versioning.md).
 
 ## Quickstart
+
+### Fastest path: Docker Compose (db + server)
+
+```bash
+# 1. Tooling: Docker + Docker Compose v2
+cp .env.example .env                 # then fill MASTER_KEY (openssl rand -base64 32)
+
+# 2. Bring up Postgres + the API/ingest server
+docker compose up                    # API on http://localhost:8080, health at /health
+```
+
+`docker compose up` waits for Postgres to report healthy, applies migrations, then starts
+`octo-server` (REST API + deposit ingest worker in one process). Verify it is up:
+
+```bash
+curl -s localhost:8080/health
+```
+
+To run against a **mock Horizon** instead of the real testnet (useful offline / in CI), enable
+the optional `mock-horizon` profile — it starts a stub Horizon and points the server at it via
+`HORIZON_URL`:
+
+```bash
+docker compose --profile mock-horizon up
+```
+
+### Local toolchain path
 
 ```bash
 # 1. Tooling: Rust 1.84.1 (pinned via rust-toolchain.toml), Docker, just
 cp .env.example .env                 # then fill MASTER_KEY (openssl rand -base64 32)
 
 # 2. Local Postgres
-docker compose up -d db
+just db-up          # docker compose up -d db
 
 # 3. Build & test
 just build
@@ -65,6 +102,24 @@ just test
 # 4. Run the service (REST API + deposit ingest worker)
 just run            # cargo run -p octo-server  → API on $BIND_ADDR (default :8080)
 ```
+
+Other handy recipes (see `just --list`): `just migrate` applies migrations, `just db-reset`
+drops and recreates the local database, and `just seed` loads idempotent demo data (a verified
+user, wallets and sample deposit history). `just seed` refuses to run against mainnet configs.
+
+For offline development and tests, a small mock Horizon server serves scripted accounts,
+payments and submit responses — no network or testnet required. See
+[docs/mock-horizon.md](docs/mock-horizon.md) for fixtures and how to point the server at it.
+
+### Configuration
+
+Every setting is read from the environment (or `.env`). The complete reference — purpose,
+default, whether it is required, and whether it is a **secret** — lives in
+[docs/environment-variables.md](docs/environment-variables.md). Read it before copying
+`.env.example`, and never commit a filled-in `.env`.
+
+CI enforces this: a test fails if the server reads an environment variable that is not
+documented in that reference, so the table always matches the code.
 
 Then, against a running server (testnet):
 
@@ -105,6 +160,9 @@ See [docs/non-custodial-flow.md](docs/non-custodial-flow.md) for the full
 build → sign → relay sequence. Accepting payments via a shareable link is walked through in
 [docs/api.md](docs/api.md#payment-link-checkout-flow); account activity categories are in
 [docs/audit-log.md](docs/audit-log.md).
+
+New here? Follow the end-to-end, curl-only walkthrough from signup to a received deposit
+(including webhook delivery) in **[docs/quickstart-testnet.md](docs/quickstart-testnet.md)**.
 
 ## Security architecture
 
@@ -222,11 +280,46 @@ open public issues for security reports.
 - [Operational Runbook: Operation Index Backfill](docs/runbook-backfill-operation-index.md)
 - [Backfill Constraint Safety Analysis](docs/backfill-constraint-analysis.md)
 - [REST API Specification](docs/api.md)
+- [Production Deployment Guide](docs/deployment.md)
+- [Mock Horizon Server & Fixtures](docs/mock-horizon.md)
 
 ## Deployment
 
 `octo-server` runs the REST API and the deposit ingest worker in one process and is safe to
-roll (Kubernetes, ECS, systemd) behind a load balancer.
+roll (Kubernetes, ECS, systemd) behind a load balancer. For TLS termination, proxy headers,
+trusted proxies, secrets, Postgres and single- vs multi-instance caveats, see the
+**[Production Deployment Guide](docs/deployment.md)**.
+
+### Container image
+
+The repo ships a hardened multi-stage `Dockerfile`:
+
+- **Multi-stage build** on a minimal runtime base — the final image contains only the compiled
+  `octo-server` binary, no shell and no package manager.
+- **Non-root** — runs as an unprivileged user (no `root`).
+- **Read-only root filesystem friendly** — writes nothing outside `/tmp`; run with
+  `--read-only --tmpfs /tmp` (or the equivalent in your orchestrator).
+- **Healthcheck** — `HEALTHCHECK` probes `GET /health`.
+
+Build args (all optional, with defaults):
+
+| Build arg | Default | Description |
+|---|---|---|
+| `RUST_VERSION` | pinned toolchain | Rust toolchain used in the builder stage |
+| `BIND_ADDR` | `0.0.0.0:8080` | Address the server listens on inside the image |
+| `APP_UID` / `APP_GID` | unprivileged ids | UID/GID of the non-root runtime user |
+
+```bash
+# Build the hardened image
+docker build -t octo-server .
+
+# Run it read-only, as non-root, with a writable /tmp
+docker run --rm --read-only --tmpfs /tmp \
+  -p 8080:8080 --env-file .env octo-server
+```
+
+CI additionally runs a **Trivy** image/config scan and a **fuzz** job over the submit-path
+validation, so image and parser regressions are caught before release.
 
 ### Graceful shutdown
 
@@ -269,3 +362,8 @@ Early development — built step by step. See the workspace crates for what's im
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-648 -->
+- #648: fix(resilience): Recover from poisoned mutexes in CircuitBreaker instead of panicking

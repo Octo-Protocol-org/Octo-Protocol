@@ -1,7 +1,8 @@
 //! API error type and the standard JSON response envelope.
 //!
-//! Every response (success or error) is `{ statusCode, message, data }`. Errors never leak
-//! internal detail (DB messages, key material, stack traces) — they map to coarse, safe messages.
+//! Every response (success or error) is `{ statusCode, message, data }`; errors add a stable
+//! machine-readable `code` (see [`ERROR_CODES`]). Errors never leak internal detail (DB messages,
+//! key material, stack traces) — they map to coarse, safe messages.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -37,10 +38,81 @@ pub enum ApiError {
     Internal,
     /// 504 — an upstream dependency (e.g. Horizon) did not answer within the route's time budget.
     GatewayTimeout(String),
+    /// 503 — a dependency needed to make a safe decision (e.g. Horizon) is unavailable.
+    ServiceUnavailable(String),
+}
+
+/// The public error-code catalogue: `(code, HTTP status, meaning)`. Codes are a stable contract —
+/// never rename or reuse one; add new ones here, in `docs/api.md` and in `docs/openapi.yaml`.
+pub const ERROR_CODES: &[(&str, u16, &str)] = &[
+    ("bad_request", 400, "The request was malformed or failed validation."),
+    ("stale_sequence", 400, "The transaction's sequence number is stale; refresh signing info and rebuild."),
+    ("unauthorized", 401, "Missing, invalid or revoked credentials."),
+    ("forbidden", 403, "Authenticated, but the server refuses this action for this resource."),
+    ("not_found", 404, "The resource or route does not exist, or is not visible to this caller."),
+    ("method_not_allowed", 405, "The route exists but not for this HTTP method."),
+    ("already_exists", 409, "A resource with this identity already exists (duplicate)."),
+    ("conflict", 409, "The resource's current state does not allow this change."),
+    ("gone", 410, "The endpoint or resource has been permanently removed or closed."),
+    ("payload_too_large", 413, "The request body exceeds the 64 KiB limit."),
+    ("unsupported_media_type", 415, "The request body has an unsupported Content-Type."),
+    ("too_many_requests", 429, "A rate limit or budget would be exceeded."),
+    ("internal_error", 500, "An internal error occurred; details are logged, never returned."),
+    ("upstream_timeout", 504, "An upstream dependency (e.g. Horizon) did not answer in time."),
+    ("service_unavailable", 503, "A dependency needed to make a safe decision is unavailable."),
+];
+
+/// Code for an error raised outside [`ApiError`] (extractor rejections, unknown routes, body limit).
+pub fn code_for_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "not_found",
+        405 => "method_not_allowed",
+        409 => "conflict",
+        410 => "gone",
+        413 => "payload_too_large",
+        415 => "unsupported_media_type",
+        429 => "too_many_requests",
+        503 => "service_unavailable",
+        504 => "upstream_timeout",
+        s if s >= 500 => "internal_error",
+        _ => "bad_request",
+    }
+}
+
+/// Build the standard error envelope: `{ statusCode, code, message, data: null }`.
+pub fn error_response(status: StatusCode, code: &'static str, message: String) -> Response {
+    let body = Json(json!({
+        "statusCode": status.as_u16(),
+        "code": code,
+        "message": message,
+        "data": serde_json::Value::Null,
+    }));
+    (status, body).into_response()
 }
 
 impl ApiError {
-    fn parts(&self) -> (StatusCode, String) {
+    /// Stable machine-readable code for this variant — one per variant, listed in [`ERROR_CODES`].
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::Unauthorized => "unauthorized",
+            ApiError::Forbidden(_) => "forbidden",
+            ApiError::NotFound => "not_found",
+            ApiError::Conflict => "already_exists",
+            ApiError::ConflictWith(_) => "conflict",
+            ApiError::Gone(_) => "gone",
+            ApiError::TooManyRequests(_) => "too_many_requests",
+            ApiError::StaleSequence(_) => "stale_sequence",
+            ApiError::Internal => "internal_error",
+            ApiError::GatewayTimeout(_) => "upstream_timeout",
+            ApiError::ServiceUnavailable(_) => "service_unavailable",
+        }
+    }
+
+    /// HTTP status and client-safe message.
+    pub fn parts(&self) -> (StatusCode, String) {
         match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
@@ -56,6 +128,7 @@ impl ApiError {
                 "internal server error".into(),
             ),
             ApiError::GatewayTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, m.clone()),
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
         }
     }
 }
@@ -63,13 +136,17 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = self.parts();
-        let body = Json(json!({
-            "statusCode": status.as_u16(),
-            "message": message,
-            "data": serde_json::Value::Null,
-        }));
-        (status, body).into_response()
+        error_response(status, self.code(), message)
     }
+}
+
+/// Log the cause of an internal failure and map it to the opaque [`ApiError::Internal`].
+///
+/// Only the error's `Debug` representation is logged — never request bodies, tokens, API keys or
+/// addresses — and the client response stays the generic "internal server error".
+pub(crate) fn internal(e: impl std::fmt::Debug) -> ApiError {
+    tracing::error!(error = ?e, "internal error");
+    ApiError::Internal
 }
 
 /// Map store errors to API errors without leaking DB internals.
@@ -86,6 +163,9 @@ impl From<octo_store::StoreError> for ApiError {
             }
             octo_store::StoreError::BudgetExceeded => {
                 ApiError::TooManyRequests("daily sponsorship budget exceeded".into())
+            }
+            octo_store::StoreError::DuplicateCustomerRef => {
+                ApiError::ConflictWith("customer_ref already in use for this wallet".into())
             }
             // Database/migration errors are logged by the caller; never echoed.
             _ => ApiError::Internal,
@@ -105,17 +185,28 @@ impl From<octo_wallet_core::WalletError> for ApiError {
             | W::InvalidAmount
             | W::InvalidDerivationPath
             | W::InvalidXdr
-            | W::InvalidSignature => ApiError::BadRequest("invalid input".into()),
+            | W::InvalidSignature
+            | W::InvalidSeedLength
+            | W::WeakSeed
+            | W::MnemonicAccountMismatch => ApiError::BadRequest("invalid input".into()),
             W::ReservedNativeAssetCode => ApiError::BadRequest(
                 "native asset codes cannot be used as credit asset codes".into(),
             ),
             W::StaleSequence => ApiError::StaleSequence(
                 "Stale sequence number — refresh signing info and rebuild the transaction.".into(),
             ),
-            ),
             W::KeyDerivation | W::Signing | W::SeedDecryption => ApiError::Internal,
         }
     }
+}
+
+/// Log an internal failure (type/message only) and map it to the opaque [`ApiError::Internal`].
+///
+/// Use this instead of `map_err(|_| ApiError::Internal)` so a 500 leaves a trace in the logs.
+/// Never pass request bodies, tokens or addresses here — only the underlying error.
+pub fn internal(e: impl std::fmt::Debug) -> ApiError {
+    tracing::error!(error = ?e, "internal error");
+    ApiError::Internal
 }
 
 /// Wrap any serializable value in the standard success envelope with a status code.
@@ -149,21 +240,61 @@ impl<T: Serialize> Envelope<T> {
 }
 
 impl Envelope<Option<()>> {
-    /// Build an error envelope so failures raised in middleware (e.g. an oversized body
-    /// rejected before any handler runs) use the same `{statusCode, message, data}` shape as
-    /// every other response.
-    pub fn error(
-        status: StatusCode,
-        message: String,
-        data: Option<()>,
-    ) -> (StatusCode, Json<Envelope<Option<()>>>) {
-        (
-            status,
-            Json(Envelope {
-                status_code: status.as_u16(),
-                message,
-                data,
-            }),
-        )
+    /// Build an error envelope (with the status-derived `code`) for failures raised in
+    /// middleware, so they match every other error response.
+    pub fn error(status: StatusCode, message: String) -> Response {
+        error_response(status, code_for_status(status), message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_maps_to_opaque_500() {
+        let err = internal("db exploded");
+        assert!(matches!(err, ApiError::Internal));
+        let (status, message) = err.parts();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "internal server error");
+    }
+
+    #[test]
+    fn every_variant_maps_to_one_catalogue_entry() {
+        let variants = [
+            ("BadRequest", ApiError::BadRequest("bad".into())),
+            ("Unauthorized", ApiError::Unauthorized),
+            ("Forbidden", ApiError::Forbidden("no".into())),
+            ("NotFound", ApiError::NotFound),
+            ("Conflict", ApiError::Conflict),
+            ("ConflictWith", ApiError::ConflictWith("conflict".into())),
+            ("Gone", ApiError::Gone("gone".into())),
+            ("TooManyRequests", ApiError::TooManyRequests("slow".into())),
+            ("StaleSequence", ApiError::StaleSequence("stale".into())),
+            ("Internal", ApiError::Internal),
+            ("GatewayTimeout", ApiError::GatewayTimeout("timeout".into())),
+            (
+                "ServiceUnavailable",
+                ApiError::ServiceUnavailable("unavailable".into()),
+            ),
+        ];
+
+        for (name, err) in &variants {
+            let code = err.code();
+            let matches: Vec<_> = ERROR_CODES.iter().filter(|(c, _, _)| *c == code).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "ApiError::{name} code {code:?} must appear exactly once in ERROR_CODES"
+            );
+            let (_, catalogue_status, _) = matches[0];
+            let (status, _) = err.parts();
+            assert_eq!(
+                *catalogue_status,
+                status.as_u16(),
+                "ApiError::{name} code {code:?} status {status} must match catalogue status {catalogue_status}"
+            );
+        }
     }
 }

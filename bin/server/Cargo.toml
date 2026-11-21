@@ -21,10 +21,21 @@ octo-webhooks.workspace = true
 octo-email.workspace = true
 octo-wallet-core.workspace = true
 octo-resilience.workspace = true
+octo-metrics.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
 dotenvy = "0.15"
+# Only for the `otel` exporter; both are already in the tree via the API crate.
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+# OTLP/HTTP span export (issue #468). Still off at runtime until OTEL_EXPORTER_OTLP_ENDPOINT is set.
+otel = ["dep:reqwest", "dep:serde_json"]

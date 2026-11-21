@@ -1,129 +1,84 @@
-//! Transactional email via Resend, plus OTP generation and hashing.
+//! Transactional email behind a pluggable transport, plus OTP generation and hashing.
 #![forbid(unsafe_code)]
 
 mod error;
 pub mod templates;
+mod transport;
 
 pub use error::EmailError;
+pub use transport::{
+    CaptureTransport, DeliverFuture, Email, EmailTransport, FailingTransport, LogOnlyTransport,
+    ResendTransport, SharedTransport,
+};
 
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::sync::Arc;
 
-#[cfg(feature = "test-fixtures")]
-use std::sync::{Arc, Mutex};
-
-const RESEND_URL: &str = "https://api.resend.com/emails";
-
-/// A captured OTP, recorded instead of actually emailed when using [`EmailSender::new_captured`].
-#[cfg(feature = "test-fixtures")]
-#[derive(Debug, Clone)]
-pub struct CapturedOtp {
-    pub to: String,
-    pub code: String,
-}
-
-/// Sends transactional email via Resend's HTTP API.
+/// Sends transactional email through whichever [`EmailTransport`] it was built with.
 #[derive(Clone)]
 pub struct EmailSender {
-    api_key: String,
-    from_address: String,
-    http: reqwest::Client,
-    #[cfg(feature = "test-fixtures")]
-    captured: Option<Arc<Mutex<Vec<CapturedOtp>>>>,
-    #[cfg(feature = "test-fixtures")]
-    always_fail: bool,
+    transport: SharedTransport,
 }
 
 impl EmailSender {
+    /// A sender backed by Resend.
     pub fn new(api_key: String, from_address: String) -> Self {
-        Self {
-            api_key,
-            from_address,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
-            #[cfg(feature = "test-fixtures")]
-            captured: None,
-            #[cfg(feature = "test-fixtures")]
-            always_fail: false,
-        }
+        Self::with_transport(Arc::new(ResendTransport::new(api_key, from_address)))
     }
 
-    /// A sender that records OTP codes in memory instead of calling Resend — lets integration
-    /// tests complete the signup/withdrawal OTP flow without a real inbox.
-    #[cfg(feature = "test-fixtures")]
+    pub fn with_transport(transport: SharedTransport) -> Self {
+        Self { transport }
+    }
+
+    /// A sender that records messages in memory — lets integration tests complete the
+    /// signup/withdrawal OTP flow without a real inbox.
     pub fn new_captured() -> Self {
-        Self {
-            captured: Some(Arc::new(Mutex::new(Vec::new()))),
-            ..Self::new(String::new(), "test@octo.test".to_string())
-        }
+        Self::with_transport(Arc::new(CaptureTransport::default()))
     }
 
-    /// A sender that always fails to send — simulates a Resend rejection (e.g. unverified
-    /// domain), so callers can test their rollback/error-handling behavior.
-    #[cfg(feature = "test-fixtures")]
+    /// A sender that only logs recipient and subject — for local runs without a provider.
+    pub fn new_log_only() -> Self {
+        Self::with_transport(Arc::new(LogOnlyTransport))
+    }
+
+    /// A sender that always fails — simulates a provider rejection so callers can test their
+    /// rollback/error-handling behavior.
     pub fn new_failing() -> Self {
-        Self {
-            always_fail: true,
-            ..Self::new(String::new(), "test@octo.test".to_string())
-        }
+        Self::with_transport(Arc::new(FailingTransport))
     }
 
-    /// The most recently captured OTP for `to`, if any. Test-fixtures only.
-    #[cfg(feature = "test-fixtures")]
+    /// The most recently captured OTP for `to`, if the transport retains messages.
     pub fn last_otp_for(&self, to: &str) -> Option<String> {
-        let captured = self.captured.as_ref()?.lock().ok()?;
-        captured
+        self.transport
+            .sent()
             .iter()
             .rev()
-            .find(|c| c.to == to)
-            .map(|c| c.code.clone())
+            .filter(|m| m.to == to)
+            .find_map(|m| templates::extract_otp(&m.html))
     }
 
-    /// Send an OTP email. In captured mode, records `code` instead of calling Resend.
+    /// Send an OTP email.
     pub async fn send_otp(&self, to: &str, purpose: &str, code: &str) -> Result<(), EmailError> {
-        #[cfg(feature = "test-fixtures")]
-        if self.always_fail {
-            return Err(EmailError::Rejected("simulated failure".into()));
-        }
-        #[cfg(feature = "test-fixtures")]
-        if let Some(captured) = &self.captured {
-            captured.lock().unwrap().push(CapturedOtp {
-                to: to.to_string(),
-                code: code.to_string(),
-            });
-            return Ok(());
-        }
-        let html = templates::otp_email(code, purpose);
-        self.send(to, "Your Octo verification code", &html).await
+        let body = templates::otp_email(code, purpose);
+        self.send(to, "Your Octo verification code", &body).await
     }
 
-    /// Send one HTML email. Logs and propagates failure — callers on a critical path (e.g. an
-    /// OTP the user has no other way to receive) need to know sending failed, not just log it.
-    pub async fn send(&self, to: &str, subject: &str, html: &str) -> Result<(), EmailError> {
-        let body = serde_json::json!({
-            "from": self.from_address,
-            "to": to,
-            "subject": subject,
-            "html": html,
-        });
-
-        let resp = self
-            .http
-            .post(RESEND_URL)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if resp.status().is_success() {
-            return Ok(());
-        }
-        let detail = resp.text().await.unwrap_or_default();
-        tracing::warn!(to, subject, detail, "Resend rejected an email send");
-        Err(EmailError::Rejected(detail))
+    /// Send one multipart (HTML + plain-text) email. Propagates failure — callers on a critical
+    /// path (e.g. an OTP the user has no other way to receive) need to know sending failed.
+    pub async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &templates::Body,
+    ) -> Result<(), EmailError> {
+        let email = Email {
+            to: to.to_string(),
+            subject: subject.to_string(),
+            html: body.html.clone(),
+            text: body.text.clone(),
+        };
+        self.transport.deliver(&email).await
     }
 }
 

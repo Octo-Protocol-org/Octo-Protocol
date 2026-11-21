@@ -79,7 +79,7 @@ async fn find_candidates_batch(
     store: &Store,
     limit: usize,
     offset: usize,
-) -> Result<Vec<UpdateCandidate>> {
+) -> Result<(Vec<UpdateCandidate>, usize)> {
     let query = r#"
         SELECT id, horizon_op_id, operation_index, stellar_tx_hash
         FROM transactions 
@@ -97,6 +97,7 @@ async fn find_candidates_batch(
         .await
         .context("Failed to fetch candidate rows")?;
 
+    let examined = rows.len();
     let mut candidates = Vec::new();
 
     for row in rows {
@@ -118,7 +119,7 @@ async fn find_candidates_batch(
         }
     }
 
-    Ok(candidates)
+    Ok((candidates, examined))
 }
 
 async fn update_batch(
@@ -195,10 +196,7 @@ async fn update_batch(
 
 async fn run_backfill(args: Args) -> Result<()> {
     info!("Starting operation_index backfill");
-    info!(
-        "Database URL: {}",
-        args.database_url.chars().take(20).collect::<String>() + "..."
-    );
+    // Never log the URL, even truncated: its prefix is `postgres://user:password`.
     info!("Batch size: {}", args.batch_size);
     info!("Dry run: {}", args.dry_run);
     info!(
@@ -236,17 +234,26 @@ async fn run_backfill(args: Args) -> Result<()> {
             offset, current_batch_size
         );
 
-        let candidates = find_candidates_batch(&store, current_batch_size, offset)
+        let (candidates, examined) = find_candidates_batch(&store, current_batch_size, offset)
             .await
             .context("Failed to find candidate records")?;
 
-        if candidates.is_empty() {
+        if examined == 0 {
             info!("No more records to process");
             break;
         }
 
-        stats.total_examined += current_batch_size;
+        stats.total_examined += examined;
         stats.needs_update += candidates.len();
+
+        if candidates.is_empty() {
+            offset += examined;
+            total_processed += examined;
+            if examined < current_batch_size {
+                break;
+            }
+            continue;
+        }
 
         // Log some examples of what we're about to update
         if !candidates.is_empty() {
@@ -284,8 +291,8 @@ async fn run_backfill(args: Args) -> Result<()> {
             }
         }
 
-        offset += current_batch_size;
-        total_processed += current_batch_size;
+        offset += examined;
+        total_processed += examined;
 
         // Check if we've reached the limit
         if args.limit > 0 && total_processed >= args.limit {

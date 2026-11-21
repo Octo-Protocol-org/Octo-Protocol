@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- API: `service_unavailable` (503) is now part of the public error catalogue in `ERROR_CODES`,
+  `docs/api.md` and the `ErrorResponse.code` enum in `docs/openapi.yaml` (#608).
+- Docker: the builder image's default `RUST_VERSION` is aligned with the pinned `1.84.1`
+  toolchain in `rust-toolchain.toml` (#605).
+- `octo-server --check-config`: validates the environment, the mainnet guard, database
+  connectivity and pending migrations, prints a redacted summary and exits non-zero on any
+  failure (#469). Also adds the `Store::ping` the readiness probe already called.
+- Optional OTLP/HTTP span export behind the `otel` cargo feature and
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (both off by default), with `traceparent` propagation to
+  Horizon and sensitive span fields dropped before export (#468). See `docs/tracing.md`.
+- Prometheus `/metrics` on a separate, opt-in listener (token required off loopback): HTTP
+  latency histograms, circuit-breaker state, webhook outcomes and ingest tick/lag series, all
+  with bounded label cardinality (#467). See `docs/metrics.md`.
+- Account data export and deletion, each gated by password plus an emailed OTP. Deletion is
+  refused while any wallet holds funds, tombstones the user and anonymises (and re-links) the
+  retained audit chain; the export contains no secrets (#466).
+- Email: transient Resend failures (429/5xx/timeouts) are retried with backoff under a 25s
+  overall deadline and 4xx is never retried (#470); delivery sits behind an `EmailTransport`
+  trait with Resend, capture, log-only and failing implementations, and the `test-fixtures`
+  feature is gone (#471); every template ships an HTML and a plain-text part (#472).
+- Withdrawals are recorded `pending` before submission and a background reconciler settles
+  stale ones by transaction hash, distinguishing not-found from timebound-expired (#473).
+- API: every error response carries a stable machine-readable `code` (catalogue in
+  `docs/api.md` and `ErrorResponse.code` in `docs/openapi.yaml`, pinned by a snapshot test).
+  Framework rejections, unknown routes and 405s now use the JSON error envelope too (#465).
+  **Breaking:** error bodies gain a required `code` field, and non-handler errors that were plain
+  text are now JSON.
+- Security: `octo-server` exits non-zero on mainnet when secrets are placeholders or low-entropy,
+  or when `HORIZON_URL` / `PUBLIC_APP_URL` / `PUBLIC_API_URL` are not HTTPS (#433).
+- CI: CycloneDX SBOM (full transitive tree) uploaded on every `main` build and attached to
+  releases (#432); every GitHub Action pinned to a commit SHA, enforced by a lint job (#431);
+  weekly grouped Dependabot for cargo and Actions, with crypto-crate breaking bumps held for
+  manual review and manifests routed to maintainers + security via CODEOWNERS (#430).
 - Workspace scaffold: `crypto`, `wallet-core`, `store`, `webhooks`, `ingest`, `api` crates and
   the `server` binary.
 - Repository tooling: CI (fmt, clippy, test, cargo-deny), `justfile`, `docker-compose` for local

@@ -1,0 +1,14 @@
+# ApiError variant -> HTTP status -> machine-readable code (#465).
+# This file is the published contract. A diff here is a breaking API change: never rename or
+# reuse a code. Regenerate only when deliberately adding a variant.
+BadRequest 400 bad_request
+StaleSequence 400 stale_sequence
+Unauthorized 401 unauthorized
+Forbidden 403 forbidden
+NotFound 404 not_found
+Conflict 409 already_exists
+ConflictWith 409 conflict
+Gone 410 gone
+TooManyRequests 429 too_many_requests
+Internal 500 internal_error
+GatewayTimeout 504 upstream_timeout

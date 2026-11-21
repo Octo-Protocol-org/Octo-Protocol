@@ -11,41 +11,58 @@ pub mod horizon;
 mod json;
 pub mod rate_limit;
 pub mod routes;
+pub mod self_test;
+pub mod signing_policy;
 pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
+pub mod validation;
+pub mod withdrawal_estimate;
+pub mod withdrawal_reconciler;
 
-pub use error::{ApiError, ApiResult, Envelope};
+pub use error::{code_for_status, ApiError, ApiResult, Envelope, ERROR_CODES};
+pub use signing_policy::SigningPolicy;
 pub use state::AppState;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::header::HeaderName;
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::header::{self, HeaderName};
+use axum::http::{Method, StatusCode};
 use axum::http::HeaderValue;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use std::time::Duration;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::Instrument;
 
 /// Canonical header name for request correlation IDs.
 pub static REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Longest caller-supplied request ID accepted; longer values are replaced with a fresh UUID.
+pub const MAX_REQUEST_ID_LEN: usize = 64;
 
 /// Extracted or generated request ID stored in request extensions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestId(pub String);
 
 /// Middleware that extracts or generates a request ID, enters an info span, and echoes it in responses.
+///
+/// A caller-supplied `X-Request-Id` is reused only when, after trimming, it is non-empty, at most
+/// [`MAX_REQUEST_ID_LEN`] bytes, and made up solely of ASCII alphanumerics, `-` and `_`; anything
+/// else is replaced with a fresh UUIDv4 so untrusted input can't bloat or confuse logs.
 pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
-    // Reuse caller-supplied X-Request-Id if non-empty and valid ASCII, else generate UUIDv4.
+    // Reuse caller-supplied X-Request-Id if it passes validation, else generate UUIDv4.
     let request_id = req
         .headers()
         .get(&REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|s| !s.is_empty() && HeaderValue::from_str(s).is_ok())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= MAX_REQUEST_ID_LEN
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -66,6 +83,114 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     response
 }
 
+/// Record request latency for `/metrics`. Labels use the matched route *template*, never the raw
+/// path, and fixed method/status buckets, so cardinality stays bounded whatever clients send.
+async fn http_metrics_middleware(req: Request, next: Next) -> Response {
+    let method = match *req.method() {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::HEAD => "HEAD",
+        _ => "other",
+    };
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_string(), |p| p.as_str().to_string());
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status_class = match response.status().as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    };
+    octo_metrics::HTTP_REQUEST_DURATION.observe(
+        &[method, &route, status_class],
+        started.elapsed().as_secs_f64(),
+    );
+    response
+}
+
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    if std::env::var("ENABLE_HSTS").as_deref() == Ok("1") {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    response
+}
+
+/// Longest framework rejection text carried over as the envelope `message`.
+const REJECTION_MESSAGE_LIMIT: usize = 512;
+
+/// Wrap framework-generated errors (extractor rejections, unknown routes, 405, oversized bodies)
+/// in the standard error envelope with a `code`, so every error a client sees is machine-readable.
+async fn error_envelope_middleware(req: Request, next: Next) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || is_json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let detail = axum::body::to_bytes(body, REJECTION_MESSAGE_LIMIT)
+        .await
+        .ok()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let message = detail.unwrap_or_else(|| {
+        status
+            .canonical_reason()
+            .unwrap_or("error")
+            .to_ascii_lowercase()
+    });
+    let mut wrapped = error::error_response(status, code_for_status(status), message);
+    // A 405 must keep advertising the methods the route does accept.
+    if let Some(allow) = parts.headers.get(header::ALLOW) {
+        wrapped.headers_mut().insert(header::ALLOW, allow.clone());
+    }
+    wrapped
+}
+
+async fn secret_response_cache_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let sensitive = path.starts_with("/v1/auth/")
+        || path.ends_with("/api-key")
+        || path.ends_with("/backup")
+        || (path == "/v1/wallets" && method == axum::http::Method::POST);
+    let mut response = next.run(req).await;
+    if sensitive {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
 ///
 /// These routes deserialize JSON from raw `Bytes`; a `Bytes` extractor alone would otherwise
@@ -82,10 +207,29 @@ pub const OUTBOUND_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the API router with shared state.
 pub fn build_router(state: AppState) -> Router {
+    let allowed_origins: Vec<HeaderValue> = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|origin| origin.trim().parse().ok())
+        .collect();
+    auth::initialize_dummy_password_hash();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            REQUEST_ID_HEADER.clone(),
+            HeaderName::from_static("idempotency-key"),
+        ]);
 
     // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only
     // affect routes added before them, so it covered nothing. It is now applied at the end,
@@ -114,6 +258,32 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/auth/change-password", post(auth::change_password))
+        // Account export/deletion (password + emailed OTP); under /v1/auth/ for no-store.
+        .route(
+            "/v1/auth/account/export/request-otp",
+            post(routes::account::export_request_otp),
+        )
+        .route("/v1/auth/account/export", post(routes::account::export_account))
+        .route(
+            "/v1/auth/account/delete/request-otp",
+            post(routes::account::delete_request_otp)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
+        .route(
+            "/v1/auth/account/delete",
+            post(routes::account::delete_account)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
+        .route("/v1/auth/sessions", get(routes::sessions::list_sessions))
+        // Static segment takes priority over the :id capture below (matchit routing).
+        .route(
+            "/v1/auth/sessions/revoke-others",
+            post(routes::sessions::revoke_other_sessions),
+        )
+        .route(
+            "/v1/auth/sessions/:id",
+            delete(routes::sessions::revoke_session),
+        )
         .route("/v1/audit-logs", get(routes::audit::list_audit_logs))
         .route(
             "/v1/uploads/signature",
@@ -128,9 +298,14 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/challenge",
             get(routes::wallets::wallet_challenge),
         )
-        .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
+        .route(
+            "/v1/wallets/:id",
+            get(routes::wallets::get_wallet).patch(routes::wallets::update_wallet),
+        )
         .route("/v1/wallets/:id/archive", patch(routes::wallets::archive_wallet))
         .route("/v1/wallets/:id/unarchive", patch(routes::wallets::unarchive_wallet))
+        .route("/v1/wallets/:id/ingest/pause", patch(routes::wallets::pause_ingest))
+        .route("/v1/wallets/:id/ingest/resume", patch(routes::wallets::resume_ingest))
         .route(
             "/v1/wallets/:id/balances",
             get(routes::wallets::get_balances)
@@ -141,8 +316,16 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::wallets::list_transactions),
         )
         .route(
+            "/v1/wallets/:id/transactions.csv",
+            get(routes::transactions_csv::export_transactions_csv),
+        )
+        .route(
             "/v1/wallets/:id/addresses",
             post(routes::addresses::create_address).get(routes::addresses::list_addresses),
+        )
+        .route(
+            "/v1/wallets/:id/addresses/batch",
+            post(routes::addresses::create_addresses_batch),
         )
         .route(
             "/v1/wallets/:id/webhooks",
@@ -157,6 +340,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/webhooks/:endpoint_id",
             delete(routes::webhooks::delete_webhook),
+        )
+        .route(
+            "/v1/wallets/:id/webhooks/:endpoint_id/test",
+            post(routes::webhooks::test_webhook),
+        )
+        .route(
+            "/v1/wallets/:id/webhooks/:endpoint_id/deliveries/:delivery_id/redeliver",
+            post(routes::webhooks::redeliver_webhook),
         )
         .route(
             "/v1/wallets/:id/api-key",
@@ -187,6 +378,11 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::submit::withdraw_confirm),
         )
         .route(
+            "/v1/wallets/:id/withdraw/estimate",
+            get(routes::submit::withdraw_estimate)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
+        .route(
             "/v1/wallets/:id/signing-info",
             get(routes::submit::signing_info),
         )
@@ -200,6 +396,12 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::sponsorship::get_config).put(routes::sponsorship::put_config),
         )
         .route("/v1/wallets/:id/sponsor", post(routes::sponsor::sponsor))
+        // Dry run: same validation as /sponsor, no signing and no budget reservation.
+        .route(
+            "/v1/wallets/:id/sponsor/validate",
+            post(routes::sponsor::validate_sponsor)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
         .route(
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
@@ -224,11 +426,16 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/payment-links/:link_id",
             get(routes::payment_links::get_payment_link)
-                .put(routes::payment_links::set_payment_link_active),
+                .put(routes::payment_links::set_payment_link_active)
+                .patch(routes::payment_links::update_payment_link),
         )
         .route(
             "/v1/wallets/:id/payment-links/:link_id/payments",
             get(routes::payment_links::list_payment_link_payments),
+        )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id/cancel",
+            post(routes::payment_links::cancel_payment_link),
         )
         // Public: no auth, reachable by anyone with the link.
         .route(
@@ -256,7 +463,12 @@ pub fn build_router(state: AppState) -> Router {
         // needed. tower_http's RequestBodyLimitLayer would require one and does not compose
         // cleanly with `Router::layer` here.
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
+        .layer(middleware::from_fn(error_envelope_middleware))
+        // Innermost of the middleware below, so it sees the MatchedPath set by routing.
+        .layer(middleware::from_fn(http_metrics_middleware))
         .layer(cors)
+        .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn(secret_response_cache_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }

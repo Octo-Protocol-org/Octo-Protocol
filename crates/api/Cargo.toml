@@ -15,11 +15,14 @@ octo-store.workspace = true
 octo-webhooks.workspace = true
 octo-email.workspace = true
 octo-resilience.workspace = true
+octo-metrics.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 # Needed to downcast RequestBodyLimitLayer's error to LengthLimitError (413 handling).
 http-body-util = "0.1"
+# Stream combinators for chunked response bodies (CSV export).
+futures-util = "0.3"
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -56,5 +59,3 @@ serde_yaml = "0.9"
 jsonschema = "0.26"
 # Signing fixtures for validation tests only — never enabled in production builds.
 octo-wallet-core = { workspace = true, features = ["test-fixtures"] }
-# Captures OTP codes in memory instead of emailing them — never enabled in production builds.
-octo-email = { workspace = true, features = ["test-fixtures"] }

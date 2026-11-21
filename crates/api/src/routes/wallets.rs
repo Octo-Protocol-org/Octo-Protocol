@@ -1,9 +1,10 @@
-//! Wallet endpoints: create a master wallet, fetch one, list with pagination.
+//! Wallet endpoints: create a master wallet, fetch, rename/annotate, list with pagination.
 
-use crate::auth::{authenticate, authorize_wallet};
+use crate::auth::{authenticate, authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
+use crate::validation::{clean_optional, WALLET_DESCRIPTION_MAX, WALLET_LABEL_MAX};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,15 +27,111 @@ pub struct ListParams {
     pub include_archived: Option<bool>,
 }
 
-/// Query parameters for `list_transactions`: supports pagination and direction filter.
+/// Pagination for `list_transactions`; filters come from [`TransactionFilterParams`].
 #[derive(Debug, Default, Deserialize)]
 pub struct TransactionListParams {
     /// Maximum rows to return (default 50, max 200).
     pub limit: Option<i64>,
     /// Cursor: return rows created before this id (exclusive).
     pub before: Option<Uuid>,
-    /// Filter by direction: deposit | withdrawal.
+}
+
+/// Transaction history filters, shared by the JSON list and the CSV export.
+#[derive(Debug, Default, Deserialize)]
+pub struct TransactionFilterParams {
+    /// deposit | withdrawal.
     pub direction: Option<String>,
+    /// pending | confirmed | failed.
+    pub status: Option<String>,
+    /// `native` (or `XLM`), a credit code such as `USDC`, or `CODE:ISSUER`.
+    pub asset: Option<String>,
+    /// Inclusive lower bound: RFC 3339 timestamp or `YYYY-MM-DD` (midnight UTC).
+    pub from: Option<String>,
+    /// Exclusive upper bound: RFC 3339 timestamp or `YYYY-MM-DD` (midnight UTC).
+    pub to: Option<String>,
+}
+
+impl TransactionFilterParams {
+    /// Validate every filter and build the store filter; any bad value is a 400.
+    pub fn validate(&self) -> Result<octo_store::TransactionFilter, ApiError> {
+        let direction = match self.direction.as_deref() {
+            None => None,
+            Some(d @ ("deposit" | "withdrawal")) => Some(d.to_string()),
+            Some(other) => {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid direction filter '{other}'; valid values are: deposit, withdrawal"
+                )))
+            }
+        };
+        let status = match self.status.as_deref() {
+            None => None,
+            Some(s @ ("pending" | "confirmed" | "failed")) => Some(s.to_string()),
+            Some(other) => {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid status filter '{other}'; valid values are: pending, confirmed, failed"
+                )))
+            }
+        };
+        let (asset_code, asset_issuer) = match self.asset.as_deref() {
+            None => (None, None),
+            Some(a) => parse_asset_filter(a)?,
+        };
+        let from = self.from.as_deref().map(|v| parse_bound("from", v)).transpose()?;
+        let to = self.to.as_deref().map(|v| parse_bound("to", v)).transpose()?;
+        if let (Some(f), Some(t)) = (from, to) {
+            if f >= t {
+                return Err(ApiError::BadRequest("from must be earlier than to".into()));
+            }
+        }
+        Ok(octo_store::TransactionFilter {
+            direction,
+            status,
+            asset_code,
+            asset_issuer,
+            from,
+            to,
+        })
+    }
+}
+
+/// Parse `native` / `XLM`, `CODE` or `CODE:ISSUER` into `(asset_code, asset_issuer)`.
+fn parse_asset_filter(raw: &str) -> Result<(Option<String>, Option<String>), ApiError> {
+    if raw.eq_ignore_ascii_case("native") || raw.eq_ignore_ascii_case("xlm") {
+        return Ok((Some("native".into()), None));
+    }
+    let (code, issuer) = match raw.split_once(':') {
+        Some((c, i)) => (c, Some(i)),
+        None => (raw, None),
+    };
+    if !octo_wallet_core::is_valid_asset_code(code) {
+        return Err(ApiError::BadRequest(
+            "asset must be native, a 1-12 byte asset code, or CODE:ISSUER".into(),
+        ));
+    }
+    if let Some(i) = issuer {
+        if !is_valid_account(i) {
+            return Err(ApiError::BadRequest(
+                "asset issuer must be a valid Stellar account (G...)".into(),
+            ));
+        }
+    }
+    Ok((Some(code.to_string()), issuer.map(str::to_string)))
+}
+
+/// Parse a date-range bound: RFC 3339, or a bare `YYYY-MM-DD` taken as midnight UTC.
+fn parse_bound(name: &str, raw: &str) -> Result<chrono::DateTime<chrono::Utc>, ApiError> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(ts.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "{name} must be an RFC 3339 timestamp or a YYYY-MM-DD date"
+            ))
+        })
 }
 
 /// Body for wallet creation. Non-custodial: the client generates the keypair and sends only the
@@ -229,6 +326,9 @@ pub struct WalletView {
     pub label: Option<String>,
     pub description: Option<String>,
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True while deposit ingestion is paused for this wallet.
+    pub ingest_paused: bool,
+    pub ingest_paused_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Paginated list response for wallets.
@@ -274,8 +374,10 @@ pub async fn create_wallet(
 ) -> ApiResult<(StatusCode, Json<Envelope<CreateWalletResponse>>)> {
     let user_id = authenticate(&headers, &state).await?;
     let req: CreateWalletRequest = parse_optional(&body)?;
-    let label = req.label;
-    let description = req.description;
+    // Same limits as PATCH, so creation can't be used to slip in an oversized or spoofed label.
+    let label = clean_optional("label", req.label.as_deref(), WALLET_LABEL_MAX)?;
+    let description =
+        clean_optional("description", req.description.as_deref(), WALLET_DESCRIPTION_MAX)?;
 
     // Non-custodial: the client did the keygen; we only accept the public account.
     let public_key = req
@@ -351,10 +453,31 @@ pub async fn get_backup(
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<BackupView>>> {
     let user_id = crate::auth::require_login(&headers, &state).await?;
+    // Per-user (not per-IP) so a stolen session can't sidestep the cap by rotating addresses.
+    if !state.rate_limiter().check(
+        &format!("backup:{user_id}"),
+        "backup",
+        crate::rate_limit::BACKUP_USER_LIMIT,
+        crate::rate_limit::BACKUP_USER_WINDOW,
+    ).await {
+        return Err(ApiError::TooManyRequests(
+            "too many backup requests — wait a while and try again".into(),
+        ));
+    }
     let wallet = state.store().get_wallet(id).await?;
     if wallet.user_id != Some(user_id) {
         return Err(ApiError::NotFound);
     }
+    // Fail closed: the sealed seed is never handed out without a trace. Target is the id only.
+    crate::audit::record_strict(
+        &state,
+        user_id,
+        crate::audit::action::BACKUP_RETRIEVED,
+        crate::audit::category::WALLET,
+        Some(&wallet.id.to_string()),
+        &headers,
+    )
+    .await?;
     Ok(Envelope::ok(BackupView {
         wallet_id: wallet.id,
         encrypted_backup: wallet.encrypted_backup,
@@ -502,7 +625,7 @@ pub async fn get_gas_tank(
         .store()
         .sum_sponsored_fees_reserved_today(id)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
     Ok(Envelope::ok(GasTankStatusView {
         wallet_id: id,
         provisioned: true,
@@ -525,36 +648,28 @@ pub async fn get_balances(
     Ok(Envelope::ok(balances))
 }
 
-/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet,
-/// with optional `?limit=`, `?before=` cursor pagination, and `?direction=` filter.
+/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet, with
+/// `?limit=` / `?before=` keyset pagination and composable `?direction=`, `?status=`, `?asset=`,
+/// `?from=` and `?to=` filters.
 pub async fn list_transactions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Query(q): Query<TransactionListParams>,
+    Query(f): Query<TransactionFilterParams>,
 ) -> ApiResult<Json<Envelope<TransactionListResponse>>> {
     authorize_wallet(&headers, &state, id).await?;
     let _ = state.store().get_wallet(id).await?;
 
-    let direction = match q.direction.as_deref() {
-        Some("deposit") => Some("deposit"),
-        Some("withdrawal") => Some("withdrawal"),
-        None => None,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!(
-                "invalid direction filter '{other}'; valid values are: deposit, withdrawal"
-            )));
-        }
-    };
-
+    let filter = f.validate()?;
     let limit = validated_limit(q.limit)?;
 
     // Fetch limit+1 to detect whether a next page exists.
     let rows = state
         .store()
-        .list_transactions_page(id, limit + 1, direction, q.before)
+        .list_transactions_page(id, &filter, limit + 1, q.before)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
 
     let has_more = rows.len() > limit as usize;
     let mut data = rows;
@@ -579,6 +694,8 @@ fn to_view(w: octo_store::Wallet) -> WalletView {
         label: w.label,
         description: w.description,
         archived_at: w.archived_at,
+        ingest_paused: w.ingest_paused,
+        ingest_paused_at: w.ingest_paused_at,
     }
 }
 
@@ -591,9 +708,76 @@ pub async fn get_wallet(
     authorize_wallet(&headers, &state, id).await?;
     let w = state.store().get_wallet(id).await.map_err(|e| match e {
         octo_store::StoreError::NotFound => ApiError::NotFound,
-        _ => ApiError::Internal,
+        _ => crate::error::internal(e),
     })?;
     Ok(Envelope::ok(to_view(w)))
+}
+
+/// Body for `PATCH /v1/wallets/{id}`: omit a field to keep it, send `null` or `""` to clear it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWalletRequest {
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub label: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub description: Option<Option<String>>,
+}
+
+/// Validate one PATCH field, keeping the absent / clear / set distinction.
+fn clean_patch_field(
+    field: &str,
+    value: Option<Option<String>>,
+    max_chars: usize,
+) -> Result<Option<Option<String>>, ApiError> {
+    value
+        .map(|v| clean_optional(field, v.as_deref(), max_chars))
+        .transpose()
+}
+
+/// `PATCH /v1/wallets/{id}` — rename or annotate a wallet. Owner login or a `write`-scoped API key.
+pub async fn update_wallet(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    authorize_wallet_scope(&headers, &state, id, "write").await?;
+    let req: UpdateWalletRequest = parse_optional(&body)?;
+    if req.label.is_none() && req.description.is_none() {
+        return Err(ApiError::BadRequest(
+            "provide at least one of label, description".into(),
+        ));
+    }
+    let label = clean_patch_field("label", req.label, WALLET_LABEL_MAX)?;
+    let description = clean_patch_field("description", req.description, WALLET_DESCRIPTION_MAX)?;
+
+    let wallet = state
+        .store()
+        .update_wallet_details(
+            id,
+            label.as_ref().map(|l| l.as_deref()),
+            description.as_ref().map(|d| d.as_deref()),
+        )
+        .await?;
+
+    // Field names only in the action; target is the wallet id so caller text never enters the log.
+    if let Some(uid) = wallet.user_id {
+        let fields: Vec<&str> = [("label", label.is_some()), ("description", description.is_some())]
+            .into_iter()
+            .filter_map(|(name, changed)| changed.then_some(name))
+            .collect();
+        crate::audit::record(
+            &state,
+            uid,
+            &format!("updated wallet details ({})", fields.join(", ")),
+            crate::audit::category::WALLET,
+            Some(&wallet.id.to_string()),
+            &headers,
+        )
+        .await;
+    }
+
+    Ok(Envelope::ok(to_view(wallet)))
 }
 
 /// `GET /v1/wallets` — list the authenticated user's wallets, with optional
@@ -612,7 +796,7 @@ pub async fn list_wallets(
         .store()
         .list_wallets_for_user(user_id, limit + 1, q.before, q.include_archived.unwrap_or(false))
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
 
     let has_more = rows.len() > limit as usize;
     let mut wallets = rows;
@@ -663,12 +847,122 @@ pub async fn unarchive_wallet(
     Ok(Envelope::ok(to_view(updated)))
 }
 
+/// `PATCH /v1/wallets/:id/ingest/pause` — stop polling this wallet (dashboard login only).
+///
+/// The saved cursor is kept, so deposits that land while paused are picked up on resume. Takes
+/// effect from the supervisor's next tick; a page already in flight still finishes.
+pub async fn pause_ingest(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    set_ingest_paused(state, id, headers, true).await
+}
+
+/// `PATCH /v1/wallets/:id/ingest/resume` — resume polling from the saved cursor.
+pub async fn resume_ingest(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    set_ingest_paused(state, id, headers, false).await
+}
+
+/// Shared pause/resume body: owner-only, API keys rejected, every change audit-logged.
+async fn set_ingest_paused(
+    state: AppState,
+    id: Uuid,
+    headers: HeaderMap,
+    paused: bool,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    // A leaked API key must not be able to silence deposit detection, so login only.
+    let user_id = crate::auth::require_login(&headers, &state).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    let updated = state.store().set_ingest_paused(id, paused).await?;
+    crate::audit::record(
+        &state,
+        user_id,
+        if paused {
+            "paused deposit ingestion"
+        } else {
+            "resumed deposit ingestion"
+        },
+        crate::audit::category::WALLET,
+        Some(&id.to_string()),
+        &headers,
+    )
+    .await;
+    Ok(Envelope::ok(to_view(updated)))
+}
+
 /// Guard check ensuring a wallet is not archived before executing a mutating operation.
 pub fn ensure_wallet_not_archived(wallet: &octo_store::Wallet) -> ApiResult<()> {
     if wallet.is_archived() {
         return Err(ApiError::Forbidden("wallet is archived".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod transaction_filter_tests {
+    use super::*;
+
+    const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    fn params() -> TransactionFilterParams {
+        TransactionFilterParams::default()
+    }
+
+    #[test]
+    fn filters_compose() {
+        let f = TransactionFilterParams {
+            direction: Some("deposit".into()),
+            status: Some("confirmed".into()),
+            asset: Some(format!("USDC:{ISSUER}")),
+            from: Some("2026-01-01".into()),
+            to: Some("2026-02-01T00:00:00Z".into()),
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(f.direction.as_deref(), Some("deposit"));
+        assert_eq!(f.status.as_deref(), Some("confirmed"));
+        assert_eq!(f.asset_code.as_deref(), Some("USDC"));
+        assert_eq!(f.asset_issuer.as_deref(), Some(ISSUER));
+        assert!(f.from.unwrap() < f.to.unwrap());
+    }
+
+    #[test]
+    fn native_aliases_map_to_native_without_issuer() {
+        for raw in ["native", "XLM", "xlm"] {
+            let f = TransactionFilterParams { asset: Some(raw.into()), ..params() }
+                .validate()
+                .unwrap();
+            assert_eq!(f.asset_code.as_deref(), Some("native"));
+            assert!(f.asset_issuer.is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        let bad = [
+            TransactionFilterParams { status: Some("settled".into()), ..params() },
+            TransactionFilterParams { direction: Some("in".into()), ..params() },
+            TransactionFilterParams { asset: Some("TOOLONGASSETCODE".into()), ..params() },
+            TransactionFilterParams { asset: Some("USDC:not-a-key".into()), ..params() },
+            TransactionFilterParams { from: Some("yesterday".into()), ..params() },
+            TransactionFilterParams {
+                from: Some("2026-02-01".into()),
+                to: Some("2026-01-01".into()),
+                ..params()
+            },
+        ];
+        for p in bad {
+            assert!(p.validate().is_err(), "{p:?} should be rejected");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -685,6 +979,10 @@ mod tests {
             custody: "client".into(),
             label: None,
             description: None,
+            archived_at: None,
+            ingest_paused: false,
+            ingest_paused_at: None,
+            ingest_streaming: false,
         };
         let responses = [
             serde_json::to_string(&CreateWalletResponse {
@@ -723,5 +1021,4 @@ mod tests {
             }
         }
     }
-}
 }

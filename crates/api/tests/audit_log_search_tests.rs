@@ -64,10 +64,47 @@ async fn list_audit_logs_rejects_search_term_over_the_length_cap() {
     let req = get_auth(&uri, &token);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    // Once implemented, this should reject with 400 Bad Request
-    // For now, we verify the endpoint handles the request
-    let _status = resp.status();
-    // The actual assertion will check for BadRequest once the validation is implemented
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_audit_logs_accepts_search_term_at_the_length_cap() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = format!("user-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let token = common::signup_and_verify(&app, &state, &email).await;
+
+    let max_search = "a".repeat(100);
+    let uri = format!("/v1/audit-logs?search={}", urlencoding::encode(&max_search));
+    let req = get_auth(&uri, &token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["data"].is_array());
+}
+
+#[tokio::test]
+async fn list_audit_logs_trims_whitespace_before_the_length_check() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = format!("user-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let token = common::signup_and_verify(&app, &state, &email).await;
+
+    let padded_search = format!("  {}  ", "a".repeat(100));
+    let uri = format!("/v1/audit-logs?search={}", urlencoding::encode(&padded_search));
+    let req = get_auth(&uri, &token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["data"].is_array());
 }
 
 #[tokio::test]

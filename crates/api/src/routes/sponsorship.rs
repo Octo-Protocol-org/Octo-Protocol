@@ -1,6 +1,6 @@
 //! Gas sponsorship configuration: enable/disable sponsorship and set spend controls.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -16,6 +16,10 @@ pub struct SponsorshipConfigRequest {
     pub enabled: Option<bool>,
     pub per_tx_fee_cap_stroops: Option<i64>,
     pub daily_budget_stroops: Option<i64>,
+    /// Omit to keep the current list, `null` to inherit the global allowlist, or a non-empty
+    /// subset of it to narrow what this wallet sponsors.
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub allowed_operations: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,6 +29,20 @@ pub struct SponsorshipConfigView {
     pub daily_budget_stroops: Option<i64>,
     pub fees_spent_today_stroops: i64,
     pub spent_today_stroops: i64,
+    /// The wallet's own list, or `null` when it inherits the global allowlist.
+    pub allowed_operations: Option<Vec<String>>,
+    /// What sponsorship actually permits for this wallet right now.
+    pub effective_allowed_operations: Vec<String>,
+}
+
+/// The operations a wallet may sponsor: its own list, or the global allowlist when unset.
+fn effective_allowlist(wallet_list: Option<&[String]>) -> Vec<String> {
+    wallet_list.map(<[String]>::to_vec).unwrap_or_else(|| {
+        crate::sponsor_validation::ALLOWED_OP_TYPES
+            .iter()
+            .map(|op| op.to_string())
+            .collect()
+    })
 }
 
 /// `GET /v1/wallets/:id/sponsorship`
@@ -40,7 +58,7 @@ pub async fn get_config(
         .store()
         .sum_sponsored_fees_today(wallet_id)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
 
     let view = match config {
         Some(c) => SponsorshipConfigView {
@@ -49,6 +67,8 @@ pub async fn get_config(
             daily_budget_stroops: c.daily_budget_stroops,
             fees_spent_today_stroops: spent_today,
             spent_today_stroops: spent_today,
+            effective_allowed_operations: effective_allowlist(c.allowed_operations.as_deref()),
+            allowed_operations: c.allowed_operations,
         },
         None => SponsorshipConfigView {
             enabled: false,
@@ -56,6 +76,8 @@ pub async fn get_config(
             daily_budget_stroops: None,
             fees_spent_today_stroops: spent_today,
             spent_today_stroops: spent_today,
+            allowed_operations: None,
+            effective_allowed_operations: effective_allowlist(None),
         },
     };
 
@@ -69,7 +91,7 @@ pub async fn put_config(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<SponsorshipConfigView>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "sponsor").await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.is_archived() {
         return Err(ApiError::Forbidden("wallet is archived".into()));
@@ -78,6 +100,7 @@ pub async fn put_config(
     if req.enabled.is_none()
         && req.per_tx_fee_cap_stroops.is_none()
         && req.daily_budget_stroops.is_none()
+        && req.allowed_operations.is_none()
     {
         return Err(ApiError::BadRequest(
             "at least one field must be provided".into(),
@@ -109,6 +132,15 @@ pub async fn put_config(
         }
     }
 
+    // Rejects anything outside the global allowlist, so a wallet can only ever narrow it.
+    let allowed_operations = req
+        .allowed_operations
+        .map(|list| {
+            list.map(|ops| crate::sponsor_validation::normalize_wallet_allowlist(&ops))
+                .transpose()
+        })
+        .transpose()?;
+
     let config = state
         .store()
         .upsert_gas_sponsorship_config(
@@ -116,6 +148,7 @@ pub async fn put_config(
             enabled,
             req.per_tx_fee_cap_stroops,
             req.daily_budget_stroops,
+            allowed_operations.as_ref().map(|l| l.as_deref()),
         )
         .await?;
 
@@ -123,14 +156,18 @@ pub async fn put_config(
         .store()
         .sum_sponsored_fees_today(wallet_id)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(crate::error::internal)?;
 
     let wallet = state.store().get_wallet(wallet_id).await?;
     if let Some(uid) = wallet.user_id {
+        let ops = match &config.allowed_operations {
+            Some(list) => list.join(", "),
+            None => "global".into(),
+        };
         crate::audit::record(
             &state,
             uid,
-            &format!("updated sponsorship config (enabled: {enabled})"),
+            &format!("updated sponsorship config (enabled: {enabled}, operations: {ops})"),
             crate::audit::category::SPONSORSHIP,
             Some(&wallet_id.to_string()),
             &headers,
@@ -144,5 +181,7 @@ pub async fn put_config(
         daily_budget_stroops: config.daily_budget_stroops,
         fees_spent_today_stroops: spent_today,
         spent_today_stroops: spent_today,
+        effective_allowed_operations: effective_allowlist(config.allowed_operations.as_deref()),
+        allowed_operations: config.allowed_operations,
     }))
 }

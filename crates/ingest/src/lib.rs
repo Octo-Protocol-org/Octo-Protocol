@@ -1,26 +1,33 @@
 //! Deposit detection for octo.
 //!
-//! Polls a master account's Horizon `/payments` (oldest-first, from a saved cursor), attributes
+//! Polls a master account's Horizon `/operations` (oldest-first, from a saved cursor), attributes
 //! each incoming payment to a customer by **muxed id** or **transaction memo id**, and records it
 //! idempotently via [`octo_store`]. Unattributable deposits are still recorded but with no
 //! `address_id` (quarantine) — they are never guessed onto a customer.
 //!
 //! Security (see `docs/threat-model.md`):
-//! - Only `transaction_successful` payments are credited (no failed/reorged double-credit).
+//! - Only `transaction_successful` operations are credited, enforced once in `is_from_successful_tx`.
 //! - Dedup on the Horizon operation id (TOID) → replays/re-deliveries are no-ops.
 //! - Amounts are integer stroops (no floats); only whitelisted incoming directions are credited.
 //! - The cursor is advanced and persisted only after a record is processed, so a crash resumes
 //!   without missing or double-processing.
+//!
+//! Wallets opted into streaming receive records over Horizon SSE instead (see [`stream`]), through
+//! the same `process` path and cursor; polling takes over whenever a stream is down.
 #![forbid(unsafe_code)]
 
 pub mod amount;
 pub mod horizon;
+pub mod stream;
 
 #[cfg(test)]
 mod backfill_tests;
 
 use horizon::{HorizonPayments, PaymentRecord};
-use octo_store::{NewDeposit, Store, Wallet};
+use octo_store::{IngestLeaderLock, NewDeposit, Store, Wallet};
+pub use stream::LiveStreams;
+use stream::StreamSet;
+use octo_wallet_core::asset::USDC_TESTNET_ISSUER;
 use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::collections::HashMap;
@@ -28,11 +35,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-/// The widely-used testnet USDC issuer — must match `crates/api/src/routes/payment_links.rs`'s
-/// constant of the same name (kept separate rather than shared since this crate has no
-/// dependency on `octo-api`).
-const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 /// Shared thread-safe tracker for the last successful poll times of ingestion.
 #[derive(Debug, Clone, Default)]
@@ -70,6 +72,14 @@ impl LastPollTracker {
     }
 }
 
+/// Current Unix time in seconds (0 if the clock is before the epoch).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Outcome of processing a single payment record.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Processed {
@@ -77,6 +87,8 @@ pub enum Processed {
     Recorded { attributed: bool },
     /// Already recorded (idempotent no-op).
     Duplicate,
+    /// The operation's transaction failed on-chain, so it moved no funds (issue #449).
+    FailedTransaction,
     /// Skipped (not a credit to us, failed tx, unknown asset shape, etc.).
     Skipped,
 }
@@ -155,15 +167,15 @@ impl Ingestor {
             count += 1;
         }
 
-        if let Some(ref tracker) = self.tracker {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            tracker.record_success(self.wallet_id, now);
-        }
-
+        self.record_poll_success();
         Ok(count)
+    }
+
+    /// Stamp the lag tracker: Horizon answered for this wallet just now (poll or stream).
+    fn record_poll_success(&self) {
+        if let Some(ref tracker) = self.tracker {
+            tracker.record_success(self.wallet_id, unix_now());
+        }
     }
 
     /// Run forever, polling every `interval`. Errors are logged and retried (the cursor makes this
@@ -191,65 +203,16 @@ impl Ingestor {
         }
     }
 
-    /// Process one payment record into a deposit (or skip it).
+    /// Process one operation record into a deposit (or skip it).
     pub async fn process(&self, rec: &PaymentRecord) -> Result<Processed, IngestError> {
-        // 1. Only successful credits to us.
-        if !rec.transaction_successful {
-            return Ok(Processed::Skipped);
-        }
-        if rec.kind != "payment" && rec.kind != "create_account" {
-            return Ok(Processed::Skipped);
-        }
-        // The destination base account must be our master account.
-        match rec.to.as_deref() {
-            Some(to) if to == self.account_g => {}
-            _ => return Ok(Processed::Skipped),
+        // 1. The one place failed transactions are rejected; nothing below may run for them.
+        if !is_from_successful_tx(rec) {
+            tracing::debug!(op_id = %rec.id, kind = %rec.kind, "ignoring operation of failed transaction");
+            return Ok(Processed::FailedTransaction);
         }
 
-        // 2. Amount → stroops (payment uses `amount`, create_account uses `starting_balance`).
-        let amount_str = rec
-            .amount
-            .as_deref()
-            .or(rec.starting_balance.as_deref())
-            .unwrap_or("");
-        let Some(stroops) = amount::to_stroops(amount_str) else {
-            // Never credit an approximation: surface the unparseable amount (no customer data).
-            tracing::warn!(
-                op_id = %rec.id,
-                amount = ?amount_str,
-                "skipping payment: amount is not a valid Stellar amount (≤ 7 decimals)"
-            );
-            return Ok(Processed::Skipped);
-        };
-        if stroops <= 0 {
-            return Ok(Processed::Skipped);
-        }
-
-        // 3. Attribute to a customer: muxed id first, then memo id.
-        let customer_id = self.attribute(rec);
-        let address_id = match customer_id {
-            Some(id) => self
-                .store
-                .address_by_muxed_id(self.wallet_id, id)
-                .await?
-                .map(|a| a.id),
-            None => None,
-        };
-        let attributed = address_id.is_some();
-
-        // 4. Asset.
-        let (asset_code, asset_issuer) = match rec.asset_type.as_deref() {
-            Some("native") | None => ("native".to_string(), None),
-            _ => (
-                rec.asset_code.clone().unwrap_or_else(|| "unknown".into()),
-                rec.asset_issuer.clone(),
-            ),
-        };
-
-        let memo_id = self.memo_id(rec);
         let ledger = rec.transaction.as_ref().and_then(|t| t.ledger);
         let tx_hash = rec.transaction_hash.clone().unwrap_or_default();
-
         // A bad TOID would corrupt the (tx_hash, operation_index) dedup key — skip, never guess.
         let toid = decode_toid(&rec.id, plausible_max_ledger())
             .filter(|t| ledger.is_none_or(|l| i64::from(t.ledger) == l));
@@ -263,29 +226,149 @@ impl Ingestor {
             return Ok(Processed::Skipped);
         };
 
+        // 2. What landed in our account, and from whom.
+        let credit = if rec.kind == CLAIM_KIND {
+            self.claim_credit(rec).await?
+        } else {
+            self.direct_credit(rec)
+        };
+        let Some(credit) = credit else {
+            return Ok(Processed::Skipped);
+        };
+
+        // 3. Amount → stroops, from the field that holds what the destination actually received.
+        let Some(stroops) = amount::to_stroops(&credit.amount) else {
+            // Never credit an approximation: surface the unparseable amount (no customer data).
+            tracing::warn!(
+                op_id = %rec.id,
+                amount = ?credit.amount,
+                "skipping payment: amount is not a valid Stellar amount (≤ 7 decimals)"
+            );
+            return Ok(Processed::Skipped);
+        };
+        if stroops <= 0 {
+            return Ok(Processed::Skipped);
+        }
+
+        // 4. Attribute to a customer (muxed id, then memo id; see `Credit::customer_id`).
+        let address_id = match credit.customer_id {
+            Some(id) => self
+                .store
+                .address_by_muxed_id(self.wallet_id, id)
+                .await?
+                .map(|a| a.id),
+            None => None,
+        };
+        let attributed = address_id.is_some();
+
+        // 5. Asset.
+        let (asset_code, asset_issuer) = match credit.asset_type.as_deref() {
+            Some("native") | None => ("native".to_string(), None),
+            _ => (
+                credit.asset_code.unwrap_or_else(|| "unknown".into()),
+                credit.asset_issuer,
+            ),
+        };
+
         let dep = NewDeposit {
             wallet_id: self.wallet_id,
             address_id,
             asset_code,
             asset_issuer,
             amount_stroops: stroops,
-            source_account: rec.from.clone(),
-            destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
+            source_account: credit.source_account,
+            destination_account: credit.destination_account,
             stellar_tx_hash: tx_hash,
             operation_index: toid.operation_index,
             horizon_op_id: rec.id.clone(),
             ledger,
-            memo_id,
+            memo_id: credit.memo_id,
         };
 
         match self.store.record_deposit(&dep).await? {
             Some(tx) => {
+                let attributed_label = if attributed { "true" } else { "false" };
+                octo_metrics::INGEST_DEPOSITS.inc(&[attributed_label]);
                 self.fire_deposit_webhook(&tx).await;
                 self.confirm_payment_link(&tx).await;
                 Ok(Processed::Recorded { attributed })
             }
             None => Ok(Processed::Duplicate),
         }
+    }
+
+    /// The credit carried directly by a payment, path payment or account creation.
+    fn direct_credit(&self, rec: &PaymentRecord) -> Option<Credit> {
+        if !is_credit_kind(&rec.kind) {
+            return None;
+        }
+        // The destination base account must be our master account.
+        if rec.to.as_deref() != Some(self.account_g.as_str()) {
+            return None;
+        }
+        // A path payment from ourselves to ourselves is an asset conversion, not new funds.
+        if is_path_payment(&rec.kind) && rec.from.as_deref() == Some(self.account_g.as_str()) {
+            return None;
+        }
+        Some(Credit {
+            amount: credited_amount(rec).unwrap_or("").to_string(),
+            asset_type: rec.asset_type.clone(),
+            asset_code: rec.asset_code.clone(),
+            asset_issuer: rec.asset_issuer.clone(),
+            source_account: rec.from.clone(),
+            destination_account: rec.to_muxed.clone().or_else(|| rec.to.clone()),
+            customer_id: self.attribute(rec),
+            memo_id: self.memo_id(rec),
+        })
+    }
+
+    /// The credit from claiming a claimable balance into our account (issue #448).
+    ///
+    /// The amount and asset come from the claim's `account_credited` effect for our account. The
+    /// origin is the balance's creator, and attribution uses the creating transaction's memo id —
+    /// the sender's intent, exactly like the memo fallback — never anything the claimer chose.
+    /// Horizon failures propagate so the cursor holds and the claim is retried, never dropped.
+    async fn claim_credit(&self, rec: &PaymentRecord) -> Result<Option<Credit>, IngestError> {
+        if rec.claimant.as_deref() != Some(self.account_g.as_str()) {
+            return Ok(None);
+        }
+        // The id is interpolated into a URL path, so accept only the hex Horizon issues.
+        let Some(balance_id) = rec.balance_id.as_deref().filter(|b| is_balance_id(b)) else {
+            tracing::warn!(op_id = %rec.id, "claim without a valid balance id; skipping");
+            return Ok(None);
+        };
+        let Some(credited) = self
+            .horizon
+            .claim_credit(&rec.id, &self.account_g)
+            .await
+            .map_err(|_| IngestError::Horizon)?
+        else {
+            return Ok(None);
+        };
+        let origin = self
+            .horizon
+            .claimable_balance_origin(balance_id)
+            .await
+            .map_err(|_| IngestError::Horizon)?;
+        let creator = origin.as_ref().and_then(|o| o.source_account.clone());
+        // Reclaiming a balance we created ourselves returns our own funds; it is not a deposit.
+        if creator.as_deref() == Some(self.account_g.as_str()) {
+            return Ok(None);
+        }
+        let memo_id = origin
+            .as_ref()
+            .and_then(|o| o.transaction.as_ref())
+            .and_then(memo_id_of_tx);
+        Ok(Some(Credit {
+            amount: credited.amount,
+            asset_type: credited.asset_type,
+            asset_code: credited.asset_code,
+            asset_issuer: credited.asset_issuer,
+            source_account: creator,
+            destination_account: rec.claimant.clone(),
+            customer_id: memo_id,
+            memo_id,
+        }))
     }
 
     /// If this deposit landed on a payment link's dedicated address, confirm its oldest pending
@@ -332,6 +415,17 @@ impl Ingestor {
                 (link, payment)
             }
         };
+
+        // Late deposit (#454): a cancelled or expired link matches nothing; the funds stay a plain
+        // deposit (deposit.created already fired) for the merchant to reconcile or refund.
+        if link.is_closed_at(tx.created_at) {
+            tracing::info!(
+                payment_id = %payment.id,
+                link_status = link.status_at(tx.created_at),
+                "deposit landed after payment link closed; not matched"
+            );
+            return;
+        }
 
         // Exact match confirms; anything else is a mismatch the merchant/payer must be told
         // about — never silently absorbed as if it were correct, and never confirmed either.
@@ -459,11 +553,67 @@ impl Ingestor {
 
     /// Extract a numeric memo id from the joined transaction (`memo_type == "id"`).
     fn memo_id(&self, rec: &PaymentRecord) -> Option<i64> {
-        let tx = rec.transaction.as_ref()?;
-        if tx.memo_type.as_deref() != Some("id") {
-            return None;
-        }
-        tx.memo.as_deref()?.parse::<i64>().ok()
+        memo_id_of_tx(rec.transaction.as_ref()?)
+    }
+}
+
+/// A numeric memo id from a transaction (`memo_type == "id"`), if it fits in `i64`.
+fn memo_id_of_tx(tx: &horizon::TransactionRecord) -> Option<i64> {
+    if tx.memo_type.as_deref() != Some("id") {
+        return None;
+    }
+    tx.memo.as_deref()?.parse::<i64>().ok()
+}
+
+/// A validated credit to our account, ready to record as a deposit.
+struct Credit {
+    amount: String,
+    asset_type: Option<String>,
+    asset_code: Option<String>,
+    asset_issuer: Option<String>,
+    source_account: Option<String>,
+    destination_account: Option<String>,
+    /// Muxed id or memo id used to find the customer address; `None` quarantines the deposit.
+    customer_id: Option<i64>,
+    memo_id: Option<i64>,
+}
+
+/// Horizon operation type for claiming a claimable balance (issue #448).
+const CLAIM_KIND: &str = "claim_claimable_balance";
+
+/// A claimable balance id as Horizon renders it: hex, 72 chars for the v0 id type.
+fn is_balance_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Invariant (issue #449): an operation from a failed transaction never credits a balance.
+///
+/// This is the single check `Ingestor::process` relies on — not Horizon's default of hiding
+/// failed transactions — and it fails closed: `transaction_successful` deserializes to `false`
+/// when Horizon omits it.
+fn is_from_successful_tx(rec: &PaymentRecord) -> bool {
+    rec.transaction_successful
+}
+
+/// Operation types that deliver funds to their destination account.
+fn is_credit_kind(kind: &str) -> bool {
+    kind == "payment" || kind == "create_account" || is_path_payment(kind)
+}
+
+/// Path payments (issue #447): both variants deliver the destination asset to `to`.
+fn is_path_payment(kind: &str) -> bool {
+    kind == "path_payment_strict_send" || kind == "path_payment_strict_receive"
+}
+
+/// The amount a record credits to its destination.
+///
+/// For path payments Horizon's `amount`/`asset_*` describe what the destination received;
+/// `source_amount`/`source_asset_*` are what the sender spent and are deliberately never read.
+/// `create_account` carries its credit in `starting_balance`.
+fn credited_amount(rec: &PaymentRecord) -> Option<&str> {
+    match rec.kind.as_str() {
+        "create_account" => rec.starting_balance.as_deref(),
+        _ => rec.amount.as_deref(),
     }
 }
 
@@ -558,9 +708,9 @@ pub enum IngestError {
 
 /// Supervises deposit ingestion across all wallets.
 ///
-/// On each tick it pages through the due wallets and polls each one once (resuming from its
-/// cursor). This is a simple, restart-safe fan-out for the MVP; it can later be split into
-/// per-wallet workers or separate processes for scale without changing the cursor-based contract.
+/// On each tick it pages through the due wallets and polls each one (resuming from its cursor),
+/// round-robin and within a per-wallet budget. Several replicas may run a supervisor against one
+/// database: a Postgres advisory lock elects one leader per network and the rest stand by.
 pub struct Supervisor {
     store: Store,
     horizon_url: String,
@@ -570,7 +720,22 @@ pub struct Supervisor {
     /// Retry/circuit config handed to each per-wallet `Ingestor` built in `tick`.
     retry: octo_resilience::RetryPolicy,
     circuit: octo_resilience::CircuitBreaker,
+    /// How often a standby instance retries the ingest leader lock.
+    lock_retry: Duration,
+    /// Wallets currently served by an open SSE stream; `tick` leaves them to the stream.
+    live: LiveStreams,
 }
+
+/// One wallet's progress through a single tick, handed from one page poll to the next.
+struct WalletTurn {
+    ingestor: Ingestor,
+    pages: usize,
+    records: usize,
+}
+
+/// A finished page poll: the wallet's updated turn, the page result, and the limit requested.
+type PageOutcome = (WalletTurn, Result<usize, IngestError>, u32);
+type PollTasks = tokio::task::JoinSet<PageOutcome>;
 
 impl Supervisor {
     pub fn new(
@@ -609,6 +774,8 @@ impl Supervisor {
             tracker: LastPollTracker::new(),
             retry,
             circuit,
+            lock_retry: Self::DEFAULT_LOCK_RETRY,
+            live: LiveStreams::default(),
         }
     }
 
@@ -654,6 +821,10 @@ impl Supervisor {
 
     /// Like [`Supervisor::run`], but returns once `shutdown` is cancelled.
     ///
+    /// Only the instance holding this network's ingest leader lock polls (see
+    /// [`octo_store::IngestLeaderLock`]); every other replica stands by and retries the lock every
+    /// `lock_retry`, so a dead leader is replaced within one retry interval of its session ending.
+    ///
     /// Cancellation is only observed *between* ticks: an in-progress tick always finishes its
     /// current page (deposit rows + cursor), so a rolling deploy never aborts a page halfway.
     /// Bounding how long that may take is the caller's job (see `bin/server`'s drain timeout).
@@ -663,89 +834,112 @@ impl Supervisor {
         page_limit: u32,
         shutdown: CancellationToken,
     ) {
+        while let Some(mut lock) = self.wait_for_leadership(&shutdown).await {
+            tracing::info!(network = self.network, "acquired ingest leader lock; ingesting");
+            octo_metrics::INGEST_LEADER.set(&[], 1.0);
+            self.lead(&mut lock, interval, page_limit, &shutdown).await;
+            octo_metrics::INGEST_LEADER.set(&[], 0.0);
+            // Free the lock promptly so a standby takes over on its next retry, not on TCP timeout.
+            lock.release().await;
+        }
+        tracing::info!("ingest supervisor stopped after finishing its current tick");
+    }
+
+    /// Retry the leader lock every `lock_retry` until it is won (`Some`) or shutdown (`None`).
+    async fn wait_for_leadership(&self, shutdown: &CancellationToken) -> Option<IngestLeaderLock> {
+        let mut announced_standby = false;
         while !shutdown.is_cancelled() {
-            if let Err(e) = self.tick(page_limit).await {
-                tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
+            match self.store.try_acquire_ingest_leader(self.network).await {
+                Ok(Some(lock)) => return Some(lock),
+                Ok(None) if !announced_standby => {
+                    tracing::info!(
+                        network = self.network,
+                        retry_secs = self.lock_retry.as_secs(),
+                        "another instance is ingesting; standing by"
+                    );
+                    announced_standby = true;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = ?e, "ingest leader lock attempt failed; will retry"),
             }
+            tokio::select! {
+                () = tokio::time::sleep(self.lock_retry) => {}
+                () = shutdown.cancelled() => {}
+            }
+        }
+        None
+    }
+
+    /// Tick every `interval` while the lock is held; returns on shutdown or lost leadership.
+    async fn lead(
+        &self,
+        lock: &mut IngestLeaderLock,
+        interval: Duration,
+        page_limit: u32,
+        shutdown: &CancellationToken,
+    ) {
+        // Streams live only as long as this leadership term, so a standby never streams too.
+        let mut streams = StreamSet::new(self.live.clone(), shutdown);
+        while !shutdown.is_cancelled() {
+            // A leader whose lock session died must stop before a standby starts, not after.
+            if !lock.still_held().await {
+                tracing::warn!(network = self.network, "lost ingest leader lock; standing by");
+                break;
+            }
+            self.sync_streams(&mut streams).await;
+            let started = std::time::Instant::now();
+            let outcome = match self.tick(page_limit).await {
+                Ok(_) => {
+                    octo_metrics::INGEST_LAST_SUCCESS.set(&[], unix_now() as f64);
+                    "ok"
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
+                    "error"
+                }
+            };
+            let elapsed = started.elapsed().as_secs_f64();
+            octo_metrics::INGEST_TICK_DURATION.observe(&[outcome], elapsed);
             // Wake early on shutdown instead of sleeping out the full interval.
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
                 () = shutdown.cancelled() => {}
             }
         }
-        tracing::info!("ingest supervisor stopped after finishing its current tick");
+        streams.stop().await;
     }
 
-    /// One supervision pass: poll every wallet on this network, draining each wallet's backlog
-    /// page by page up to [`Self::MAX_PAGES_PER_TICK`].
+    /// Reconcile running streams with the wallets currently opted into streaming.
+    async fn sync_streams(&self, streams: &mut StreamSet) {
+        match self
+            .store
+            .streaming_wallets(self.network, Self::MAX_STREAMS)
+            .await
+        {
+            Ok(wanted) => streams.sync(&wanted, |w| self.ingestor_for(w)),
+            // Keep existing streams on a lookup failure; polling still covers everyone else.
+            Err(e) => tracing::warn!(error = ?e, "failed to load streaming wallets"),
+        }
+    }
+
+    /// One supervision pass: poll every due wallet on this network, draining each wallet's
+    /// backlog up to [`Self::MAX_RECORDS_PER_WALLET_PER_TICK`] records.
     ///
-    /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]), not one at a
-    /// time. Sequential polling meant a single slow/unfunded wallet's Horizon round-trip (or
-    /// retry-with-backoff) blocked every wallet behind it in the list — with hundreds of wallets,
-    /// a deposit on a late one could sit unprocessed for minutes despite the nominal poll
-    /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
-    /// request volume sane regardless of how many wallets exist.
+    /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]) and FAIRLY:
+    /// each task fetches a single page and releases its permit, and a wallet with more waiting is
+    /// requeued behind every page already queued. So a wallet flooded with dust payments gets one
+    /// page per turn like everyone else and can never monopolise a tick; whatever it cannot drain
+    /// within its budget stays behind its cursor for the next tick.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
         self.expire_stale_payment_link_payments().await;
+        let page_limit = page_limit.clamp(1, Self::MAX_HORIZON_PAGE_LIMIT);
 
+        // Paused wallets (#450) are excluded by the query and keep their cursor for resume.
         // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
         // wallets that never transact again, and polling them every cycle starves the active ones
         // of the shared concurrency budget. Paged by id so memory doesn't scale with wallet count.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut task_wallets = HashMap::new();
-
-        for w in wallets {
-            let wallet_id = w.id;
-            let store = self.store.clone();
-            let store_for_mark = self.store.clone();
-            let horizon_url = self.horizon_url.clone();
-            let webhooks = self.webhooks.clone();
-            let tracker = self.tracker.clone();
-            let retry = self.retry.clone();
-            let circuit = self.circuit.clone();
-            let semaphore = semaphore.clone();
-            let task_id = tasks.spawn(async move {
-                // Held for the duration of this wallet's poll; bounds how many Horizon requests
-                // are in flight at once without limiting how many wallets we *queue*.
-                let _permit = semaphore.acquire_owned().await;
-                let ingestor = Ingestor::new_with_resilience(
-                    store,
-                    &horizon_url,
-                    w.id,
-                    w.stellar_account_g.clone(),
-                    retry,
-                    circuit,
-                )
-                .with_webhooks(webhooks)
-                .with_tracker(tracker);
-                // Drain a backlog page by page; each page persists its own cursor (crash-safe).
-                let mut total = 0;
-                let mut result = Ok(0);
-                for _ in 0..Self::MAX_PAGES_PER_TICK {
-                    let page = ingestor.poll_once(page_limit).await;
-                    // Record the attempt regardless of outcome, so a wallet whose polls keep
-                    // failing still backs off instead of being retried at full rate forever.
-                    let _ = store_for_mark.mark_polled(w.id).await;
-                    match page {
-                        Ok(n) => {
-                            total += n;
-                            result = Ok(total);
-                            if !page_was_full(n, page_limit) {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    }
-                }
-                (w.id, result)
-            });
-            task_wallets.insert(task_id.id(), wallet_id);
-        }
-
+        let mut tasks = PollTasks::new();
         let mut total = 0;
         let mut after_id = None;
         let mut fetch_error = None;
@@ -774,8 +968,17 @@ impl Supervisor {
             let is_last_page = (page.len() as i64) < Self::FANOUT_PAGE_SIZE;
             after_id = page.last().map(|w| w.id);
 
-            for w in page {
-                self.spawn_poll(&mut tasks, &semaphore, w, page_limit);
+            for w in &page {
+                // An open stream already delivers this wallet's payments; polling is its fallback.
+                if self.live.contains(w.id) {
+                    continue;
+                }
+                let turn = WalletTurn {
+                    ingestor: self.ingestor_for(w),
+                    pages: 0,
+                    records: 0,
+                };
+                Self::spawn_page(&mut tasks, &semaphore, turn, page_limit);
             }
             if is_last_page {
                 break;
@@ -783,13 +986,13 @@ impl Supervisor {
             // Backpressure: keep at most about one page of queued tasks before loading the next.
             while tasks.len() > Self::FANOUT_PAGE_SIZE as usize {
                 if let Some(joined) = tasks.join_next().await {
-                    total += Self::tally(joined);
+                    total += Self::settle(joined, &mut tasks, &semaphore, page_limit);
                 }
             }
         }
 
         while let Some(joined) = tasks.join_next().await {
-            total += Self::tally(joined);
+            total += Self::settle(joined, &mut tasks, &semaphore, page_limit);
         }
         match fetch_error {
             Some(e) => Err(e.into()),
@@ -797,66 +1000,74 @@ impl Supervisor {
         }
     }
 
-    /// Queue one wallet's poll on `tasks`, gated by the shared concurrency `semaphore`.
-    fn spawn_poll(
-        &self,
-        tasks: &mut tokio::task::JoinSet<(Uuid, Result<usize, IngestError>)>,
-        semaphore: &Arc<tokio::sync::Semaphore>,
-            }
-        }
-
-        while let Some(joined) = tasks.join_next().await {
-            total += Self::tally(joined);
-        }
-        match fetch_error {
-            Some(e) => Err(e.into()),
-            None => Ok(total),
-        }
+    /// Build the per-wallet ingestor with this supervisor's Horizon, webhook and tracker wiring.
+    fn ingestor_for(&self, w: &Wallet) -> Ingestor {
+        Ingestor::new_with_resilience(
+            self.store.clone(),
+            &self.horizon_url,
+            w.id,
+            w.stellar_account_g.clone(),
+            self.retry.clone(),
+            self.circuit.clone(),
+        )
+        .with_webhooks(self.webhooks.clone())
+        .with_tracker(self.tracker.clone())
     }
 
-    /// Queue one wallet's poll on `tasks`, gated by the shared concurrency `semaphore`.
-    fn spawn_poll(
-        &self,
-        tasks: &mut tokio::task::JoinSet<(Uuid, Result<usize, IngestError>)>,
+    /// Queue one page poll for a wallet behind every page already waiting for a permit.
+    ///
+    /// Tokio's semaphore grants permits FIFO, so this is round-robin across wallets, and the
+    /// permit is dropped after the page, so no wallet holds one for its whole backlog.
+    fn spawn_page(
+        tasks: &mut PollTasks,
         semaphore: &Arc<tokio::sync::Semaphore>,
-        w: Wallet,
+        mut turn: WalletTurn,
         page_limit: u32,
     ) {
-        let store = self.store.clone();
-        let horizon_url = self.horizon_url.clone();
-        let webhooks = self.webhooks.clone();
-        let tracker = self.tracker.clone();
-        let retry = self.retry.clone();
-        let circuit = self.circuit.clone();
+        // Never request past the per-tick record budget; the rest carries over via the cursor.
+        let remaining = Self::MAX_RECORDS_PER_WALLET_PER_TICK.saturating_sub(turn.records);
+        let limit = page_limit.min(u32::try_from(remaining).unwrap_or(u32::MAX));
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
-            // Held for the duration of this wallet's poll; bounds how many Horizon requests
-            // are in flight at once without limiting how many wallets we *queue*.
             let _permit = semaphore.acquire_owned().await;
-            let ingestor = Ingestor::new_with_resilience(
-                store.clone(),
-                &horizon_url,
-                w.id,
-                w.stellar_account_g.clone(),
-                retry,
-                circuit,
-            )
-            .with_webhooks(webhooks)
-            .with_tracker(tracker);
-            let result = ingestor.poll_once(page_limit).await;
+            let result = turn.ingestor.poll_once(limit).await;
             // Record the attempt regardless of outcome, so a wallet whose polls keep failing
             // still backs off instead of being retried at full rate forever.
-            let _ = store.mark_polled(w.id).await;
-            (w.id, result)
+            let _ = turn.ingestor.store.mark_polled(turn.ingestor.wallet_id).await;
+            turn.pages += 1;
+            if let Ok(n) = &result {
+                turn.records += *n;
+            }
+            (turn, result, limit)
         });
     }
 
-    /// Count records from one finished poll task, logging failures.
-    fn tally(joined: Result<(Uuid, Result<usize, IngestError>), tokio::task::JoinError>) -> usize {
+    /// Count records from a finished page, requeueing the wallet if it has backlog and budget.
+    fn settle(
+        joined: Result<PageOutcome, tokio::task::JoinError>,
+        tasks: &mut PollTasks,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+        page_limit: u32,
+    ) -> usize {
         match joined {
-            Ok((_wallet_id, Ok(n))) => n,
-            Ok((wallet_id, Err(e))) => {
-                tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed");
+            Ok((turn, Ok(n), limit)) => {
+                if page_was_full(n, limit) {
+                    let within_budget = turn.pages < Self::MAX_PAGES_PER_TICK
+                        && turn.records < Self::MAX_RECORDS_PER_WALLET_PER_TICK;
+                    if within_budget {
+                        Self::spawn_page(tasks, semaphore, turn, page_limit);
+                    } else {
+                        tracing::debug!(
+                            wallet = %turn.ingestor.wallet_id,
+                            records = turn.records,
+                            "per-tick ingest budget reached; backlog resumes next tick"
+                        );
+                    }
+                }
+                n
+            }
+            Ok((turn, Err(e), _)) => {
+                tracing::warn!(wallet = %turn.ingestor.wallet_id, error = ?e, "wallet poll failed");
                 0
             }
             Err(e) => {
@@ -866,21 +1077,37 @@ impl Supervisor {
         }
     }
 
+    /// Override how often a standby instance retries the ingest leader lock.
+    pub fn with_lock_retry(mut self, lock_retry: Duration) -> Self {
+        self.lock_retry = lock_retry;
+        self
+    }
+
+    /// Default interval between leader-lock attempts by a standby instance.
+    pub const DEFAULT_LOCK_RETRY: Duration = Duration::from_secs(5);
+
     /// Wallets fetched per page during the fan-out. Bounds both the query size and the number of
     /// queued poll tasks (roughly two pages at most) regardless of total wallet count.
     const FANOUT_PAGE_SIZE: i64 = 500;
 
+    /// Upper bound on concurrently open SSE streams per network; each holds one connection.
+    const MAX_STREAMS: i64 = 200;
+
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;
 
+    /// Horizon rejects `limit` above 200, so larger `INGEST_PAGE_LIMIT` values are clamped.
+    const MAX_HORIZON_PAGE_LIMIT: u32 = 200;
+
     /// Upper bound on pages one wallet may fetch in a single [`Supervisor::tick`].
-    ///
-    /// Fairness tradeoff: a wallet keeps its concurrency permit while it drains, so an unbounded
-    /// drain would let one recovering wallet pin a permit for its whole backlog. At the default
-    /// `INGEST_PAGE_LIMIT` of 50 this drains up to 500 records per wallet per tick — enough to
-    /// clear a typical outage backlog in one or two ticks — while costing at most 10 Horizon
-    /// round-trips on one of 20 permits, so the other permits keep serving every other wallet.
     const MAX_PAGES_PER_TICK: usize = 10;
+
+    /// Upper bound on records one wallet may process in a single [`Supervisor::tick`].
+    ///
+    /// At the default `INGEST_PAGE_LIMIT` of 50 this matches [`Self::MAX_PAGES_PER_TICK`]: enough
+    /// to clear a typical outage backlog in a tick or two, while a dust flood costs at most this
+    /// many records (and Horizon calls) per tick no matter how large the page limit is set.
+    const MAX_RECORDS_PER_WALLET_PER_TICK: usize = 500;
 
     /// Activity-based backoff tiers. A wallet that saw a deposit within `ACTIVE_AFTER_SECS` is
     /// polled every tick; quieter wallets are polled progressively less often. Deposit latency for
@@ -947,6 +1174,8 @@ mod tests {
             asset_issuer: None,
             amount: Some("5.0000000".into()),
             starting_balance: None,
+            balance_id: None,
+            claimant: None,
             transaction: None,
         }
     }
@@ -1059,6 +1288,68 @@ mod tests {
             None,
             "memo string one above i64::MAX must be silently unattributed (current documented behavior)"
         );
+    }
+
+    /// A Horizon-shaped `path_payment_strict_send` whose source side differs from what landed.
+    fn path_payment_fixture(kind: &str) -> PaymentRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": "12884905985",
+            "paging_token": "12884905985",
+            "type": kind,
+            "transaction_successful": true,
+            "transaction_hash": "pathhash",
+            "from": "GSENDER",
+            "to": BASE,
+            "asset_type": "credit_alphanum4",
+            "asset_code": "USDC",
+            "asset_issuer": "GISSUER",
+            "amount": "9.5000000",
+            "source_asset_type": "native",
+            "source_amount": "100.0000000",
+        }))
+        .expect("fixture deserializes")
+    }
+
+    // Both path-payment variants credit the destination amount, never the source amount.
+    #[test]
+    fn path_payments_credit_the_destination_amount() {
+        for kind in ["path_payment_strict_send", "path_payment_strict_receive"] {
+            let r = path_payment_fixture(kind);
+            assert!(is_credit_kind(&r.kind), "{kind}");
+            assert_eq!(credited_amount(&r), Some("9.5000000"), "{kind}");
+            assert_eq!(r.asset_code.as_deref(), Some("USDC"), "{kind}");
+        }
+    }
+
+    // Invariant #449: a record that does not say its transaction succeeded is treated as failed.
+    #[test]
+    fn failed_transaction_invariant_fails_closed_when_flag_is_missing() {
+        let r: PaymentRecord = serde_json::from_value(serde_json::json!({
+            "id": "12884905985", "paging_token": "12884905985", "type": "payment",
+            "to": BASE, "amount": "1.0000000", "asset_type": "native",
+        }))
+        .unwrap();
+        assert!(!is_from_successful_tx(&r));
+        let mut ok = rec();
+        assert!(is_from_successful_tx(&ok));
+        ok.transaction_successful = false;
+        assert!(!is_from_successful_tx(&ok));
+    }
+
+    #[test]
+    fn balance_ids_must_be_bounded_hex() {
+        let real = "00000000929b20b72e5890ab51c24f1cc46fa01c4f318d8d33367d24dd614cfdf5491072";
+        assert!(is_balance_id(real));
+        for bad in ["", "../../accounts/G", "00ff?cursor=1", &"a".repeat(81)] {
+            assert!(!is_balance_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn non_crediting_operation_types_are_not_credit_kinds() {
+        for kind in ["account_merge", "manage_sell_offer", "change_trust", "path_payment"] {
+            assert!(!is_credit_kind(kind), "{kind}");
+        }
     }
 
     #[test]

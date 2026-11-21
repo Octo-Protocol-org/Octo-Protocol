@@ -6,30 +6,17 @@
 //! is to bound what a compromised API key/session can do, so the credential that can widen the
 //! allowlist must be stronger than the one the allowlist is meant to contain.
 
-use crate::auth::require_login;
+use crate::auth::{require_login, require_wallet_owner};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
+use crate::validation::{clean_optional, WHITELIST_LABEL_MAX};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-async fn owned_wallet(
-    state: &AppState,
-    headers: &HeaderMap,
-    wallet_id: Uuid,
-) -> Result<octo_store::Wallet, ApiError> {
-    let user_id = require_login(headers, state).await?;
-    let wallet = state.store().get_wallet(wallet_id).await?;
-    if wallet.user_id != Some(user_id) {
-        // Don't reveal existence of someone else's wallet.
-        return Err(ApiError::NotFound);
-    }
-    Ok(wallet)
-}
 
 #[derive(Debug, Serialize)]
 pub struct AllowlistConfigView {
@@ -47,12 +34,13 @@ pub async fn get_config(
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<AllowlistConfigView>>> {
-    owned_wallet(&state, &headers, wallet_id).await?;
+    let user_id = require_login(&headers, &state).await?;
+    require_wallet_owner(&state, user_id, wallet_id).await?;
     let enabled = state
         .store()
         .get_withdrawal_allowlist_config(wallet_id)
         .await
-        .map_err(|_| ApiError::Internal)?
+        .map_err(internal)?
         .is_some_and(|c| c.enabled);
     Ok(Envelope::ok(AllowlistConfigView { enabled }))
 }
@@ -64,14 +52,14 @@ pub async fn put_config(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<AllowlistConfigView>>> {
-    owned_wallet(&state, &headers, wallet_id).await?;
+    let user_id = require_login(&headers, &state).await?;
+    require_wallet_owner(&state, user_id, wallet_id).await?;
     let req: AllowlistConfigRequest = parse_optional(&body)?;
-    if req.enabled.is_none() {
+    let Some(enabled) = req.enabled else {
         return Err(ApiError::BadRequest(
             "at least one field must be provided".into(),
         ));
-    }
-    let enabled = req.enabled.unwrap_or(false);
+    };
 
     // Enabling with an empty list would lock the wallet out of every destination — including
     // ones it might legitimately need. Require at least one entry first, so "enable" always
@@ -81,7 +69,7 @@ pub async fn put_config(
             .store()
             .list_whitelisted_addresses(wallet_id)
             .await
-            .map_err(|_| ApiError::Internal)?;
+            .map_err(internal)?;
         if entries.is_empty() {
             return Err(ApiError::BadRequest(
                 "add at least one address before enabling the withdrawal allowlist".into(),
@@ -93,7 +81,7 @@ pub async fn put_config(
         .store()
         .upsert_withdrawal_allowlist_config(wallet_id, enabled)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(internal)?;
     Ok(Envelope::ok(AllowlistConfigView { enabled }))
 }
 
@@ -122,12 +110,13 @@ pub async fn list_addresses(
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<Vec<WhitelistedAddressView>>>> {
-    owned_wallet(&state, &headers, wallet_id).await?;
+    let user_id = require_login(&headers, &state).await?;
+    require_wallet_owner(&state, user_id, wallet_id).await?;
     let rows = state
         .store()
         .list_whitelisted_addresses(wallet_id)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(internal)?;
     Ok(Envelope::ok(rows.into_iter().map(Into::into).collect()))
 }
 
@@ -144,7 +133,8 @@ pub async fn add_address(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<WhitelistedAddressView>>)> {
-    owned_wallet(&state, &headers, wallet_id).await?;
+    let user_id = require_login(&headers, &state).await?;
+    require_wallet_owner(&state, user_id, wallet_id).await?;
     let req: AddWhitelistedAddressRequest = parse_optional(&body)?;
     let raw_address = req
         .address
@@ -157,9 +147,13 @@ pub async fn add_address(
     let base_address = octo_wallet_core::to_base_account(&raw_address)
         .map_err(|_| ApiError::BadRequest("address must be a valid G... or M... address".into()))?;
 
+    // Sanitise the label with the shared free-text validator so control/bidi characters can't
+    // spoof another entry in the dashboard. Never log label contents.
+    let label = clean_optional("label", req.label.as_deref(), WHITELIST_LABEL_MAX)?;
+
     let row = state
         .store()
-        .add_whitelisted_address(wallet_id, &base_address, req.label.as_deref())
+        .add_whitelisted_address(wallet_id, &base_address, label.as_deref())
         .await?;
     let (code, json) = Envelope::created(row.into());
     Ok((code, json))
@@ -171,7 +165,8 @@ pub async fn remove_address(
     Path((wallet_id, entry_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    owned_wallet(&state, &headers, wallet_id).await?;
+    let user_id = require_login(&headers, &state).await?;
+    require_wallet_owner(&state, user_id, wallet_id).await?;
     state
         .store()
         .remove_whitelisted_address(wallet_id, entry_id)

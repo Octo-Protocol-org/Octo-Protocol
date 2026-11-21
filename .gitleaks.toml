@@ -1,0 +1,6 @@
+# Minimal gitleaks configuration referenced by .pre-commit-config.yaml.
+# Extends the default ruleset so the hook runs without a config error.
+# Existing .gitleaksignore fingerprints continue to work unchanged.
+
+[extend]
+useDefault = true

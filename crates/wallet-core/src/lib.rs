@@ -43,4 +43,4 @@ pub use signer::{
 // (`sign_change_trust`/`ChangeTrustRequest` were removed with the cutover — trustlines are now
 // built and signed client-side and relayed via /submit-signed.)
 #[cfg(any(test, feature = "test-fixtures"))]
-pub use signer::{sign_payment, PaymentRequest};
+pub use signer::{sign_payment, MemoType, PaymentRequest};

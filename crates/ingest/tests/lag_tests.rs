@@ -18,7 +18,7 @@ const BASE: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
 
 async fn setup_test_server(success: bool) -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
-        "/accounts/:account/payments",
+        "/accounts/:account/operations",
         get(move || async move {
             if success {
                 (

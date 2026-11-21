@@ -16,6 +16,7 @@ test-fixtures = []
 
 [dependencies]
 octo-crypto.workspace = true
+chrono.workspace = true
 stellar-strkey.workspace = true
 stellar-base.workspace = true
 slip10_ed25519.workspace = true
@@ -34,3 +35,7 @@ base64.workspace = true
 [dev-dependencies]
 # Property-based coverage in asset.rs / derive.rs (SEP-0005 derivation, asset-code validation).
 proptest.workspace = true
+# Cross-check fixtures generated from the JS Stellar SDK (tests/fixtures/stellar-sdk/).
+# Regenerate with: `node crates/wallet-core/tests/fixtures/stellar-sdk/generate.mjs`
+# (see tests/fixtures/stellar-sdk/README.md for prerequisites).
+serde_json.workspace = true

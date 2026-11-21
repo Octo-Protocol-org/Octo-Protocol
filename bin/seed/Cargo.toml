@@ -1,0 +1,24 @@
+[package]
+name = "octo-seed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Idempotent seed binary producing demo users, wallets and deposits for local development"
+publish = false
+
+[[bin]]
+name = "octo-seed"
+path = "src/main.rs"
+
+[dependencies]
+octo-store = { path = "../../crates/octo-store" }
+octo-wallet-core = { path = "../../crates/octo-wallet-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+dotenvy = "0.15"
+zeroize = "1"

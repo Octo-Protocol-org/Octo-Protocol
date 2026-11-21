@@ -1,12 +1,17 @@
 //! Audit log listing.
 
 use crate::auth::authenticate;
-use crate::error::{ApiError, ApiResult, Envelope};
+use crate::error::{internal, ApiError, ApiResult, Envelope};
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
+
+/// Maximum length of the audit log search parameter.
+const AUDIT_SEARCH_MAX: usize = 100;
+/// Maximum number of audit log rows returned per request.
+const AUDIT_LIST_LIMIT: i64 = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
@@ -36,12 +41,33 @@ pub async fn list_audit_logs(
         }
         None => None,
     };
-    let search = q.search.filter(|s| !s.is_empty());
+    let search = match q.search.filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.chars().count() > AUDIT_SEARCH_MAX {
+                return Err(ApiError::BadRequest(format!(
+                    "search parameter exceeds maximum length of {} characters",
+                    AUDIT_SEARCH_MAX
+                )));
+            }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => None,
+    };
 
     let rows = state
         .store()
-        .list_audit_logs(user_id, category.as_deref(), search.as_deref(), 200)
+        .list_audit_logs(
+            user_id,
+            category.as_deref(),
+            search.as_deref(),
+            AUDIT_LIST_LIMIT,
+        )
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(internal)?;
     Ok(Envelope::ok(rows))
 }

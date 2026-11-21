@@ -5,17 +5,18 @@
 //! user's own ed25519 signature (checked by the network); the API credential only authorizes use
 //! of Octo's relay + bookkeeping.
 
-use crate::auth::{authorize_wallet, require_login};
-use crate::error::{ApiError, ApiResult, Envelope};
+use crate::auth::{authorize_wallet, authorize_wallet_scope, require_login};
+use crate::error::{internal, ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
 use crate::submit_validation::validate_signed_xdr;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_wallet_core::compute_inner_tx_hash;
 use serde::{Deserialize, Serialize};
+use crate::signing_policy::MIN_BASE_FEE_STROOPS;
 use uuid::Uuid;
 
 /// Withdrawal-OTP TTL. Matches the signup OTP's 10-minute window.
@@ -77,6 +78,33 @@ pub struct RelayOutcome {
     pub asset_code: Option<String>,
 }
 
+/// Best-effort write of a withdrawal history row; idempotent per tx hash (see the store call).
+async fn record_withdrawal(
+    state: &AppState,
+    wallet_id: Uuid,
+    wallet: &octo_store::Wallet,
+    p: &crate::submit_validation::PaymentSummary,
+    tx_hash: &str,
+    status: &str,
+    ledger: Option<i64>,
+) {
+    let row = octo_store::NewWithdrawalTransaction {
+        wallet_id,
+        asset_code: &p.asset_code,
+        asset_issuer: p.asset_issuer.as_deref(),
+        amount_stroops: p.amount_stroops,
+        source_account: &wallet.stellar_account_g,
+        destination_account: &p.destination,
+        stellar_tx_hash: Some(tx_hash),
+        status,
+        ledger,
+        max_time: p.max_time,
+    };
+    if let Err(e) = state.store().record_withdrawal_transaction(row).await {
+        tracing::warn!(wallet = %wallet_id, error = ?e, "failed to record withdrawal history");
+    }
+}
+
 /// Core relay logic shared by `submit_signed` and the withdrawal OTP `confirm` endpoint: validate,
 /// allowlist-check, submit to Horizon, and record history. Callers handle auth and OTP gating.
 pub async fn relay_signed_transaction(
@@ -85,6 +113,9 @@ pub async fn relay_signed_transaction(
     wallet: &octo_store::Wallet,
     signed_xdr: &str,
 ) -> ApiResult<RelayOutcome> {
+    // Hold the account lock across validation, the Horizon submit, and persistence.
+    // This makes concurrent withdrawal requests observe the post-submit sequence.
+    let _sequence_guard = state.sequence_lock(wallet.stellar_account_g.clone()).await;
     // Pure validation: v1 envelope, ≥1 signature, source == this wallet, op allowlist.
     let payment = validate_signed_xdr(signed_xdr, &wallet.stellar_account_g)?;
 
@@ -97,7 +128,7 @@ pub async fn relay_signed_transaction(
             .store()
             .get_withdrawal_allowlist_config(wallet_id)
             .await
-            .map_err(|_| ApiError::Internal)?
+            .map_err(internal)?
             .is_some_and(|c| c.enabled);
         if allowlist_enabled {
             let base_destination = octo_wallet_core::to_base_account(&p.destination)
@@ -106,7 +137,7 @@ pub async fn relay_signed_transaction(
                 .store()
                 .is_address_whitelisted(wallet_id, &base_destination)
                 .await
-                .map_err(|_| ApiError::Internal)?;
+                .map_err(internal)?;
             if !ok {
                 return Err(ApiError::Forbidden(
                     "destination is not on this wallet's withdrawal allowlist".into(),
@@ -122,10 +153,18 @@ pub async fn relay_signed_transaction(
             .map_err(|_| ApiError::BadRequest("transaction_xdr could not be hashed".into()))?,
     );
 
+    // Record the intent as `pending` BEFORE touching Horizon, so a crash after the network
+    // accepts the transaction leaves a row the reconciler can resolve by hash.
+    if let Some(p) = &payment {
+        record_withdrawal(state, wallet_id, wallet, p, &precomputed_hash, "pending", None).await;
+    }
+
     let submit = state.horizon().submit_transaction(signed_xdr).await;
 
-    let (status, hash, detail) = match submit {
-        Ok(r) if r.successful => ("confirmed", Some(r.hash), None),
+    // `settled == false` means the outcome is unknown (transport error): the transaction may
+    // still have landed, so the row stays `pending` for the reconciler.
+    let (status, hash, detail, settled, ledger) = match submit {
+        Ok(r) if r.successful => ("confirmed", Some(r.hash), None, true, r.ledger),
         Ok(r) => {
             let reason = r
                 .operation_codes
@@ -133,35 +172,22 @@ pub async fn relay_signed_transaction(
                 .find(|c| c.as_str() != "op_success")
                 .map(|c| explain_code(c))
                 .or_else(|| r.transaction_code.as_deref().map(explain_code));
-            ("failed", Some(r.hash), reason)
+            ("failed", Some(r.hash), reason, true, r.ledger)
         }
-        Err(ApiError::BadRequest(msg)) => ("failed", Some(precomputed_hash), Some(msg)),
+        Err(ApiError::BadRequest(msg)) => {
+            ("failed", Some(precomputed_hash.clone()), Some(msg), true, None)
+        }
         Err(_) => (
             "failed",
-            Some(precomputed_hash),
+            Some(precomputed_hash.clone()),
             Some("Could not reach the Stellar network — try again.".into()),
+            false,
+            None,
         ),
     };
 
-    // Record outbound payments in the history the dashboard lists (best-effort). The store call
-    // is idempotent per tx hash, so `Ok(None)` (already recorded) is expected on a retry.
-    if let Some(p) = &payment {
-        if let Err(e) = state
-            .store()
-            .record_withdrawal_transaction(
-                wallet_id,
-                &p.asset_code,
-                p.asset_issuer.as_deref(),
-                p.amount_stroops,
-                &wallet.stellar_account_g,
-                &p.destination,
-                hash.as_deref(),
-                status,
-            )
-            .await
-        {
-            tracing::warn!(wallet = %wallet_id, error = ?e, "failed to record withdrawal history");
-        }
+    if let (Some(p), true) = (&payment, settled) {
+        record_withdrawal(state, wallet_id, wallet, p, &precomputed_hash, status, ledger).await;
     }
 
     Ok(RelayOutcome {
@@ -183,7 +209,7 @@ pub async fn submit_signed(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SubmitSignedResponse>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     // For the audit log only: present when the caller used a login JWT (None for API keys).
     let audit_user = crate::auth::authenticate(&headers, &state).await.ok();
     let wallet = state.store().get_wallet(wallet_id).await?;
@@ -259,7 +285,7 @@ pub async fn withdraw_request_otp(
         .store()
         .get_user(user_id)
         .await
-        .map_err(|_| ApiError::Internal)?
+        .map_err(internal)?
         .ok_or(ApiError::NotFound)?;
 
     let req: WithdrawOtpRequest = parse_optional(&body)?;
@@ -284,12 +310,12 @@ pub async fn withdraw_request_otp(
             chrono::Duration::minutes(WITHDRAW_OTP_TTL_MINUTES),
         )
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(internal)?;
     state
         .email()
         .send_otp(&user.email, "withdrawal", &code)
         .await
-        .map_err(|_| ApiError::Internal)?;
+        .map_err(internal)?;
 
     Ok(Envelope::ok(WithdrawOtpResponse { sent: true }))
 }
@@ -314,7 +340,7 @@ pub async fn withdraw_confirm(
         .store()
         .get_user(user_id)
         .await
-        .map_err(|_| ApiError::Internal)?
+        .map_err(internal)?
         .ok_or(ApiError::NotFound)?;
 
     let req: WithdrawConfirmRequest = parse_optional(&body)?;
@@ -339,7 +365,7 @@ pub async fn withdraw_confirm(
     {
         // Wrong/expired/reused code: never touches Horizon. Tell the user in case it wasn't them.
         if let Some(p) = &payment {
-            let html = octo_email::templates::withdrawal_failed_email(
+            let body = octo_email::templates::withdrawal_failed_email(
                 &format_amount(p.amount_stroops),
                 &p.asset_code,
                 &p.destination,
@@ -347,7 +373,7 @@ pub async fn withdraw_confirm(
             );
             let _ = state
                 .email()
-                .send(&user.email, "Withdrawal attempt failed", &html)
+                .send(&user.email, "Withdrawal attempt failed", &body)
                 .await;
         }
         return Err(ApiError::BadRequest("invalid or expired code".into()));
@@ -371,7 +397,7 @@ pub async fn withdraw_confirm(
         outcome.destination.clone(),
     );
     if let (Some(amount), Some(asset), Some(destination)) = (amount, asset, destination) {
-        let html = if outcome.response.status == "confirmed" {
+        let body = if outcome.response.status == "confirmed" {
             octo_email::templates::withdrawal_success_email(
                 &amount,
                 &asset,
@@ -395,7 +421,7 @@ pub async fn withdraw_confirm(
         } else {
             "Withdrawal attempt failed"
         };
-        let _ = state.email().send(&user.email, subject, &html).await;
+        let _ = state.email().send(&user.email, subject, &body).await;
     }
 
     let (code, json) = Envelope::created(outcome.response);
@@ -425,12 +451,27 @@ pub async fn signing_info(
             other => other,
         })?;
 
+    let fee_policy = state.signing_policy();
+    let base_fee_stroops = selected_signing_fee(&state).await;
     Ok(Envelope::ok(SigningInfo {
         account: wallet.stellar_account_g,
         sequence,
         network_passphrase: state.network().passphrase().to_string(),
-        base_fee_stroops: 100,
+        base_fee_stroops,
+        max_time: fee_policy.max_time(),
     }))
+}
+
+pub(crate) async fn selected_signing_fee(state: &AppState) -> i64 {
+    let policy = state.signing_policy();
+    state
+        .horizon()
+        .recommended_fee_stroops(
+            policy.fee_percentile(),
+            MIN_BASE_FEE_STROOPS,
+            policy.fee_ceiling_stroops(),
+        )
+        .await
 }
 
 #[derive(Debug, Serialize)]
@@ -449,7 +490,64 @@ pub struct SigningInfo {
     #[serde(with = "crate::json::i64_as_string")]
     pub sequence: i64,
     pub network_passphrase: String,
+    /// Selected per-operation fee in stroops, bounded by the configured ceiling.
     pub base_fee_stroops: i64,
+    /// Absolute UNIX timestamp in seconds for the transaction time-bound `max_time`.
+    pub max_time: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WithdrawEstimateParams {
+    /// Credit asset code; omit for native XLM.
+    pub asset_code: Option<String>,
+    /// Required with `asset_code`.
+    pub asset_issuer: Option<String>,
+    /// Optional amount to check against the withdrawable maximum.
+    pub amount_stroops: Option<i64>,
+    /// Operations in the transaction to be built (default 1).
+    pub operations: Option<i64>,
+}
+
+/// `GET /v1/wallets/:id/withdraw/estimate` — preview the fee and minimum-balance impact of a
+/// withdrawal before building it (#464). Read-only: one account read plus cached fee stats.
+pub async fn withdraw_estimate(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(q): Query<WithdrawEstimateParams>,
+) -> ApiResult<Json<Envelope<crate::withdrawal_estimate::WithdrawalEstimate>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    let asset = match (q.asset_code.filter(|c| !c.is_empty()), q.asset_issuer) {
+        (None, _) => None,
+        (Some(code), Some(issuer)) if !issuer.is_empty() => Some((code, issuer)),
+        (Some(_), _) => {
+            return Err(ApiError::BadRequest(
+                "asset_issuer is required with asset_code".into(),
+            ))
+        }
+    };
+    let req = crate::withdrawal_estimate::EstimateRequest {
+        asset,
+        amount_stroops: q.amount_stroops,
+        operations: q.operations.unwrap_or(1),
+    };
+
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    let info = state
+        .horizon()
+        .account_info(&wallet.stellar_account_g)
+        .await
+        .map_err(|e| match e {
+            ApiError::NotFound => ApiError::BadRequest(
+                "This wallet is not funded on-chain yet. Fund it with XLM (testnet friendbot) first."
+                    .into(),
+            ),
+            other => other,
+        })?;
+    let fees = state.horizon().fee_stats().await?;
+    Ok(Envelope::ok(crate::withdrawal_estimate::estimate(
+        &info, fees, &req,
+    )?))
 }
 
 const WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD: u32 = 10;
@@ -505,5 +603,12 @@ mod tests {
         assert!(!explain_code("op_low_reserve").is_empty());
         assert!(!explain_code("tx_bad_seq").is_empty());
         assert!(!explain_code("unknown_code").contains("unknown_code"));
+    }
+
+    #[test]
+    fn internal_helper_maps_store_errors_to_opaque_internal() {
+        let err = internal(octo_store::StoreError::NotFound);
+        assert!(matches!(err, ApiError::Internal));
+        assert_eq!(err.to_string(), ApiError::Internal.to_string());
     }
 }

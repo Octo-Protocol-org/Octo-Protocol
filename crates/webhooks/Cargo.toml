@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 octo-resilience.workspace = true
+octo-metrics.workspace = true
 octo-store.workspace = true
 reqwest.workspace = true
 hmac.workspace = true

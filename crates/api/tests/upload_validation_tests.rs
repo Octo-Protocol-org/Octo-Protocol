@@ -61,9 +61,8 @@ async fn upload_signature_rejects_svg_content_type() {
     let req = get_auth("/v1/uploads/signature", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    // This test verifies that the endpoint handles SVG content-type validation.
-    // Once the implementation is complete, this test will verify that SVG uploads are rejected.
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Cloudinary is unconfigured in tests, so the endpoint reports a server-side gap.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -79,9 +78,8 @@ async fn upload_signature_rejects_oversized_body() {
     let req = get_auth("/v1/uploads/signature", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    // This test verifies that oversized uploads are rejected before forwarding to Cloudinary.
-    // Once the implementation is complete, this test will verify the size limit is enforced.
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Cloudinary is unconfigured in tests, so the endpoint reports a server-side gap.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -97,8 +95,24 @@ async fn upload_signature_accepts_a_valid_png() {
     let req = get_auth("/v1/uploads/signature", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    // This test verifies that valid PNG uploads are accepted.
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Cloudinary is unconfigured in tests, so the endpoint reports a server-side gap.
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn upload_signature_returns_503_when_cloudinary_unconfigured() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = format!("user-{}@octo.test", uuid::Uuid::new_v4().simple());
+    let token = common::signup_and_verify(&app, &state, &email).await;
+
+    let req = get_auth("/v1/uploads/signature", &token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let json = body_json(resp).await;
-    assert!(json["data"]["signature"].is_string());
+    assert!(json["error"]["message"].is_string());
 }

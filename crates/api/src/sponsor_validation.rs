@@ -1,25 +1,52 @@
 //! XDR validation for sponsored transactions.
 //!
-//! Enforces the operation-type allowlist (Payment, PathPaymentStrictSend/Receive) and rejects
-//! self-sponsorship (inner tx source == master account). Validation is pure — no I/O — so it can
-//! be unit-tested independently of the database or Horizon.
+//! Enforces the global operation-type allowlist (Payment, PathPaymentStrictSend/Receive), an
+//! optional per-wallet allowlist that can only narrow it, and rejects self-sponsorship (inner tx
+//! source == master account). Validation is pure — no I/O — so it can be unit-tested independently
+//! of the database or Horizon.
 
 use crate::error::ApiError;
 use stellar_base::xdr::{MuxedAccount, OperationBody, TransactionEnvelope, XDRDeserialize};
 use stellar_strkey::ed25519::PublicKey as StrkeyPK;
 
 /// Operation types that are permitted inside a sponsored fee-bump transaction.
-const ALLOWED_OP_TYPES: &[&str] = &[
+pub const ALLOWED_OP_TYPES: &[&str] = &[
     "Payment",
     "PathPaymentStrictSend",
     "PathPaymentStrictReceive",
 ];
 
-/// Parse `inner_xdr` and reject any operation not in [`ALLOWED_OP_TYPES`] or where the inner
+/// Validate a requested per-wallet allowlist: non-empty, every entry in [`ALLOWED_OP_TYPES`].
+/// Returns it deduplicated in canonical order, so a wallet can narrow but never widen the global set.
+pub fn normalize_wallet_allowlist(requested: &[String]) -> Result<Vec<String>, ApiError> {
+    if requested.is_empty() {
+        return Err(ApiError::BadRequest(
+            "allowed_operations must not be empty; disable sponsorship instead".into(),
+        ));
+    }
+    if let Some(bad) = requested.iter().find(|op| !ALLOWED_OP_TYPES.contains(&op.as_str())) {
+        return Err(ApiError::BadRequest(format!(
+            "allowed_operations may only narrow the global allowlist; '{bad}' is not one of: {}",
+            ALLOWED_OP_TYPES.join(", ")
+        )));
+    }
+    Ok(ALLOWED_OP_TYPES
+        .iter()
+        .filter(|op| requested.iter().any(|r| r == *op))
+        .map(|op| op.to_string())
+        .collect())
+}
+
+/// Parse `inner_xdr` and reject any operation outside the effective allowlist (the global
+/// [`ALLOWED_OP_TYPES`], intersected with `wallet_allowlist` when set) or where the inner
 /// transaction's source account is the same as `master_account_g`.
 ///
 /// Must be called **before** `sign_fee_bump` so that the signing path never sees forbidden ops.
-pub fn validate_inner_xdr(inner_xdr: &str, master_account_g: &str) -> Result<(), ApiError> {
+pub fn validate_inner_xdr(
+    inner_xdr: &str,
+    master_account_g: &str,
+    wallet_allowlist: Option<&[String]>,
+) -> Result<(), ApiError> {
     let env = TransactionEnvelope::from_xdr_base64(inner_xdr)
         .map_err(|_| ApiError::BadRequest("transaction_xdr is not valid base64 XDR".into()))?;
 
@@ -39,15 +66,24 @@ pub fn validate_inner_xdr(inner_xdr: &str, master_account_g: &str) -> Result<(),
         ));
     }
 
-    // Validate every operation against the allowlist.
+    // Validate every operation against the global allowlist, then the wallet's narrower one.
     for op in inner_v1.tx.operations.iter() {
+        let name = op_type_name(&op.body);
         if !is_op_allowed(&op.body) {
-            let name = op_type_name(&op.body);
             return Err(ApiError::BadRequest(format!(
                 "op_not_allowed: operation type '{name}' is not allowed in a sponsored transaction; \
                  allowed types: {}",
                 ALLOWED_OP_TYPES.join(", ")
             )));
+        }
+        if let Some(allowed) = wallet_allowlist {
+            if !allowed.iter().any(|a| a == name) {
+                return Err(ApiError::BadRequest(format!(
+                    "op_not_allowed: operation type '{name}' is not in this wallet's sponsorship \
+                     allowlist; allowed types: {}",
+                    allowed.join(", ")
+                )));
+            }
         }
     }
 
@@ -187,7 +223,7 @@ mod tests {
         // Source is MASTER_ACCOUNT_0; pass a different account as the sponsor master
         // so the self-sponsorship guard does not fire.
         let xdr = payment_xdr();
-        assert!(validate_inner_xdr(&xdr, DEST).is_ok());
+        assert!(validate_inner_xdr(&xdr, DEST, None).is_ok());
     }
 
     #[test]
@@ -198,7 +234,7 @@ mod tests {
             )))],
             [2u8; 32], // source != master
         );
-        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, None);
         assert!(
             matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains("AccountMerge")),
             "expected AccountMerge rejection, got: {result:?}"
@@ -209,7 +245,7 @@ mod tests {
     fn rejects_set_options() {
         // Use Inflation (no inner data) as a simpler stand-in for any forbidden op.
         let xdr = make_envelope(vec![OperationBody::Inflation], [3u8; 32]);
-        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, None);
         assert!(
             matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains("Inflation")),
             "expected forbidden-op rejection, got: {result:?}"
@@ -221,7 +257,7 @@ mod tests {
         // payment_xdr() is signed FROM MASTER_ACCOUNT_0; passing the same address as master
         // triggers the self-sponsorship guard.
         let xdr = payment_xdr();
-        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, None);
         assert!(
             matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains("master")),
             "expected self-sponsorship rejection, got: {result:?}"
@@ -230,7 +266,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_xdr() {
-        let result = validate_inner_xdr("this-is-not-valid-xdr!!!", DEST);
+        let result = validate_inner_xdr("this-is-not-valid-xdr!!!", DEST, None);
         assert!(matches!(result, Err(ApiError::BadRequest(_))));
     }
 
@@ -347,7 +383,7 @@ mod tests {
         for (name, body) in forbidden_op_cases() {
             // Source != master so the self-sponsorship guard never masks the op-type rejection.
             let xdr = make_envelope(vec![body], [4u8; 32]);
-            let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+            let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, None);
             assert!(
                 matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains(name)),
                 "expected '{name}' to be rejected by name, got: {result:?}"
@@ -385,11 +421,60 @@ mod tests {
             let name = op_type_name(&body);
             // Source != master: correctly sourced, not self-sponsoring.
             let xdr = make_envelope(vec![body], [5u8; 32]);
-            let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0);
+            let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, None);
             assert!(
                 result.is_ok(),
                 "expected '{name}' to be accepted, got: {result:?}"
             );
         }
+    }
+
+    fn ops(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn path_payment_send() -> OperationBody {
+        OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 100,
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            dest_asset: Asset::Native,
+            dest_min: 1,
+            path: vec![].try_into().unwrap(),
+        })
+    }
+
+    #[test]
+    fn wallet_allowlist_rejects_globally_allowed_ops_outside_it() {
+        let payments_only = ops(&["Payment"]);
+        let xdr = make_envelope(vec![path_payment_send()], [6u8; 32]);
+        let result = validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, Some(&payments_only));
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains("wallet's sponsorship allowlist")),
+            "got: {result:?}"
+        );
+        assert!(validate_inner_xdr(&payment_xdr(), DEST, Some(&payments_only)).is_ok());
+    }
+
+    #[test]
+    fn wallet_allowlist_cannot_admit_ops_the_global_list_forbids() {
+        // Even a tampered stored list naming a forbidden op must not let it through.
+        let tampered = ops(&["Payment", "AccountMerge"]);
+        let xdr = make_envelope(
+            vec![OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([1u8; 32])))],
+            [7u8; 32],
+        );
+        assert!(validate_inner_xdr(&xdr, MASTER_ACCOUNT_0, Some(&tampered)).is_err());
+    }
+
+    #[test]
+    fn normalize_only_narrows_the_global_allowlist() {
+        assert_eq!(
+            normalize_wallet_allowlist(&ops(&["PathPaymentStrictSend", "Payment", "Payment"])).unwrap(),
+            ops(&["Payment", "PathPaymentStrictSend"])
+        );
+        assert!(normalize_wallet_allowlist(&ops(&["Payment", "SetOptions"])).is_err());
+        assert!(normalize_wallet_allowlist(&ops(&["payment"])).is_err());
+        assert!(normalize_wallet_allowlist(&[]).is_err());
     }
 }

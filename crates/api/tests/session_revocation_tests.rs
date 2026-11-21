@@ -208,6 +208,97 @@ async fn in_flight_request_behaviour_around_refresh_is_as_documented() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 5: concurrent refresh/logout — no token survives logout
+//
+// Hammer refresh and logout concurrently against the same session, then assert that once
+// logout has completed, every token observed during the run (the original, every refreshed
+// token returned, and any token minted concurrently) is rejected with 401.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn no_token_is_valid_after_concurrent_refresh_and_logout() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = unique_email();
+    let token0 = signup_and_get_token(app.clone(), &state, &email).await;
+
+    // Collect every token we ever see: the original plus all refreshed tokens.
+    let mut observed: Vec<String> = vec![token0.clone()];
+
+    // Spawn a batch of concurrent refreshes, all racing on the same starting token.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let token = token0.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = app
+                .oneshot(authed("POST", "/v1/auth/refresh", &token))
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::OK {
+                body_json(resp).await["data"]["token"]
+                    .as_str()
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        }));
+    }
+
+    // Concurrently fire logouts against the original token.
+    let mut logout_handles = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let token = token0.clone();
+        logout_handles.push(tokio::spawn(async move {
+            let resp = app
+                .oneshot(authed("POST", "/v1/auth/logout", &token))
+                .await
+                .unwrap();
+            resp.status()
+        }));
+    }
+
+    // Await all spawned tasks before making any final validity assertions.
+    for h in handles {
+        if let Some(tok) = h.await.unwrap() {
+            observed.push(tok);
+        }
+    }
+    for h in logout_handles {
+        let status = h.await.unwrap();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::UNAUTHORIZED,
+            "concurrent logout must succeed or be rejected, got {status}"
+        );
+    }
+
+    // Ensure logout has definitively completed for the original token.
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", "/v1/auth/logout", &token0))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "final logout must succeed");
+
+    // Now every observed token must be rejected.
+    for tok in &observed {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/auth/me", tok))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "no token may remain valid after logout completes"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test 4: double-logout is a no-op (not an error)
 // ---------------------------------------------------------------------------
 #[tokio::test]

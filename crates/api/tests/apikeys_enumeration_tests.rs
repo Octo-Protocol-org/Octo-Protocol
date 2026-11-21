@@ -214,6 +214,74 @@ async fn apikeys_routes_succeed_for_the_true_owner() {
 }
 
 #[tokio::test]
+async fn apikeys_delete_twice_records_single_revocation_audit_row() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+
+    // Create a wallet and generate a key for it
+    let resp = app
+        .clone()
+        .oneshot(create_wallet_req(&app, &token).await)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let wallet_id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(post_auth(
+            &format!("/v1/wallets/{}/api-key", wallet_id),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let count_revocations = || async {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT action FROM audit_log WHERE action = 'revoked API key'",
+        )
+        .fetch_all(state.store().pool())
+        .await
+        .expect("query audit log");
+        rows.len()
+    };
+
+    let before = count_revocations().await;
+
+    // First delete removes the key and records one audit row
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{}/api-key", wallet_id),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(count_revocations().await, before + 1);
+
+    // Second delete is a no-op and must not add another audit row
+    let resp = app
+        .clone()
+        .oneshot(delete_auth(
+            &format!("/v1/wallets/{}/api-key", wallet_id),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(count_revocations().await, before + 1);
+}
+
+#[tokio::test]
 async fn apikeys_nonexistent_and_unowned_wallet_return_same_error() {
     let Some(state) = test_state().await else {
         eprintln!("SKIPPED: set DATABASE_URL");

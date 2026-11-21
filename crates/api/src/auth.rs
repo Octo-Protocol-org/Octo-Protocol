@@ -7,7 +7,13 @@
 //!  POST /refresh   ──▶ revokes T1, issues T2
 //!  POST /logout    ──▶ revokes T2
 //!  POST /change-password ──▶ revokes every token issued so far, issues T3
+//!  DELETE /sessions/:id  ──▶ revokes one session (any device), effective on its next request
+//!  POST /sessions/revoke-others ──▶ revokes every session but this one, issues T4
 //! ```
+//!
+//! Each sign-in opens a row in `sessions` (migration 0030_sessions.sql) and its id rides in the
+//! JWT's `sid` claim; refresh rotates the token but keeps the session. A token whose session is
+//! revoked or expired is rejected by the same per-request query as the deny-list and epoch.
 //!
 //! Single-token revocation uses a deny-list in Postgres (migration 0008_token_denylist.sql).
 //! Revoking *all* of a user's sessions uses a per-user `session_epoch` (migration
@@ -27,9 +33,10 @@
 //! # Concurrent-request race on refresh
 //!
 //! In-flight requests that carry T1 at the moment T1 is revoked may succeed or fail
-//! depending on timing: if `is_token_revoked` runs before the deny-list INSERT commits they
-//! succeed; after, they get 401. Clients should treat a mid-session 401 as a signal to
-//! re-authenticate. This is the standard deny-list tradeoff and is documented here explicitly.
+//! depending on timing: if the deny-list lookup (`is_session_valid`) runs before the INSERT
+//! commits they succeed; after, they get 401. Clients should treat a mid-session 401 as a
+//! signal to re-authenticate. This is the standard deny-list tradeoff and is documented here
+//! explicitly.
 //!
 //! # Security
 //! - Passwords are hashed with **argon2id** (PHC string, random salt).
@@ -44,7 +51,7 @@ use crate::state::AppState;
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -154,6 +161,21 @@ pub struct Claims {
     /// default), so they stay valid until the user's first password change.
     #[serde(default)]
     pub epoch: i32,
+    pub iss: String,
+    pub aud: String,
+    /// Session id (`sessions.id`). Absent on tokens issued before session tracking, which stay
+    /// valid until expiry or until "revoke all other sessions" bumps the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
+}
+
+/// A verified dashboard login: who, and which session (when the token carries one).
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedSession {
+    pub user_id: Uuid,
+    pub session_id: Option<Uuid>,
+    /// The token's `exp`, for deny-listing it on logout/refresh.
+    pub expires_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +186,7 @@ pub struct Claims {
 ///
 /// Blunts credential stuffing and signup spam. Deliberately per-IP rather than per-email — an
 /// attacker rotates emails freely, but not source addresses.
-fn check_auth_rate_limit(
+pub(crate) async fn check_auth_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
@@ -172,7 +194,13 @@ fn check_auth_rate_limit(
     let ip = crate::rate_limit::client_ip(headers, peer);
     if state
         .rate_limiter()
-        .check(&ip, "auth", crate::rate_limit::AUTH_RATE_LIMIT, crate::rate_limit::AUTH_RATE_WINDOW)
+        .check(
+            &ip,
+            "auth",
+            crate::rate_limit::AUTH_RATE_LIMIT,
+            crate::rate_limit::AUTH_RATE_WINDOW,
+        )
+        .await
     {
         Ok(())
     } else {
@@ -184,7 +212,7 @@ fn check_auth_rate_limit(
 
 /// Generate, store, and email a one-time code for `purpose`. `bound_to` ties the code to one value
 /// (e.g. a new email address) so it can't be redeemed for anything else.
-async fn issue_otp(
+pub(crate) async fn issue_otp(
     state: &AppState,
     user_id: Uuid,
     purpose: &str,
@@ -225,36 +253,43 @@ pub async fn signup(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<VerificationRequiredResponse>>)> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
 
     let hash = hash_password(&password)?;
-    let user = state
-        .store()
-        .create_user(&email, &hash)
-        .await
-        .map_err(|e| match e {
-            octo_store::StoreError::Conflict => {
-                ApiError::BadRequest("email already registered".into())
-            }
-            _ => ApiError::Internal,
-        })?;
+    let (user, created) = match state.store().create_user(&email, &hash).await {
+        Ok(user) => (user, true),
+        Err(octo_store::StoreError::Conflict) => {
+            let user = state
+                .store()
+                .find_user_by_email(&email)
+                .await
+                .map_err(|_| ApiError::Internal)?
+                .ok_or(ApiError::Internal)?;
+            (user, false)
+        }
+        Err(_) => return Err(ApiError::Internal),
+    };
 
-    crate::audit::record(
-        &state,
-        user.id,
-        "created an account",
-        crate::audit::category::AUTH,
-        None,
-        &headers,
-    )
-    .await;
+    if created {
+        crate::audit::record(
+            &state,
+            user.id,
+            "created an account",
+            crate::audit::category::AUTH,
+            None,
+            &headers,
+        )
+        .await;
+    }
 
     // If the OTP email can't be sent, this account is otherwise unreachable — delete it rather
     // than leaving the email permanently stuck as "already registered" with no way to verify.
     if let Err(e) = issue_signup_otp(&state, user.id, &user.email).await {
-        let _ = state.store().delete_unverified_user(user.id).await;
+        if created {
+            let _ = state.store().delete_unverified_user(user.id).await;
+        }
         return Err(e);
     }
 
@@ -268,6 +303,7 @@ pub async fn signup(
 /// `POST /v1/auth/verify-email` — consume a signup OTP and issue the first session token.
 pub async fn verify_email(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
     let req: VerifyEmailRequest = parse_optional(&body)?;
@@ -299,13 +335,13 @@ pub async fn verify_email(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    let welcome_html = octo_email::templates::welcome_email(&user.email);
+    let welcome = octo_email::templates::welcome_email(&user.email);
     let _ = state
         .email()
-        .send(&user.email, "Welcome to Octo", &welcome_html)
+        .send(&user.email, "Welcome to Octo", &welcome)
         .await;
 
-    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    let token = start_session(&state, user.id, user.session_epoch, &headers).await?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -323,7 +359,7 @@ pub async fn resend_otp(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let req: ResendOtpRequest = parse_optional(&body)?;
     let user_id = req
         .user_id
@@ -335,7 +371,7 @@ pub async fn resend_otp(
         "otp_resend",
         crate::rate_limit::OTP_RESEND_USER_LIMIT,
         crate::rate_limit::OTP_RESEND_USER_WINDOW,
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many resend attempts — wait a while and try again".into(),
         ));
@@ -346,7 +382,7 @@ pub async fn resend_otp(
         "otp_resend_ip",
         crate::rate_limit::OTP_RESEND_IP_LIMIT,
         crate::rate_limit::OTP_RESEND_IP_WINDOW,
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many resend attempts — wait a while and try again".into(),
         ));
@@ -370,19 +406,58 @@ pub async fn login(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
+
+    let invalid_credentials = || ApiError::BadRequest("invalid email or password".into());
+    if state
+        .store()
+        .auth_locked_until(&email)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .is_some()
+    {
+        return Err(invalid_credentials());
+    }
 
     let user = state
         .store()
         .find_user_by_email(&email)
         .await
-        .map_err(|_| ApiError::Internal)?
-        .ok_or_else(|| ApiError::BadRequest("invalid email or password".into()))?;
+        .map_err(|_| ApiError::Internal)?;
 
-    verify_password(&password, &user.password_hash)
-        .map_err(|_| ApiError::BadRequest("invalid email or password".into()))?;
+    let Some(user) = user else {
+        let _ = verify_password(&password, dummy_password_hash());
+        state
+            .store()
+            .record_auth_failure(&email)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        return Err(invalid_credentials());
+    };
+
+    if verify_password(&password, &user.password_hash).is_err() {
+        state
+            .store()
+            .record_auth_failure(&email)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        return Err(invalid_credentials());
+    }
+    state
+        .store()
+        .reset_auth_failures(&email)
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    if password_hash_needs_upgrade(&user.password_hash) {
+        let upgraded = hash_password(&password)?;
+        state
+            .store()
+            .rehash_password(user.id, &upgraded)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+    }
 
     // A correct password on an unverified account (pre-existing user, or one who abandoned
     // signup before verifying) re-triggers the same OTP gate signup uses, instead of a token.
@@ -407,7 +482,7 @@ pub async fn login(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    let token = start_session(&state, user.id, user.session_epoch, &headers).await?;
     Ok(Envelope::ok(
         serde_json::to_value(AuthResponse {
             token,
@@ -424,41 +499,22 @@ pub async fn login(
 /// `POST /v1/auth/refresh` — exchange a valid, unexpired token for a freshly-signed one.
 ///
 /// The caller presents their current JWT via `Authorization: Bearer`; the response carries a new
-/// token for the same user with a full [`TOKEN_TTL_SECS`] window starting now.
-///
-/// **This is not a security control.** Refreshing does **not** invalidate the previous token:
-/// both the old and the new token remain valid until their natural expiry. That is an intentional
-/// scope limit — real revocation (server-side session state / a token denylist) is a separate,
-/// larger piece of work.
+/// token for the same user and session with a full [`TOKEN_TTL_SECS`] window starting now. The
+/// presented token is deny-listed, so a refreshed session leaves exactly one live token.
 pub async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    let user_id = authenticate(&headers, &state).await?;
+    let session = authenticate_session(&headers, &state).await?;
     let user = state
         .store()
-        .get_user(user_id)
+        .get_user(session.user_id)
         .await
         .map_err(|_| ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
 
-    // Rotate, don't just re-issue: deny-list the presented token so a refreshed session leaves
-    // exactly one live token. Without this a leaked token stayed valid for its full TTL even
-    // after the user refreshed.
-    if let Some(old_token) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-    {
-        if let Some(claims) = verify_token(state.jwt_secret(), old_token) {
-            let expires_at =
-                chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
-            state
-                .store()
-                .denylist_token(&hash_token(old_token), user.id, expires_at)
-                .await
-                .map_err(|_| ApiError::Internal)?;
-        }
+    if let Some(old_token) = bearer(&headers) {
+        denylist(&state, old_token, &session).await?;
     }
 
     crate::audit::record(
@@ -471,7 +527,7 @@ pub async fn refresh(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    let token = continue_session(&state, &session, user.session_epoch, &headers).await?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -490,16 +546,17 @@ pub async fn change_password(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     // API keys are wallet-scoped automation credentials; only a login session may do this.
-    let user_id = require_login(&headers, &state).await?;
+    let session = require_login_session(&headers, &state).await?;
+    let user_id = session.user_id;
     // Per-user cap too, so a stolen token can't guess the current password by rotating IPs.
     if !state.rate_limiter().check(
         &user_id.to_string(),
         "change_password",
         CHANGE_PASSWORD_ATTEMPTS,
         std::time::Duration::from_secs(15 * 60),
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many attempts — wait a while and try again".into(),
         ));
@@ -508,12 +565,12 @@ pub async fn change_password(
     let req: ChangePasswordRequest = parse_optional(&body)?;
     let current = req
         .current_password
-        .filter(|p| !p.is_empty())
+        .filter(|password| !password.is_empty() && password.len() <= 128)
         .ok_or_else(|| ApiError::BadRequest("current_password is required".into()))?;
     let new = req
         .new_password
-        .filter(|p| p.len() >= 8)
-        .ok_or_else(|| ApiError::BadRequest("new_password must be at least 8 characters".into()))?;
+        .filter(|password| (8..=128).contains(&password.len()))
+        .ok_or_else(|| ApiError::BadRequest("new_password must be 8-128 bytes".into()))?;
     if new == current {
         return Err(ApiError::BadRequest(
             "new_password must differ from the current password".into(),
@@ -531,7 +588,7 @@ pub async fn change_password(
 
     let epoch = state
         .store()
-        .change_password(user_id, &hash_password(&new)?)
+        .change_password(user_id, &hash_password(&new)?, session.session_id)
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -545,27 +602,8 @@ pub async fn change_password(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user_id, epoch)?;
+    let token = continue_session(&state, &session, epoch, &headers).await?;
 
-    Ok(Envelope::ok(AuthResponse {
-        token,
-        user: UserView {
-            id: user.id,
-            email: user.email,
-            username: user.username,
-        },
-    }))
-}
-
-/// `GET /v1/auth/me` — returns the authenticated user (token required).
-pub async fn me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Envelope<UserView>>> {
-    let user_id = authenticate(&headers, &state).await?;
-    let user = state
-        .store()
-        .get_user(user
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -642,7 +680,7 @@ async fn send_password_reset_otp(state: &AppState, email: &str) -> Result<(), Ap
         "pw_reset_send",
         3,
         std::time::Duration::from_secs(60 * 60),
-    ) {
+    ).await {
         return Ok(());
     }
     issue_otp(state, user.id, "password_reset", &user.email, None).await
@@ -658,7 +696,7 @@ pub async fn request_password_reset(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let req: RequestPasswordResetRequest = parse_optional(&body)?;
     let email = normalize_email(req.email)?;
 
@@ -678,7 +716,7 @@ pub async fn confirm_password_reset(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let req: ConfirmPasswordResetRequest = parse_optional(&body)?;
     // Validate the password first so a typo doesn't burn the one-time code.
     let (email, new_password) = validate(Credentials {
@@ -737,13 +775,13 @@ pub async fn request_email_change(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let user_id = require_login(&headers, &state).await?;
     let req: RequestEmailChangeRequest = parse_optional(&body)?;
     let new_email = normalize_email(req.new_email)?;
     let password = req
         .password
-        .filter(|p| !p.is_empty())
+        .filter(|password| !password.is_empty() && password.len() <= 128)
         .ok_or_else(|| ApiError::BadRequest("password is required".into()))?;
 
     // Per-account cap: bounds password guessing with a stolen session, and OTP mail to third parties.
@@ -752,7 +790,7 @@ pub async fn request_email_change(
         "email_change_request",
         5,
         std::time::Duration::from_secs(60 * 60),
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many attempts — wait a while and try again".into(),
         ));
@@ -800,7 +838,7 @@ pub async fn confirm_email_change(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<UserView>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let user_id = require_login(&headers, &state).await?;
     let req: ConfirmEmailChangeRequest = parse_optional(&body)?;
     let new_email = normalize_email(req.new_email)?;
@@ -875,28 +913,26 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    // Extract and validate the token *before* denylisting it — also gives us the user_id and exp.
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or(ApiError::Unauthorized)?;
-
+    // Signature + expiry only, so logging out an already-revoked token stays an idempotent no-op.
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
     let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
     let user_id = claims
         .sub
         .parse::<Uuid>()
         .map_err(|_| ApiError::Unauthorized)?;
-
-    // Deny-list the token so it cannot be replayed.
-    let token_hash = hash_token(token);
-    let expires_at =
-        chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
-    state
-        .store()
-        .denylist_token(&token_hash, user_id, expires_at)
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    let session = AuthenticatedSession {
+        user_id,
+        session_id: claims.sid,
+        expires_at: claims.exp,
+    };
+    denylist(&state, token, &session).await?;
+    if let Some(sid) = session.session_id {
+        state
+            .store()
+            .revoke_session(user_id, sid)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+    }
 
     crate::audit::record(
         &state,
@@ -924,8 +960,8 @@ fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
     let email = normalize_email(creds.email)?;
     let password = creds
         .password
-        .filter(|p| p.len() >= 8)
-        .ok_or_else(|| ApiError::BadRequest("password must be at least 8 characters".into()))?;
+        .filter(|password| (8..=128).contains(&password.len()))
+        .ok_or_else(|| ApiError::BadRequest("password must be 8-128 bytes".into()))?;
     Ok((email, password))
 }
 
@@ -981,21 +1017,122 @@ pub fn validate_jwt_secret(secret: &[u8]) -> Result<(), String> {
 
 fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
+    configured_argon2()?
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|_| ApiError::Internal)
 }
 
-fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
+pub(crate) fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
     let parsed = PasswordHash::new(phc).map_err(|_| ())?;
-    Argon2::default()
+    configured_argon2().map_err(|_| ())?
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| ())
 }
 
+fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        hash_password("octo-login-timing-dummy")
+            .expect("constant dummy password must be hashable")
+    })
+}
+
+pub(crate) fn initialize_dummy_password_hash() {
+    let _ = dummy_password_hash();
+}
+
+/// Argon2id cost parameters, parsed once from the environment.
+///
+/// A variable that is set but not a valid integer is a hard error rather than a silent fallback:
+/// silently hashing at the default cost hides a misconfiguration of the password-hashing cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Argon2Settings {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+impl Argon2Settings {
+    pub(crate) const DEFAULT_MEMORY_KIB: u32 = 65_536;
+    pub(crate) const DEFAULT_ITERATIONS: u32 = 3;
+    pub(crate) const DEFAULT_PARALLELISM: u32 = 1;
+
+    /// Read the settings from the environment, rejecting malformed values.
+    pub(crate) fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Build settings from an arbitrary lookup, so parsing can be unit-tested without touching
+    /// the process environment.
+    pub(crate) fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        let parse = |name: &str, default: u32| match lookup(name) {
+            None => Ok(default),
+            Some(value) => value.trim().parse::<u32>().map_err(|_| {
+                format!("{name} must be a positive integer, got {value:?}")
+            }),
+        };
+        Ok(Self {
+            memory_kib: parse("ARGON2_MEMORY_KIB", Self::DEFAULT_MEMORY_KIB)?,
+            iterations: parse("ARGON2_ITERATIONS", Self::DEFAULT_ITERATIONS)?,
+            parallelism: parse("ARGON2_PARALLELISM", Self::DEFAULT_PARALLELISM)?,
+        })
+    }
+
+    fn params(&self) -> Result<Params, ApiError> {
+        Params::new(self.memory_kib, self.iterations, self.parallelism, None)
+            .map_err(|_| ApiError::Internal)
+    }
+
+    /// Whether `phc` was hashed with different parameters than these.
+    fn needs_upgrade(&self, phc: &str) -> bool {
+        !phc.contains(&format!(
+            "m={},t={},p={}",
+            self.memory_kib, self.iterations, self.parallelism
+        ))
+    }
+}
+
+fn configured_argon2() -> Result<Argon2<'static>, ApiError> {
+    let settings = Argon2Settings::from_env().map_err(|_| ApiError::Internal)?;
+    Ok(Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        settings.params()?,
+    ))
+}
+
+fn password_hash_needs_upgrade(phc: &str) -> bool {
+    match Argon2Settings::from_env() {
+        Ok(settings) => settings.needs_upgrade(phc),
+        // Malformed settings are rejected at startup; never silently claim an upgrade is needed.
+        Err(_) => false,
+    }
+}
+
 type HmacSha256 = Hmac<Sha256>;
-const JWT_HEADER_B64: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+#[derive(Serialize, Deserialize)]
+struct JwtHeader {
+    alg: String,
+    typ: String,
+    kid: String,
+}
+
+fn jwt_key_id(secret: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(&Sha256::digest(secret)[..8])
+}
+
+fn jwt_issuer() -> String {
+    std::env::var("JWT_ISSUER").unwrap_or_else(|_| "octo-api".into())
+}
+
+fn jwt_audience() -> String {
+    std::env::var("JWT_AUDIENCE").unwrap_or_else(|_| "octo-clients".into())
+}
 
 fn b64(input: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
@@ -1007,15 +1144,31 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<String, ApiError> {
+fn issue_token(
+    secret: &[u8],
+    user_id: Uuid,
+    session_epoch: i32,
+    session_id: Option<Uuid>,
+) -> Result<String, ApiError> {
     let claims = Claims {
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
         jti: Uuid::new_v4().to_string(),
-fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<String, ApiError> {
+        epoch: session_epoch,
+        iss: jwt_issuer(),
+        aud: jwt_audience(),
+        sid: session_id,
     };
+    let header = b64(
+        &serde_json::to_vec(&JwtHeader {
+            alg: "HS256".into(),
+            typ: "JWT".into(),
+            kid: jwt_key_id(secret),
+        })
+        .map_err(|_| ApiError::Internal)?,
+    );
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
-    let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
+    let signing_input = format!("{header}.{}", b64(&payload));
     let sig = sign_hs256(secret, signing_input.as_bytes());
     Ok(format!("{signing_input}.{sig}"))
 }
@@ -1026,33 +1179,60 @@ pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
     let header = parts.next()?;
     let payload = parts.next()?;
     let signature = parts.next()?;
-    if parts.next().is_some() || header != JWT_HEADER_B64 {
+    if parts.next().is_some() {
         return None;
     }
+    let header_data: JwtHeader = serde_json::from_slice(&b64_decode(header)?).ok()?;
+    if header_data.alg != "HS256" || header_data.typ != "JWT" {
+        return None;
+    }
+    let previous = std::env::var("JWT_SECRET_PREVIOUS").ok();
+    let verification_secret = if header_data.kid == jwt_key_id(secret) {
+        secret
+    } else {
+        previous
+            .as_deref()
+            .map(str::as_bytes)
+            .filter(|previous| header_data.kid == jwt_key_id(previous))?
+    };
     let signing_input = format!("{header}.{payload}");
-    if !verify_hs256(secret, signing_input.as_bytes(), signature) {
+    if !verify_hs256(verification_secret, signing_input.as_bytes(), signature) {
         return None;
     }
     let claims: Claims = serde_json::from_slice(&b64_decode(payload)?).ok()?;
-    if claims.exp < now_secs() {
+    if claims.exp < now_secs() || claims.iss != jwt_issuer() || claims.aud != jwt_audience() {
         return None;
     }
     Some(claims)
 }
 
+/// Compute the HMAC-SHA256 of `data` under `secret`.
+///
+/// `new_from_slice` only fails for key types with a fixed size; HMAC accepts any key length, so
+/// the error is unreachable in practice — but it is mapped rather than unwrapped so a future
+/// change can't turn a request into a panic.
+fn hmac_sha256(secret: &[u8], data: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).map_err(|_| ApiError::Internal)?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
 pub(crate) fn sign_hs256(secret: &[u8], input: &[u8]) -> String {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(input);
-    b64(&mac.finalize().into_bytes())
+    hmac_sha256(secret, input)
+        .map(|mac| b64(&mac))
+        .unwrap_or_default()
 }
 
 pub(crate) fn verify_hs256(secret: &[u8], input: &[u8], signature_b64: &str) -> bool {
     let Some(sig) = b64_decode(signature_b64) else {
         return false;
     };
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(input);
-    mac.verify_slice(&sig).is_ok()
+    let Ok(expected) = hmac_sha256(secret, input) else {
+        return false;
+    };
+    // Constant-time comparison, matching `Mac::verify_slice`.
+    use subtle::ConstantTimeEq;
+    expected.ct_eq(&sig).into()
 }
 
 pub(crate) fn now_secs() -> i64 {
@@ -1061,6 +1241,71 @@ pub(crate) fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Session rows expire with the token they were issued for.
+fn session_expiry() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::seconds(TOKEN_TTL_SECS)
+}
+
+/// SHA-256 hex of the User-Agent header (capped at 512 bytes), or `None` when absent.
+fn user_agent_hash(headers: &HeaderMap) -> Option<String> {
+    use sha2::Digest;
+    let ua = headers.get(axum::http::header::USER_AGENT)?.as_bytes();
+    Some(hex::encode(Sha256::digest(&ua[..ua.len().min(512)])))
+}
+
+/// Open a new session for `user_id` and return its first token.
+async fn start_session(
+    state: &AppState,
+    user_id: Uuid,
+    session_epoch: i32,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let session = state
+        .store()
+        .create_session(user_id, user_agent_hash(headers).as_deref(), session_expiry())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    issue_token(state.jwt_secret(), user_id, session_epoch, Some(session.id))
+}
+
+/// Re-issue a token for the caller's existing session (extending it), or open a new session for a
+/// token that predates session tracking.
+pub(crate) async fn continue_session(
+    state: &AppState,
+    session: &AuthenticatedSession,
+    session_epoch: i32,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let Some(sid) = session.session_id else {
+        return start_session(state, session.user_id, session_epoch, headers).await;
+    };
+    let extended = state
+        .store()
+        .extend_session(session.user_id, sid, session_expiry())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    // Revoked between authentication and here (e.g. from another device): don't resurrect it.
+    if !extended {
+        return Err(ApiError::Unauthorized);
+    }
+    issue_token(state.jwt_secret(), session.user_id, session_epoch, Some(sid))
+}
+
+/// Deny-list `token` until its own expiry so it can't be replayed.
+async fn denylist(
+    state: &AppState,
+    token: &str,
+    session: &AuthenticatedSession,
+) -> Result<(), ApiError> {
+    let expires_at =
+        chrono::DateTime::from_timestamp(session.expires_at, 0).unwrap_or_else(chrono::Utc::now);
+    state
+        .store()
+        .denylist_token(&hash_token(token), session.user_id, expires_at)
+        .await
+        .map_err(|_| ApiError::Internal)
 }
 
 /// SHA-256 hex of a raw token string — used as the deny-list key.
@@ -1092,42 +1337,47 @@ pub async fn authenticate(
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<Uuid, ApiError> {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or(ApiError::Unauthorized)?;
+    authenticate_session(headers, state).await.map(|s| s.user_id)
+}
+
+/// [`authenticate`], also returning the session the token belongs to.
+pub async fn authenticate_session(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedSession, ApiError> {
+    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
     let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
     let user_id = claims
         .sub
         .parse::<Uuid>()
         .map_err(|_| ApiError::Unauthorized)?;
-
-    // Reject tokens revoked individually (deny-list) or en masse (stale session epoch).
+    // Reject tokens revoked individually (deny-list), per session, or en masse (stale epoch).
     let valid = state
         .store()
-        .is_session_valid(&hash_token(token), user_id, claims.epoch)
+        .is_session_valid(&hash_token(token), user_id, claims.epoch, claims.sid)
         .await
         .map_err(|_| ApiError::Internal)?;
     if !valid {
         return Err(ApiError::Unauthorized);
     }
-
-    // A stale epoch (password reset) or a deleted user revokes the token.
-    let epoch = state
-        .store()
-        .get_session_epoch(user_id)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    if epoch != Some(claims.ep) {
-        return Err(ApiError::Unauthorized);
-    }
-
-    Ok(user_id)
+    Ok(AuthenticatedSession {
+        user_id,
+        session_id: claims.sid,
+        expires_at: claims.exp,
+    })
 }
 
 /// Prefix that marks an octo API key (vs a dashboard login JWT).
 const API_KEY_PREFIX: &str = "octo_sk_";
+
+/// API key scope: read-only access to the key's wallet.
+pub const SCOPE_READ: &str = "read";
+/// API key scope: write access to the key's wallet.
+pub const SCOPE_WRITE: &str = "write";
+/// API key scope: sponsor access to the key's wallet.
+pub const SCOPE_SPONSOR: &str = "sponsor";
+/// Every scope an API key may be granted.
+pub const ALL_SCOPES: &[&str] = &[SCOPE_READ, SCOPE_WRITE, SCOPE_SPONSOR];
 
 /// Extract the raw bearer token (`octo_sk_…` or a JWT), if present.
 fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
@@ -1145,6 +1395,13 @@ fn hash_api_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
+fn has_valid_api_key_checksum(key: &str) -> bool {
+    let Some((body, supplied)) = key.rsplit_once('_') else {
+        return false;
+    };
+    supplied.len() == 8 && hash_api_key(body).starts_with(supplied)
+}
+
 /// Authorize a request to operate on `wallet_id`, accepting **either**:
 /// - a dashboard login JWT whose user **owns** the wallet, or
 /// - an `octo_sk_…` API key whose wallet **is** `wallet_id` (the key implies its wallet).
@@ -1156,18 +1413,33 @@ pub async fn authorize_wallet(
     state: &AppState,
     wallet_id: Uuid,
 ) -> Result<(), ApiError> {
+    authorize_wallet_scope(headers, state, wallet_id, SCOPE_READ).await
+}
+
+pub async fn authorize_wallet_scope(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+    wallet_id: Uuid,
+    required_scope: &str,
+) -> Result<(), ApiError> {
     let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
 
     if let Some(_key) = token.strip_prefix(API_KEY_PREFIX) {
+        if !has_valid_api_key_checksum(token) {
+            return Err(ApiError::Unauthorized);
+        }
         // API-key path: the key maps to exactly one wallet.
-        let key_wallet = state
+        let key = state
             .store()
-            .wallet_id_for_key_hash(&hash_api_key(token))
+            .use_api_key(&hash_api_key(token))
             .await
             .map_err(|_| ApiError::Internal)?
             .ok_or(ApiError::Unauthorized)?;
-        if key_wallet != wallet_id {
+        if key.wallet_id != wallet_id {
             return Err(ApiError::NotFound);
+        }
+        if !key.scopes.iter().any(|scope| scope == required_scope) {
+            return Err(ApiError::Forbidden("API key lacks the required scope".into()));
         }
         return Ok(());
     }
@@ -1181,19 +1453,44 @@ pub async fn authorize_wallet(
     Ok(())
 }
 
+/// Load `wallet_id` and require that `user_id` owns it.
+///
+/// Returns [`ApiError::NotFound`] when the wallet belongs to someone else (or doesn't exist), so
+/// callers never reveal the existence of another user's wallet. Callers must authenticate the
+/// request themselves first (e.g. [`authenticate`] or [`require_login`]).
+pub async fn require_wallet_owner(
+    state: &AppState,
+    user_id: Uuid,
+    wallet_id: Uuid,
+) -> Result<octo_store::Wallet, ApiError> {
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    Ok(wallet)
+}
+
 /// Require a **dashboard login** (reject API keys). Returns the authenticated user id.
 /// Used for sensitive operations (e.g. withdrawals) that must not be driven by an API key.
 pub async fn require_login(
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<Uuid, ApiError> {
+    require_login_session(headers, state).await.map(|s| s.user_id)
+}
+
+/// [`require_login`], also returning the session the token belongs to.
+pub async fn require_login_session(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedSession, ApiError> {
     if let Some(tok) = bearer(headers) {
         if tok.starts_with(API_KEY_PREFIX) {
             // An API key was presented where a login is required.
             return Err(ApiError::Unauthorized);
         }
     }
-    authenticate(headers, state).await
+    authenticate_session(headers, state).await
 }
 
 #[cfg(test)]
@@ -1211,10 +1508,21 @@ mod tests {
             sub: user_id.to_string(),
             exp,
             jti: Uuid::new_v4().to_string(),
-            exp: 0,
+            epoch: 0,
+            iss: jwt_issuer(),
+            aud: jwt_audience(),
+            sid: None,
         };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
-        let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
+        let header = b64(
+            &serde_json::to_vec(&JwtHeader {
+                alg: "HS256".into(),
+                typ: "JWT".into(),
+                kid: jwt_key_id(secret),
+            })
+            .unwrap(),
+        );
+        let signing_input = format!("{header}.{}", b64(&payload));
         let sig = sign_hs256(secret, signing_input.as_bytes());
         format!("{signing_input}.{sig}")
     }
@@ -1229,7 +1537,7 @@ mod tests {
     #[test]
     fn tampered_signature_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -1252,7 +1560,7 @@ mod tests {
     #[test]
     fn tampered_payload_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -1276,7 +1584,7 @@ mod tests {
     #[test]
     fn non_standard_header_segment_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -1284,14 +1592,14 @@ mod tests {
         // signature segment is irrelevant here: verify_token must reject on the header check
         // alone, before ever reaching signature verification.
         let none_header = b64(br#"{"alg":"none","typ":"JWT"}"#);
-        assert_ne!(none_header, JWT_HEADER_B64);
+        assert_ne!(none_header, parts[0]);
         let tampered = format!("{}.{}.{}", none_header, parts[1], parts[2]);
         assert!(verify_token(SECRET, &tampered).is_none());
 
         // Also confirm a header that isn't even valid JSON (garbage bytes) is rejected the
         // same way, and doesn't panic.
         let garbage_header = b64(b"not-a-jwt-header");
-        assert_ne!(garbage_header, JWT_HEADER_B64);
+        assert_ne!(garbage_header, parts[0]);
         let tampered = format!("{}.{}.{}", garbage_header, parts[1], parts[2]);
         assert!(verify_token(SECRET, &tampered).is_none());
 
@@ -1422,8 +1730,8 @@ mod tests {
     #[test]
     fn token_includes_unique_jti_to_prevent_collision() {
         let user_id = Uuid::new_v4();
-        let token1 = issue_token(SECRET, user_id).expect("issue_token should succeed");
-        let token2 = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token1 = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
+        let token2 = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
 
         assert_ne!(token1, token2, "tokens for same user issued in quick succession should differ");
 
@@ -1442,7 +1750,7 @@ mod tests {
     #[test]
     fn token_expires_after_ttl() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let claims = verify_token(SECRET, &token).expect("token should verify");
 
         let now = now_secs();
@@ -1496,9 +1804,58 @@ mod tests {
     #[test]
     fn verify_token_rejects_tokens_signed_with_different_secret() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
 
         let other_secret = b"different-secret-at-least-32-bytes-long!";
         assert!(verify_token(other_secret, &token).is_none());
+    }
+
+    #[test]
+    fn argon2_settings_use_defaults_when_unset() {
+        let settings = Argon2Settings::from_lookup(|_| None).expect("missing vars use defaults");
+        assert_eq!(
+            settings,
+            Argon2Settings {
+                memory_kib: Argon2Settings::DEFAULT_MEMORY_KIB,
+                iterations: Argon2Settings::DEFAULT_ITERATIONS,
+                parallelism: Argon2Settings::DEFAULT_PARALLELISM,
+            }
+        );
+    }
+
+    #[test]
+    fn argon2_settings_parse_valid_values() {
+        let settings = Argon2Settings::from_lookup(|name| match name {
+            "ARGON2_MEMORY_KIB" => Some("131072".into()),
+            "ARGON2_ITERATIONS" => Some("4".into()),
+            "ARGON2_PARALLELISM" => Some("2".into()),
+            _ => None,
+        })
+        .expect("valid values parse");
+        assert_eq!(settings.memory_kib, 131_072);
+        assert_eq!(settings.iterations, 4);
+        assert_eq!(settings.parallelism, 2);
+    }
+
+    #[test]
+    fn argon2_settings_reject_malformed_values() {
+        for name in ["ARGON2_MEMORY_KIB", "ARGON2_ITERATIONS", "ARGON2_PARALLELISM"] {
+            let err = Argon2Settings::from_lookup(|var| {
+                (var == name).then(|| "not-a-number".to_string())
+            })
+            .expect_err("malformed value must be rejected");
+            assert!(err.contains(name), "error should name {name}: {err}");
+        }
+    }
+
+    #[test]
+    fn argon2_settings_needs_upgrade_matches_used_params() {
+        let settings = Argon2Settings {
+            memory_kib: 65_536,
+            iterations: 3,
+            parallelism: 1,
+        };
+        assert!(!settings.needs_upgrade("$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$aGFzaA"));
+        assert!(settings.needs_upgrade("$argon2id$v=19$m=4096,t=3,p=1$c2FsdA$aGFzaA"));
     }
 }

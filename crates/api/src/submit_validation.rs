@@ -7,7 +7,9 @@
 //! no I/O — so it can be unit-tested independently of the database or Horizon.
 
 use crate::error::ApiError;
-use stellar_base::xdr::{Asset, MuxedAccount, OperationBody, TransactionEnvelope, XDRDeserialize};
+use stellar_base::xdr::{
+    Asset, MuxedAccount, OperationBody, Preconditions, TransactionEnvelope, XDRDeserialize,
+};
 use stellar_strkey::ed25519::PublicKey as StrkeyPK;
 
 /// Operation types a client-signed submission may contain.
@@ -26,6 +28,8 @@ pub struct PaymentSummary {
     pub amount_stroops: i64,
     pub asset_code: String,
     pub asset_issuer: Option<String>,
+    /// The transaction's timebound upper limit (unix seconds); `None` when it has no expiry.
+    pub max_time: Option<i64>,
 }
 
 /// Parse and validate a client-signed envelope for `wallet_account_g`.
@@ -61,6 +65,7 @@ pub fn validate_signed_xdr(
         ));
     }
 
+    let max_time = tx_max_time(&v1.tx.cond);
     let mut summary: Option<PaymentSummary> = None;
     for op in v1.tx.operations.iter() {
         // Per-operation source overrides could spend from another account Octo has no business
@@ -81,6 +86,7 @@ pub fn validate_signed_xdr(
                         amount_stroops: p.amount,
                         asset_code,
                         asset_issuer,
+                        max_time,
                     });
                 }
             }
@@ -99,6 +105,20 @@ pub fn validate_signed_xdr(
     }
 
     Ok(summary)
+}
+
+/// The transaction's `max_time` in unix seconds; `None` when there is no (or an infinite) bound.
+fn tx_max_time(cond: &Preconditions) -> Option<i64> {
+    let bounds = match cond {
+        Preconditions::None => return None,
+        Preconditions::Time(tb) => Some(tb),
+        Preconditions::V2(v2) => v2.time_bounds.as_ref(),
+    }?;
+    // On the wire 0 means "no upper bound".
+    match bounds.max_time.0 {
+        0 => None,
+        t => i64::try_from(t).ok(),
+    }
 }
 
 /// True when `source` is the same underlying ed25519 account as `account_g` (muxed or not).

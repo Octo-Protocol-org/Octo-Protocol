@@ -13,6 +13,7 @@ octo-store.workspace = true
 octo-wallet-core.workspace = true
 octo-webhooks.workspace = true
 octo-resilience.workspace = true
+octo-metrics.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -29,6 +30,7 @@ dotenvy = "0.15"
 axum.workspace = true
 octo-webhooks.workspace = true
 proptest.workspace = true
+chrono.workspace = true
 sqlx.workspace = true
 # Pinned: newer 0.6.x requires edition2024 (Rust >= 1.85), but rust-toolchain.toml pins 1.84.1,
 # so an unpinned "0.6" resolves to a version this project's own toolchain cannot build.

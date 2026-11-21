@@ -160,6 +160,26 @@ WHERE user_id = :'hot_user'
 ORDER BY created_at DESC
 LIMIT 25;
 
+\echo '=== list_wallets_for_user (issue #479) ==='
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM wallets
+WHERE user_id = :'hot_user'
+  AND (NULL::uuid IS NULL OR (created_at, id) < (
+      SELECT created_at, id FROM wallets WHERE id = NULL::uuid
+  ))
+ORDER BY created_at DESC, id DESC
+LIMIT 25;
+
+\echo '=== list_addresses (issue #479) ==='
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM addresses
+WHERE wallet_id = :'hot_wallet'
+  AND (NULL::uuid IS NULL OR (created_at, id) < (
+      SELECT created_at, id FROM addresses WHERE id = NULL::uuid
+  ))
+ORDER BY created_at DESC, id DESC
+LIMIT 25;
+
 \echo '=== wallets_due_for_poll (ingest supervisor tick) ==='
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT w.* FROM wallets w

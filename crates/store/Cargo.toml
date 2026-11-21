@@ -16,8 +16,12 @@ uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
 dotenvy = "0.15"
 sqlx.workspace = true
+futures = "0.3"

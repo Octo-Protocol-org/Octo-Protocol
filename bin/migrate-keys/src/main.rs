@@ -171,6 +171,11 @@ async fn main() -> Result<()> {
             )
                 .with_context(|| format!("reseal wallet {}", wallet.id))?;
 
+            if cfg.dry_run {
+                total_skipped += 1;
+                tracing::info!(wallet_id = %wallet.id, "dry-run: would migrate wallet");
+                continue;
+            }
             // Atomically swap the DB record. The idempotency guard (expected_old_scheme)
             // means a concurrent run that already migrated this wallet is a safe no-op.
             let updated = store
@@ -197,8 +202,10 @@ async fn main() -> Result<()> {
         // Advance the cursor to the last wallet in this batch (ids are ordered ASC), and persist
         // it only now that every row in the batch is done, so a resume never skips a row.
         after_id = batch.last().map(|w| w.id);
-        if let Some(id) = after_id {
-            write_checkpoint(&cfg.checkpoint_path, &fingerprint, id)?;
+        if !cfg.dry_run {
+            if let Some(id) = after_id {
+                write_checkpoint(&cfg.checkpoint_path, &fingerprint, id)?;
+            }
         }
         batches_completed += 1;
         tracing::info!(
@@ -210,7 +217,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    remove_checkpoint(&cfg.checkpoint_path)?;
+    if !cfg.dry_run {
+        remove_checkpoint(&cfg.checkpoint_path)?;
+    }
     tracing::info!(
         batches_completed,
         total_migrated,
@@ -294,6 +303,7 @@ struct Config {
     new_key: [u8; MASTER_KEY_LEN],
     batch_size: i64,
     checkpoint_path: PathBuf,
+    dry_run: bool,
 }
 
 impl Config {
@@ -326,6 +336,7 @@ impl Config {
         let checkpoint_path = std::env::var("MIGRATE_KEYS_CHECKPOINT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_CHECKPOINT_PATH));
+        let dry_run = std::env::args().any(|arg| arg == "--dry-run");
 
         Ok(Config {
             database_url,
@@ -333,6 +344,7 @@ impl Config {
             new_key,
             batch_size,
             checkpoint_path,
+            dry_run,
         })
     }
 }

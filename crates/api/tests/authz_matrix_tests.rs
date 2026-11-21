@@ -13,6 +13,10 @@
 //! `require_login` + a manual ownership check, not by `authorize_wallet` (it does not accept API
 //! keys at all), so it is out of scope for this matrix.
 //!
+//! Routes that authenticate with `require_login` and then call the shared
+//! `require_wallet_owner` helper (crates/api/src/auth.rs) — the api-key and whitelist routes —
+//! are covered by `require_login_owned_wallet_routes_are_404_for_a_foreign_wallet` below.
+//!
 //! Every `authorize_wallet`-guarded handler calls it *before* parsing the request body, so an
 //! empty body is sufficient to exercise the authorization check on POST/PUT routes too.
 
@@ -143,6 +147,11 @@ fn guarded_routes() -> Vec<GuardedRoute> {
             path: |id| format!("/v1/wallets/{id}"),
         },
         GuardedRoute {
+            name: "PATCH /v1/wallets/:id",
+            method: "PATCH",
+            path: |id| format!("/v1/wallets/{id}"),
+        },
+        GuardedRoute {
             name: "GET /v1/wallets/:id/balances",
             method: "GET",
             path: |id| format!("/v1/wallets/{id}/balances"),
@@ -156,6 +165,11 @@ fn guarded_routes() -> Vec<GuardedRoute> {
             name: "POST /v1/wallets/:id/addresses",
             method: "POST",
             path: |id| format!("/v1/wallets/{id}/addresses"),
+        },
+        GuardedRoute {
+            name: "POST /v1/wallets/:id/addresses/batch",
+            method: "POST",
+            path: |id| format!("/v1/wallets/{id}/addresses/batch"),
         },
         GuardedRoute {
             name: "GET /v1/wallets/:id/addresses",
@@ -287,6 +301,72 @@ async fn api_key_for_wallet_a_is_404_on_every_guarded_route_for_wallet_b() {
             StatusCode::NOT_FOUND,
             "{}: wallet A's API key against B's wallet must be 404, got {}",
             route.name,
+            resp.status()
+        );
+    }
+}
+
+/// Routes that use `require_login` + the shared `require_wallet_owner` helper (rather than
+/// `authorize_wallet`) must still answer 404 — never 401/403 — for a foreign wallet, so the
+/// wallet's existence is not revealed. Covers both the api-key and whitelist route families.
+#[tokio::test]
+async fn require_login_owned_wallet_routes_are_404_for_a_foreign_wallet() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+
+    let token_a = auth_token(&app, &state).await;
+    let wallet_a = create_wallet(&app, &token_a).await;
+
+    let token_b = auth_token(&app, &state).await;
+    let wallet_b = create_wallet(&app, &token_b).await;
+
+    // (name, method, path builder)
+    let routes: Vec<(&str, &str, fn(&str) -> String)> = vec![
+        ("POST /v1/wallets/:id/api-key", "POST", |id| {
+            format!("/v1/wallets/{id}/api-key")
+        }),
+        ("GET /v1/wallets/:id/whitelist", "GET", |id| {
+            format!("/v1/wallets/{id}/whitelist")
+        }),
+        ("POST /v1/wallets/:id/whitelist", "POST", |id| {
+            format!("/v1/wallets/{id}/whitelist")
+        }),
+        (
+            "DELETE /v1/wallets/:id/whitelist/:address",
+            "DELETE",
+            |id| format!("/v1/wallets/{id}/whitelist/GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+        ),
+    ];
+
+    for (name, method, path) in routes {
+        // A's JWT against B's wallet.
+        let uri = path(&wallet_b);
+        let resp = app
+            .clone()
+            .oneshot(req_auth(method, &uri, &token_a))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{name}: user A's JWT against B's wallet must be 404, got {}",
+            resp.status()
+        );
+
+        // Vice versa: B's JWT against A's wallet.
+        let uri = path(&wallet_a);
+        let resp = app
+            .clone()
+            .oneshot(req_auth(method, &uri, &token_b))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{name}: user B's JWT against A's wallet must be 404, got {}",
             resp.status()
         );
     }

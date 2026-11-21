@@ -83,7 +83,7 @@ async fn tick_polls_wallets_concurrently_not_sequentially() {
     let max_seen = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route(
-            "/accounts/:account/payments",
+            "/accounts/:account/operations",
             get(slow_mock_payments_handler),
         )
         .with_state((in_flight.clone(), max_seen.clone()));

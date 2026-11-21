@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly mutation testing (Mondays) and nightly fuzzing; fuzz is also runnable on demand.
+  schedule:
+    - cron: "0 3 * * 1"
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+# Least privilege: no job here writes to the repo, so the token stays read-only.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,16 +41,16 @@ jobs:
       # hermetic; this URL lets the store integration tests run against the Postgres service.
       DATABASE_URL: postgres://octo:octo@localhost:5432/octo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        # Pin the action to its major-version tag and pass the Rust toolchain version
+        # SHA-pinned (see the `pinned-actions` job) and passed the Rust toolchain version
         # explicitly via `with.toolchain`. Decouples action upgrades from toolchain
         # version pinning. The explicit `toolchain: 1.84.1` input matches the project's
         # already-pinned `rust-toolchain.toml`, so rustup derives the per-host triple
         # correctly and `cargo install` no longer resolves against a stale channel name.
         # See Octo-Protocol-org/Octo-Protocol#33.
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.84.1
           components: rustfmt, clippy
@@ -55,7 +64,7 @@ jobs:
         # main-branch cache so the warm cache starts from a known-good baseline rather
         # than a per-PR reproduction.
         # Supersedes part of #34 / #35; closes Octo-Protocol-org/Octo-Protocol#33.
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: false
           shared-cache: true
@@ -73,6 +82,243 @@ jobs:
         # --locked: same rationale as Clippy above — fail loudly on lockfile drift.
         run: cargo test --workspace --locked
 
+      - name: Check env var docs are complete
+        # Fails when a variable read via std::env / dotenvy in the code is missing from the
+        # docs table, or when the docs list a variable the code no longer reads. Keeps the
+        # environment variable reference (docs/environment-variables.md) in sync with main.rs and
+        # .env.example. See Octo-Protocol-org/Octo-Protocol#514.
+        run: scripts/check-env-docs.sh
+
+  # Coverage reporting. Generates an lcov report, uploads it as an artifact, posts a summary
+  # comment on PRs, and enforces a minimum line-coverage floor for the security-critical crates.
+  coverage:
+    name: cargo-llvm-cov (coverage)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: octo
+          POSTGRES_PASSWORD: octo
+          POSTGRES_DB: octo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U octo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://octo:octo@localhost:5432/octo
+      # Minimum line-coverage percentage enforced for each critical crate.
+      MIN_COVERAGE_CRYPTO: "80"
+      MIN_COVERAGE_WALLET_CORE: "80"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: false
+          shared-cache: true
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate lcov report
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+      - name: Enforce coverage floor for critical crates
+        # Parses lcov.info and fails if any critical crate falls below its floor.
+        run: |
+          set -euo pipefail
+          check_floor() {
+            local crate="$1" min="$2"
+            # Sum LF (lines found) and LH (lines hit) for source files under the crate.
+            local lf lh pct
+            read -r lf lh < <(awk -v crate="$crate" '
+              /^SF:/ { in_crate = ($0 ~ ("/" crate "/")) }
+              /^LF:/ && in_crate { lf += substr($0, 4) }
+              /^LH:/ && in_crate { lh += substr($0, 4) }
+              END { printf "%d %d\n", lf, lh }
+            ' lcov.info)
+            if [ "${lf:-0}" -eq 0 ]; then
+              echo "::error::No coverage data found for ${crate}"
+              return 1
+            fi
+            pct=$(awk -v lh="$lh" -v lf="$lf" 'BEGIN { printf "%.2f", (lh / lf) * 100 }')
+            echo "${crate}: ${pct}% (floor ${min}%)"
+            if awk -v pct="$pct" -v min="$min" 'BEGIN { exit !(pct + 0 < min + 0) }'; then
+              echo "::error::${crate} coverage ${pct}% is below the ${min}% floor"
+              return 1
+            fi
+          }
+          status=0
+          check_floor octo-crypto "${MIN_COVERAGE_CRYPTO}" || status=1
+          check_floor octo-wallet-core "${MIN_COVERAGE_WALLET_CORE}" || status=1
+          exit "$status"
+
+      - name: Post coverage summary on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const lcov = fs.readFileSync('lcov.info', 'utf8');
+            const crates = ['octo-crypto', 'octo-wallet-core'];
+            const lines = ['### Coverage summary', '', '| Crate | Lines hit | Lines found | Coverage |', '| --- | --- | --- | --- |'];
+            for (const crate of crates) {
+              let lf = 0, lh = 0, inCrate = false;
+              for (const line of lcov.split('\n')) {
+                if (line.startsWith('SF:')) inCrate = line.includes(`/${crate}/`);
+                else if (inCrate && line.startsWith('LF:')) lf += parseInt(line.slice(3), 10) || 0;
+                else if (inCrate && line.startsWith('LH:')) lh += parseInt(line.slice(3), 10) || 0;
+              }
+              const pct = lf > 0 ? ((lh / lf) * 100).toFixed(2) : 'n/a';
+              lines.push(`| ${crate} | ${lh} | ${lf} | ${pct}% |`);
+            }
+            const body = lines.join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '### Coverage summary';
+            const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+  # Mutation testing for the security-critical crates. Runs on a schedule and on PRs that touch
+  # those crates only; non-blocking (continue-on-error) so unrelated PRs are never gated on it.
+  mutants:
+    name: cargo-mutants (octo-crypto · octo-wallet-core)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1') ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       (contains(github.event.pull_request.changed_files, '') &&
+        (github.event.pull_request.base.repo.full_name != github.repository ||
+         true)))
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect changes to critical crates
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            critical:
+              - 'crates/octo-crypto/**'
+              - 'crates/octo-wallet-core/**'
+
+      - name: Skip when critical crates are untouched
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ steps.changes.outputs.critical }}" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+
+      - name: Cache cargo
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: false
+          shared-cache: true
+
+      - name: Install cargo-mutants
+        if: steps.gate.outputs.run == 'true'
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-mutants
+
+      - name: Run mutation tests
+        if: steps.gate.outputs.run == 'true'
+        # --in-place keeps the workspace layout; mutants writes reports to mutants.out/.
+        run: |
+          cargo mutants --in-place -p octo-crypto -p octo-wallet-core --no-shuffle --timeout 120 || true
+
+      - name: Upload surviving-mutant report
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-report
+          path: mutants.out/
+          if-no-files-found: warn
+
+      - name: Summarize surviving mutants
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ -f mutants.out/missed.txt ]; then
+            echo "### Surviving mutants" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No surviving-mutant report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # MSRV check: builds with the `rust-version` declared in the manifests so a mismatch between
+  # the declared minimum and the code (or the pinned toolchain) fails CI.
+  msrv:
+    name: MSRV (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(awk -F'"' '/^rust-version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::No rust-version declared in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $version"
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: false
+          shared-cache: true
+
+      - name: Check with MSRV
+        # --locked: fail on lockfile drift; the MSRV toolchain must build the pinned lockfile.
+        run: cargo check --workspace --all-targets --locked
+
   # Supply-chain and secret scanning. These ran until 071e4d5 dropped them; restored here because
   # nothing has been checking dependency advisories on a non-custodial codebase that moves funds.
   # Documented exceptions live in deny.toml, .cargo/audit.toml, and .gitleaksignore.
@@ -80,12 +326,12 @@ jobs:
     name: cargo-audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set cache key date
         id: cache-date
         run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       - name: Cache cargo-audit binary and advisory DB
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-audit
@@ -97,7 +343,7 @@ jobs:
       # `cargo install cargo-audit`, which picks up the 1.84.1 pin in rust-toolchain.toml and
       # fails, because a current cargo-audit needs rustc 1.88+. Installing a prebuilt binary
       # sidesteps the toolchain entirely — the scan reads Cargo.lock and compiles nothing.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit
       # Invoked directly rather than as `cargo audit`, so the pinned cargo shim is not involved.
@@ -109,39 +355,93 @@ jobs:
     name: cargo-deny (licenses + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set cache key date
         id: cache-date
         run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       - name: Cache cargo-deny advisory DB
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/advisory-dbs
           key: ${{ runner.os }}-cargo-deny-${{ steps.cache-date.outputs.date }}
           restore-keys: |
             ${{ runner.os }}-cargo-deny-
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   secret-scan:
     name: gitleaks (secret scanning)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: a secret that was committed and later deleted is still a leaked secret.
           fetch-depth: 0
       # The binary rather than gitleaks-action, which requires a paid licence key for
       # organization-owned repositories — the likely reason this job was dropped originally.
       - name: Install gitleaks
+        # Checksum-verified before extraction so a tampered release asset cannot run in CI.
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
+          curl -sSfLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz -C /usr/local/bin gitleaks
         env:
           VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
       - name: Scan history
         # --redact keeps any match out of the public log output.
         run: gitleaks git --redact --no-banner --verbose
+
+  # Guards against careless migrations that lock a hot table or drop data. Only runs when a PR
+  # touches the migrations directory, so unrelated PRs pay nothing. The linter itself lives in
+  # scripts/lint-migrations.sh; destructive statements are allowed only with an explicit
+  # `-- migration-lint: allow <reason>` annotation in the SQL file.
+  migration-lint:
+    name: migration lint (destructive / locking statements)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Need the merge base to diff against, so fetch enough history for the base branch.
+          fetch-depth: 0
+      - name: Detect changed migrations
+        id: changed
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          files=$(git diff --name-only --diff-filter=ACMR "$base"...HEAD -- 'crates/store/migrations/**.sql' || true)
+          if [ -z "$files" ]; then
+            echo "No migration changes; skipping lint."
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed migrations:"
+            echo "$files"
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<EOF"
+              echo "$files"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+      - name: Lint migrations
+        if: steps.changed.outputs.any == 'true'
+        env:
+          CHANGED_MIGRATIONS: ${{ steps.changed.outputs.files }}
+        run: |
+          # Feed the changed files to the linter; it exits non-zero on any unannotated
+          # destructive or locking statement.
+          printf '%s\n' "$CHANGED_MIGRATIONS" | xargs -r scripts/lint-migrations.sh
+
+  # A moving tag (e.g. @v4) can be repointed by whoever controls the action's repo; a full commit
+  # SHA cannot. Dependabot keeps the pins and their version comments current.
+  pinned-actions:
+    name: GitHub Actions pinned to commit SHAs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reject unpinned actions
+        run: scripts/check-pinned-actions.sh
 
   integration-test:
     name: Bruno API integration tests
@@ -172,16 +472,16 @@ jobs:
       JWT_SECRET: supersecretjwtkeyforminimumnsixteenbytes
       BIND_ADDR: 0.0.0.0:8080
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.84.1
       - name: Cache cargo
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: false
           shared-cache: true
@@ -207,3 +507,174 @@ jobs:
           done
           npx -y @usebruno/cli run api-tests --env Local || true
           kill $SERVER_PID 2>/dev/null || true
+
+  # Fuzz XDR and strkey parsing. Runs nightly (and on demand) rather than on every PR: a short
+  # time-boxed run is cheap but not free, and the corpus is kept between runs so coverage grows
+  # over time. Crashes are uploaded as artifacts for triage.
+  fuzz:
+    name: cargo-fuzz (XDR + strkey)
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - sponsor_validation
+          - submit_validation
+          - strkey_decode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          # cargo-fuzz needs a nightly toolchain for -Zsanitizer.
+          toolchain: nightly
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-fuzz
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: false
+          shared-cache: true
+          workspaces: fuzz
+      - name: Cache fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Run ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Build the container image and scan it for HIGH/CRITICAL vulnerabilities. Findings are uploaded
+  # as SARIF so they surface in the PR's code-scanning results. Documented exceptions live in
+  # .trivyignore.
+  docker-trivy:
+    name: docker build + trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build image
+        run: docker build -t octo-protocol:ci .
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: octo-protocol:ci
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+  # Tag-triggered release build. Produces verifiable artifacts: a SHA256SUMS file users can
+  # check with `sha256sum -c`, plus a SLSA build-provenance attestation. Release notes are
+  # extracted from CHANGELOG.md so the published release matches the repo's history.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the GitHub Release and upload assets
+      id-token: write       # OIDC token for the SLSA provenance generator
+      attestations: write   # write build-provenance attestations
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: false
+          shared-cache: true
+      - name: Build release binaries
+        # --locked: fail loudly on lockfile drift rather than silently regenerating it.
+        run: |
+          cargo build --release --locked \
+            -p octo-server \
+            -p octo-migrate-keys \
+            -p backfill-operation-index
+      - name: Stage artifacts and checksums
+        run: |
+          mkdir -p dist
+          for bin in octo-server octo-migrate-keys backfill-operation-index; do
+            cp "target/release/${bin}" "dist/${bin}"
+          done
+          ( cd dist && sha256sum octo-server octo-migrate-keys backfill-operation-index > SHA256SUMS )
+          cat dist/SHA256SUMS
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-binaries
+          path: dist/
+          if-no-files-found: error
+      - name: Generate SLSA build provenance
+        # Reusable workflow that emits a signed provenance attestation for the artifacts above.
+        uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+        with:
+          base64-subjects: ${{ needs.build.outputs.hashes }}
+          upload-assets: false
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # Pull the section for this version: from its heading up to the next version heading.
+          awk -v ver="$version" '
+            $0 ~ "^## \\[?" ver "\\]?" { capture=1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG section found for ${version}; falling back to tag name." >&2
+            echo "Release ${tag}" > release-notes.md
+          fi
+          {
+            echo "body<<EOF"
+            cat release-notes.md
+            echo ""
+            echo "## Verifying artifacts"
+            echo ""
+            echo '```'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo ""
+            echo "Build provenance is attached as a SLSA attestation; verify with"
+            echo "\`gh attestation verify <artifact> --repo \${{ github.repository }}\`."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          body: ${{ steps.notes.outputs.body }}
+          files: |
+            dist/octo-server
+            dist/octo-migrate-keys
+            dist/backfill-operation-index
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

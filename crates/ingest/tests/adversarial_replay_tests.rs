@@ -19,7 +19,7 @@
 //! operation index) at the moment the ledger that contains them closes, and that id, along with
 //! the ledger's contents, never changes afterward.
 //!
-//! Concretely, for `crates/ingest`'s polling loop against Horizon's `/accounts/{id}/payments`:
+//! Concretely, for `crates/ingest`'s polling loop against Horizon's `/accounts/{id}/operations`:
 //! - `transaction_successful` is set once, permanently, when the containing ledger closes.
 //!   Horizon has no mechanism to retroactively flip a previously-`true` record to `false` for the
 //!   same operation id, because that would require rewriting already-closed ledger history, which
@@ -134,6 +134,8 @@ async fn build_pool(store: &Store, wallet_id: Uuid, n: usize) -> Vec<PaymentReco
             asset_issuer: None,
             amount: Some(format!("{}.0000000", i + 1)),
             starting_balance: None,
+            balance_id: None,
+            claimant: None,
             transaction: None,
         });
     }

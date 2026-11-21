@@ -53,6 +53,8 @@ fn make_record(id: &str) -> PaymentRecord {
         asset_issuer: None,
         amount: Some("1.0000000".into()),
         starting_balance: None,
+        balance_id: None,
+        claimant: None,
         transaction: Some(TransactionRecord {
             memo_type: None,
             memo: None,
@@ -73,6 +75,13 @@ struct MockState {
     last_cursor: String,
     /// How many times the payments endpoint was called.
     call_count: Arc<Mutex<usize>>,
+    /// Optional second page served once the cursor reaches `last_cursor`.
+    /// When `Some`, the mock returns these records instead of an empty page.
+    second_page: Option<Vec<PaymentRecord>>,
+    /// When true, the request that would serve `second_page` fails with 503 exactly once.
+    fail_second_page_once: bool,
+    /// Set once the injected 503 has been served, so the retry succeeds.
+    failed_once: Arc<Mutex<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -80,16 +89,35 @@ struct PaymentsQuery {
     cursor: Option<String>,
 }
 
-/// Axum handler for `/accounts/:account/payments?...`
+/// Axum handler for `/accounts/:account/operations?...`
 async fn mock_payments_handler(
     Query(q): Query<PaymentsQuery>,
     State(state): State<MockState>,
 ) -> axum::response::Response<axum::body::Body> {
     *state.call_count.lock().unwrap() += 1;
 
-    // When the cursor has already passed our last record, return an empty page.
+    // When the cursor has already passed our last record, serve the second page (if any)
+    // or an empty page.
     let records = if q.cursor.as_deref() == Some(&state.last_cursor) {
-        vec![]
+        match &state.second_page {
+            Some(page) => {
+                if state.fail_second_page_once {
+                    let mut failed = state.failed_once.lock().unwrap();
+                    if !*failed {
+                        *failed = true;
+                        return axum::response::Response::builder()
+                            .status(503)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({ "error": "service unavailable" }).to_string(),
+                            ))
+                            .unwrap();
+                    }
+                }
+                page.clone()
+            }
+            None => vec![],
+        }
     } else {
         state.records.clone()
     };
@@ -109,7 +137,7 @@ async fn mock_payments_handler(
 async fn start_mock_horizon(state: MockState) -> (String, Arc<Mutex<usize>>) {
     let call_count = state.call_count.clone();
     let app = Router::new()
-        .route("/accounts/:account/payments", get(mock_payments_handler))
+        .route("/accounts/:account/operations", get(mock_payments_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -172,6 +200,9 @@ async fn resumed_poll_after_full_page_processes_nothing_new() {
         records: records.clone(),
         last_cursor: last_cursor.clone(),
         call_count: Arc::new(Mutex::new(0)),
+        second_page: None,
+        fail_second_page_once: false,
+        failed_once: Arc::new(Mutex::new(false)),
     };
     let (horizon_url, call_count) = start_mock_horizon(mock_state).await;
 
@@ -306,5 +337,116 @@ async fn replayed_page_out_of_original_order_still_dedupes_correctly() {
     assert_eq!(
         tx_count_after_second, 5,
         "out-of-order replay must not create any new deposit rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: Horizon outage mid-page — a 503 after page 1 must leave the cursor at
+//         the last successfully processed record, and the next poll_once must
+//         resume from there with no gaps and no duplicates.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn horizon_503_mid_page_resumes_without_gaps_or_duplicates() {
+    let Some(db_url) = database_url() else {
+        eprintln!("SKIPPED: set DATABASE_URL to run cursor-resume tests");
+        return;
+    };
+
+    let run_id = Uuid::new_v4().simple().to_string();
+
+    // Page 1: two records. Page 2: two more records.
+    let page1: Vec<PaymentRecord> = (1..=2)
+        .map(|i| make_record(&format!("op-outage-{run_id}-p1-{i}")))
+        .collect();
+    let page2: Vec<PaymentRecord> = (3..=4)
+        .map(|i| make_record(&format!("op-outage-{run_id}-p2-{i}")))
+        .collect();
+    let page1_last_cursor = page1.last().unwrap().paging_token.clone();
+
+    let mock_state = MockState {
+        records: page1.clone(),
+        last_cursor: page1_last_cursor.clone(),
+        call_count: Arc::new(Mutex::new(0)),
+        second_page: Some(page2.clone()),
+        fail_second_page_once: true,
+        failed_once: Arc::new(Mutex::new(false)),
+    };
+    let (horizon_url, _call_count) = start_mock_horizon(mock_state).await;
+
+    let Some((store, ingestor, wallet_id)) = setup_with_horizon(&db_url, &horizon_url).await else {
+        return;
+    };
+
+    // First poll: page 1 is served, then the follow-up request for page 2 gets a 503.
+    // poll_once must surface the error rather than silently swallowing it.
+    let first = ingestor.poll_once(10).await;
+    assert!(
+        first.is_err(),
+        "poll_once must error when Horizon returns 503 mid-page, got {first:?}"
+    );
+
+    // Page 1's records must already be persisted and the cursor must point at the
+    // last record of page 1, so the retry resumes exactly there.
+    let after_failure = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_failure.len(),
+        page1.len(),
+        "page 1 deposits must be persisted before the failure surfaces"
+    );
+    let cursor_after_failure = store.get_cursor(wallet_id).await.unwrap();
+    assert_eq!(
+        cursor_after_failure.as_deref(),
+        Some(page1_last_cursor.as_str()),
+        "cursor must point at the last successfully processed record of page 1"
+    );
+
+    // Second poll: the mock now serves page 2, so the ingestor resumes from the
+    // page-1 cursor and picks up exactly the remaining records.
+    let n2 = ingestor
+        .poll_once(10)
+        .await
+        .expect("resumed poll_once after 503");
+    assert_eq!(
+        n2,
+        page2.len(),
+        "resumed poll must process exactly the remaining page-2 records"
+    );
+
+    // Union of persisted deposits must equal the expected set across both pages.
+    let txs = store.list_transactions(wallet_id, 100, None).await.unwrap();
+    let expected: Vec<String> = page1
+        .iter()
+        .chain(page2.iter())
+        .map(|r| r.transaction_hash.clone().unwrap())
+        .collect();
+    let mut actual: Vec<String> = txs.iter().map(|t| t.tx_hash.clone()).collect();
+    actual.sort();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    assert_eq!(
+        actual, expected_sorted,
+        "union of deposits must equal the expected set across both pages"
+    );
+    assert_eq!(
+        txs.len(),
+        page1.len() + page2.len(),
+        "no gaps: every record from both pages must be persisted"
+    );
+
+    // No duplicates: (stellar_tx_hash, operation_index) must be unique.
+    let mut keys: Vec<(String, i32)> = txs
+        .iter()
+        .map(|t| (t.tx_hash.clone(), t.operation_index))
+        .collect();
+    let total = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        total,
+        "no duplicates: (stellar_tx_hash, operation_index) must be unique"
     );
 }

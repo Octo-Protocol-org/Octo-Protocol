@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# `fuzz/` is a standalone cargo-fuzz crate (nightly-only, libfuzzer-sys); keep it out of
+# the workspace so `cargo build --workspace` and the MSRV resolver are unaffected.
+exclude = ["fuzz"]
 members = [
     "crates/crypto",
     "crates/wallet-core",
@@ -9,9 +12,14 @@ members = [
     "crates/ingest",
     "crates/api",
     "crates/resilience",
+    "crates/evm-core",
+    "crates/evm-rpc",
+    "crates/metrics",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
+    "bin/seed",
+    "crates/horizon-mock",
 ]
 
 [workspace.package]
@@ -19,7 +27,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.84"
 license = "MIT"
-repository = "https://github.com/octo/octo"
+repository = "https://github.com/Octo-Protocol-org/Octo-Protocol"
 authors = ["octo contributors"]
 
 # Shared, version-pinned dependencies (locked in Step 1 of the plan).
@@ -41,6 +49,17 @@ hex = "0.4.3"
 base64 = "0.22"
 argon2 = "0.5"
 subtle = "2.6"
+
+# --- EVM / secp256k1 ---
+# k256 provides secp256k1 signing/recovery with low-s normalisation (EIP-2).
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "arithmetic"] }
+# sha3 provides keccak-256 for EVM address derivation.
+sha3 = "0.10.8"
+# bip32 provides BIP-32/BIP-44 hierarchical deterministic derivation over secp256k1.
+bip32 = { version = "0.5.2", default-features = false, features = ["secp256k1"] }
+# alloy-primitives supplies U256 and the EIP-55 address type used by the RPC client.
+alloy-primitives = { version = "0.8.25", default-features = false, features = ["serde", "std"] }
+
 # Note: the MSRV-aware resolver (.cargo/config.toml: incompatible-rust-versions = "fallback")
 # keeps the whole tree on Rust-1.84-compatible versions, so no manual transitive pins are needed.
 
@@ -67,6 +86,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # rand::rngs::OsRng is the CSPRNG for seed entropy, nonces and salts — a bump must keep it OS-backed.
 rand = "0.8"
 proptest = "1"
+wiremock = "=0.6.2"
 
 # --- internal crates ---
 octo-crypto = { path = "crates/crypto" }
@@ -77,6 +97,9 @@ octo-email = { path = "crates/email" }
 octo-ingest = { path = "crates/ingest" }
 octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
+octo-evm-core = { path = "crates/evm-core" }
+octo-evm-rpc = { path = "crates/evm-rpc" }
+octo-metrics = { path = "crates/metrics" }
 
 [profile.release]
 lto = "thin"

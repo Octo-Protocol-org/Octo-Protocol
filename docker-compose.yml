@@ -17,14 +17,75 @@ services:
       timeout: 5s
       retries: 5
 
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: octo-server
+    env_file:
+      - .env
+    environment:
+      # Default to the compose Postgres unless overridden in .env.
+      DATABASE_URL: ${DATABASE_URL:-postgres://octo:octo@db:5432/octo}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/octo-server", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Offline Horizon mocking is provided by the `horizon-mock` crate (see the horizon-mock service below).
   # Optional DB UI — `docker compose up adminer` — http://localhost:8081
+  # Tool image pins are bumped by the maintainers on release.
   adminer:
-    image: adminer:latest
+    image: adminer:4.8.1
     container_name: octo-adminer
     ports:
       - "8081:8080"
     depends_on:
       - db
+    profiles: ["tools"]
+
+  # Optional seed runner — `docker compose --profile tools run seed`
+  # Produces demo users, wallets and deposits against the local testnet config.
+  # Refuses to run against mainnet configs (see seed binary).
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: octo-seed
+    command: ["seed"]
+    environment:
+      DATABASE_URL: postgres://octo:octo@db:5432/octo
+      NETWORK: testnet
+      HORIZON_URL: http://horizon-mock:8000
+      APP_ENV: local
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  # Optional offline mock Horizon — `docker compose --profile tools up horizon-mock`
+  # Serves scripted accounts, payments and submit responses for offline development.
+  horizon-mock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: octo-horizon-mock
+    command: ["horizon-mock"]
+    environment:
+      HORIZON_MOCK_ADDR: 0.0.0.0:8000
+      HORIZON_MOCK_FIXTURES: /app/fixtures/horizon
+    ports:
+      - "8000:8000"
     profiles: ["tools"]
 
 volumes:

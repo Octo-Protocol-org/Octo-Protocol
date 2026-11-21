@@ -8,7 +8,8 @@
 //! green). If a URL is found but the DB is unreachable, the test fails loudly with the reason.
 
 use octo_store::{
-    NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
+    IdempotencyClaim, NewAddress, NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet,
+    NewWithdrawal, Store, StoreError, TransactionFilter,
 };
 use std::sync::Once;
 use uuid::Uuid;
@@ -184,6 +185,80 @@ async fn different_op_index_same_tx_is_distinct() {
     );
 }
 
+/// Batch entries with the given references (`None` = no reference).
+fn batch(refs: &[Option<&'static str>]) -> Vec<NewAddress<'static>> {
+    refs.iter()
+        .map(|r| NewAddress {
+            customer_ref: *r,
+            metadata: serde_json::json!({}),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn allocate_addresses_reserves_a_contiguous_block() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let rows = store
+        .allocate_addresses(wallet_id, |id| Ok(format!("M{wid}-{id}")), batch(&[Some("x"), None, Some("y")]))
+        .await
+        .expect("batch");
+    assert_eq!(rows.iter().map(|a| a.muxed_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(store.get_wallet(wallet_id).await.unwrap().next_muxed_id, 4);
+}
+
+#[tokio::test]
+async fn allocate_addresses_is_all_or_nothing() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+    store
+        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-{id}")), Some("taken"), serde_json::json!({}))
+        .await
+        .expect("seed");
+
+    // The last entry collides with an existing reference: nothing from the batch may persist.
+    let err = store
+        .allocate_addresses(wallet_id, |id| Ok(format!("M{wid}-{id}")), batch(&[Some("new-1"), None, Some("taken")]))
+        .await
+        .expect_err("duplicate ref must fail the batch");
+    assert!(matches!(err, StoreError::DuplicateCustomerRef), "got {err:?}");
+    assert_eq!(store.list_addresses(wallet_id, 100, None).await.unwrap().len(), 1);
+    // The counter bump rolled back too.
+    assert_eq!(store.get_wallet(wallet_id).await.unwrap().next_muxed_id, 2);
+}
+
+#[tokio::test]
+async fn concurrent_address_batches_never_collide() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .allocate_addresses(wallet_id, |id| Ok(format!("M{wid}-{id}")), batch(&[None; 25]))
+                    .await
+                    .expect("batch")
+            })
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for t in tasks {
+        let rows = t.await.unwrap();
+        // Each batch holds one contiguous block.
+        let block: Vec<i64> = rows.iter().map(|a| a.muxed_id).collect();
+        assert!(block.windows(2).all(|w| w[1] == w[0] + 1), "non-contiguous block {block:?}");
+        ids.extend(block);
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=200).collect::<Vec<i64>>());
+}
+
 #[tokio::test]
 async fn sum_deposits_for_address_totals_only_that_addresss_confirmed_deposits() {
     let Some(store) = store().await else { return };
@@ -335,6 +410,7 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
             image_url: None,
             redirect_url: None,
             amount_usdc_stroops: None,
+            expires_at: None,
         })
         .await
         .expect("create link");
@@ -472,6 +548,7 @@ async fn payment_link_mismatched_deposit_records_the_transaction_but_does_not_co
             image_url: None,
             redirect_url: None,
             amount_usdc_stroops: Some(10_000_000),
+            expires_at: None,
         })
         .await
         .expect("create link");
@@ -552,6 +629,7 @@ async fn expire_stale_payment_link_payments_only_sweeps_old_pending_rows() {
             image_url: None,
             redirect_url: None,
             amount_usdc_stroops: Some(10_000_000),
+            expires_at: None,
         })
         .await
         .expect("create link");
@@ -808,6 +886,28 @@ async fn duplicate_inner_tx_hash_is_conflict() {
 }
 
 #[tokio::test]
+async fn create_api_key_duplicate_for_wallet_is_conflict() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let scopes = vec!["read".to_string()];
+
+    store
+        .create_api_key(wallet_id, "octo_first", "hash-first", &scopes, None)
+        .await
+        .expect("first api key for a wallet must be created");
+
+    // A wallet may hold only one API key: a second insert must surface as a conflict (409), not a
+    // generic database error (500).
+    let second = store
+        .create_api_key(wallet_id, "octo_second", "hash-second", &scopes, None)
+        .await;
+    assert!(
+        matches!(second, Err(StoreError::Conflict)),
+        "duplicate api key insert must conflict, got: {second:?}"
+    );
+}
+
+#[tokio::test]
 async fn cursor_roundtrip() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
@@ -865,7 +965,7 @@ async fn upsert_gas_sponsorship_config_works() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
     let cfg = store
-        .upsert_gas_sponsorship_config(wallet_id, true, Some(500_000), Some(10_000_000))
+        .upsert_gas_sponsorship_config(wallet_id, true, Some(500_000), Some(10_000_000), None)
         .await
         .expect("upsert");
     assert!(cfg.enabled);
@@ -874,6 +974,32 @@ async fn upsert_gas_sponsorship_config_works() {
         .await
         .expect("sum");
     assert_eq!(spent, 0);
+}
+
+#[tokio::test]
+async fn sponsorship_allowed_operations_persist_until_explicitly_reset() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let payments = vec!["Payment".to_string()];
+
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, true, None, None, Some(Some(&payments[..])))
+        .await
+        .expect("set list");
+    assert_eq!(cfg.allowed_operations.as_deref(), Some(&payments[..]));
+
+    // An update that omits the list must not widen the wallet back to the global set.
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, false, Some(1_000), None, None)
+        .await
+        .expect("unrelated update");
+    assert_eq!(cfg.allowed_operations.as_deref(), Some(&payments[..]));
+
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, true, None, None, Some(None))
+        .await
+        .expect("reset");
+    assert_eq!(cfg.allowed_operations, None);
 }
 
 /// Create a throwaway user with a unique email (so tests don't collide).
@@ -959,9 +1085,11 @@ async fn list_sponsored_transactions_orders_filters_and_paginates_correctly() {
 async fn list_audit_logs_filters_by_category_and_search_correctly() {
     let Some(store) = store().await else { return };
     let user_id = fresh_user(&store).await;
+    let key = octo_store::AuditChainKey::new(zeroize::Zeroizing::new([7u8; 32]));
 
     store
         .record_audit(
+            &key,
             user_id,
             "signed in",
             "authentication",
@@ -972,6 +1100,7 @@ async fn list_audit_logs_filters_by_category_and_search_correctly() {
         .expect("record 1");
     store
         .record_audit(
+            &key,
             user_id,
             "created wallet octo master wallet",
             "wallet",
@@ -981,7 +1110,7 @@ async fn list_audit_logs_filters_by_category_and_search_correctly() {
         .await
         .expect("record 2");
     store
-        .record_audit(user_id, "rotated api key", "credentials", None, None)
+        .record_audit(&key, user_id, "rotated api key", "credentials", None, None)
         .await
         .expect("record 3");
 
@@ -1323,4 +1452,242 @@ async fn migrate_applies_cleanly_from_a_genuinely_empty_database() {
     .await;
 }
 
+}
+
+/// Record a confirmed deposit in `asset_code` for filter tests.
+async fn deposit(store: &Store, wallet_id: Uuid, asset_code: &str) {
+    let tx_hash = Uuid::new_v4().to_string();
+    store
+        .record_deposit(&NewDeposit {
+            wallet_id,
+            address_id: None,
+            asset_code: asset_code.into(),
+            asset_issuer: (asset_code != "native").then(|| "Gissuer".to_string()),
+            amount_stroops: 1_000,
+            source_account: None,
+            destination_account: None,
+            stellar_tx_hash: tx_hash.clone(),
+            operation_index: 0,
+            horizon_op_id: format!("{tx_hash}-0"),
+            ledger: None,
+            memo_id: None,
+        })
+        .await
+        .expect("deposit")
+        .expect("recorded");
+}
+
+#[tokio::test]
+async fn transaction_filters_compose_with_stable_keyset_pages() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    for asset in ["USDC", "native", "USDC", "USDC", "native"] {
+        deposit(&store, wallet_id, asset).await;
+    }
+
+    let usdc = TransactionFilter {
+        asset_code: Some("USDC".into()),
+        status: Some("confirmed".into()),
+        direction: Some("deposit".into()),
+        ..Default::default()
+    };
+    let all = store.list_transactions_page(wallet_id, &usdc, 100, None).await.unwrap();
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().all(|t| t.asset_code == "USDC"));
+
+    // Paging one row at a time under the filter visits the same rows in the same order.
+    let mut paged = Vec::new();
+    let mut before = None;
+    loop {
+        let page = store.list_transactions_page(wallet_id, &usdc, 1, before).await.unwrap();
+        let Some(last) = page.last() else { break };
+        before = Some(last.id);
+        paged.extend(page);
+    }
+    let ids = |v: &[octo_store::Transaction]| v.iter().map(|t| t.id).collect::<Vec<_>>();
+    assert_eq!(ids(&paged), ids(&all));
+
+    // A future window excludes everything; a failed-status filter matches nothing here.
+    let future = TransactionFilter {
+        from: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        ..Default::default()
+    };
+    assert!(store.list_transactions_page(wallet_id, &future, 100, None).await.unwrap().is_empty());
+    let failed = TransactionFilter { status: Some("failed".into()), ..Default::default() };
+    assert!(store.list_transactions_page(wallet_id, &failed, 100, None).await.unwrap().is_empty());
+
+    // A cursor from another wallet must not position this wallet's history.
+    let other = fresh_wallet(&store).await;
+    deposit(&store, other, "USDC").await;
+    let foreign = store
+        .list_transactions_page(other, &TransactionFilter::default(), 1, None)
+        .await
+        .unwrap()[0]
+        .id;
+    assert!(store
+        .list_transactions_page(wallet_id, &TransactionFilter::default(), 100, Some(foreign))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn transaction_history_main_path_uses_an_index_scan() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    // Forbid the seq-scan fallback a tiny test table would otherwise pick, then check a plan exists.
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off").execute(&mut *tx).await.unwrap();
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT * FROM transactions WHERE wallet_id = $1
+           AND created_at >= now() - interval '30 days' AND created_at < now()
+         ORDER BY created_at DESC, id DESC LIMIT 50",
+    )
+    .bind(wallet_id)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    let plan = plan.join("\n");
+    assert!(plan.contains("idx_tx_wallet_created"), "expected index scan, got:\n{plan}");
+    assert!(!plan.contains("Sort"), "keyset order must come from the index:\n{plan}");
+}
+
+#[tokio::test]
+async fn idempotency_key_claims_replays_and_rejects_mismatches() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let scope = "payment_link.create";
+    let key = format!("key-{}", Uuid::new_v4().simple());
+
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-a").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+    // A concurrent retry before completion must not run the create again.
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-a").await.unwrap(),
+        IdempotencyClaim::InProgress
+    );
+
+    let response = serde_json::json!({ "id": "link-1" });
+    store
+        .complete_idempotency_key(wallet_id, scope, &key, 201, &response)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-a").await.unwrap(),
+        IdempotencyClaim::Replay { status_code: 201, response: response.clone() }
+    );
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-b").await.unwrap(),
+        IdempotencyClaim::Mismatch
+    );
+
+    // Keys are namespaced per wallet.
+    let other = fresh_wallet(&store).await;
+    assert_eq!(
+        store.claim_idempotency_key(other, scope, &key, "hash-b").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+
+    // An expired key is reclaimed fresh, even with a different body.
+    sqlx::query("UPDATE idempotency_keys SET expires_at = now() - interval '1 second' WHERE wallet_id = $1 AND key = $2")
+        .bind(wallet_id)
+        .bind(&key)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-b").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+
+    // A failed create releases its claim so the key can be retried.
+    store.release_idempotency_key(wallet_id, scope, &key).await.unwrap();
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-c").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #491 — Concurrent deposit insert dedup across pool connections
+// ---------------------------------------------------------------------------
+
+/// Spin up `concurrency` tasks that all try to insert the **same** `horizon_op_id` at the same
+/// time, each on its own pooled connection.  Exactly one row must land and exactly one webhook
+/// enqueue (i.e. `Ok(Some(_))`) must be returned; every other attempt must be a benign
+/// `Ok(None)` (the unique-index dedup path), never an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_deposit_insert_dedup_across_connections() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let tx_hash = Uuid::new_v4().to_string();
+    let horizon_op_id = format!("{tx_hash}-0");
+
+    let dep = NewDeposit {
+        wallet_id,
+        address_id: None,
+        asset_code: "USDC".into(),
+        asset_issuer: Some("GISSUER".into()),
+        amount_stroops: 10_000_000,
+        source_account: Some("Gsender".into()),
+        destination_account: Some("Gdest".into()),
+        stellar_tx_hash: tx_hash.clone(),
+        operation_index: 0,
+        horizon_op_id: horizon_op_id.clone(),
+        ledger: Some(999),
+        memo_id: None,
+    };
+
+    // Fan out 20 concurrent tasks — enough to stress the unique-index dedup path across the
+    // pool while staying well within a typical test Postgres connection limit.
+    const CONCURRENCY: usize = 20;
+    let mut handles = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let store = store.clone();
+        let dep = dep.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .record_deposit(&dep)
+                .await
+                .expect("record_deposit must never return Err on a dedup race")
+        }));
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
+
+    let inserted: Vec<_> = results.iter().filter(|r| r.is_some()).collect();
+    let deduped: Vec<_> = results.iter().filter(|r| r.is_none()).collect();
+
+    assert_eq!(
+        inserted.len(),
+        1,
+        "exactly one task must win the insert; got {}: {:?}",
+        inserted.len(),
+        inserted
+    );
+    assert_eq!(
+        deduped.len(),
+        CONCURRENCY - 1,
+        "every other task must get the silent dedup (Ok(None)); got {}",
+        deduped.len()
+    );
+
+    // One row in the ledger — no phantom double-credits.
+    let rows = store
+        .list_transactions(wallet_id, 100, None)
+        .await
+        .expect("list transactions");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one transaction row must exist after {} concurrent inserts",
+        CONCURRENCY
+    );
+    assert_eq!(rows[0].horizon_op_id.as_deref(), Some(horizon_op_id.as_str()));
 }

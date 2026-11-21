@@ -29,3 +29,5 @@ tasks/
 
 # Keep reference material out of release artifacts but tracked
 # (reference/ is intentionally NOT ignored)
+
+.claude/settings.local.json

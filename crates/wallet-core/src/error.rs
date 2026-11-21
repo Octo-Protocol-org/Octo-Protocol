@@ -25,6 +25,11 @@ pub enum WalletError {
     #[error("invalid seed length")]
     InvalidSeedLength,
 
+    /// A syntactically valid seed does not meet a future entropy-strength policy. Unlike
+    /// `InvalidMnemonic` and `InvalidChecksum`, this represents valid input that is too weak.
+    #[error("entropy strength is insufficient")]
+    WeakSeed,
+
     /// A derivation path component or index was invalid.
     #[error("invalid derivation path")]
     InvalidDerivationPath,
@@ -53,6 +58,10 @@ pub enum WalletError {
     /// A requested amount was out of range (must be a positive number of stroops).
     #[error("invalid amount")]
     InvalidAmount,
+
+    /// A memo value was invalid (text too long, hash wrong size, etc.).
+    #[error("invalid memo")]
+    InvalidMemo,
 
     /// Building or signing the transaction failed.
     #[error("transaction signing failed")]
@@ -93,6 +102,11 @@ mod tests {
     const ALL_VARIANTS: &[(WalletError, &str)] = &[
         (WalletError::InvalidMnemonic, "invalid mnemonic phrase"),
         (WalletError::InvalidChecksum, "invalid mnemonic checksum"),
+        (WalletError::InvalidSeedLength, "invalid seed length"),
+        (
+            WalletError::WeakSeed,
+            "entropy strength is insufficient",
+        ),
         (WalletError::InvalidDerivationPath, "invalid derivation path"),
         (WalletError::KeyDerivation, "key derivation failed"),
         (
@@ -106,6 +120,7 @@ mod tests {
             "native asset codes cannot be used as credit asset codes",
         ),
         (WalletError::InvalidAmount, "invalid amount"),
+        (WalletError::InvalidMemo, "invalid memo"),
         (WalletError::Signing, "transaction signing failed"),
         (WalletError::SeedDecryption, "seed decryption failed"),
         (WalletError::InvalidXdr, "invalid transaction XDR"),
@@ -129,7 +144,7 @@ mod tests {
     #[test]
     fn every_walleterror_variant_has_an_explicit_display_message_containing_no_secret_material() {
         // Guard against a variant being added without an entry in `ALL_VARIANTS`.
-        assert_eq!(ALL_VARIANTS.len(), 14, "update ALL_VARIANTS for new variants");
+        assert_eq!(ALL_VARIANTS.len(), 17, "update ALL_VARIANTS for new variants");
 
         for (error, expected) in ALL_VARIANTS {
             let display = error.to_string();
@@ -156,6 +171,7 @@ mod tests {
         let errors = [
             WalletError::InvalidMnemonic,
             WalletError::InvalidSeedLength,
+            WalletError::WeakSeed,
             WalletError::InvalidDerivationPath,
             WalletError::KeyDerivation,
             WalletError::MnemonicAccountMismatch,

@@ -15,6 +15,7 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 use stellar_base::crypto::DalekKeyPair;
 use stellar_base::operations::Operation;
+use stellar_base::time_bounds::TimeBounds;
 use stellar_base::transaction::{Transaction, MIN_BASE_FEE};
 use stellar_base::xdr::XDRSerialize;
 use tokio::sync::Mutex;
@@ -951,5 +952,45 @@ async fn payment_link_signing_info_returns_the_requested_payer_account_sequence(
         submitted_ok,
         "a payment built from signing-info's returned sequence must be accepted by Horizon \
          (not tx_bad_seq): {submit:?}"
+    );
+}
+
+#[tokio::test]
+async fn horizon_rejects_a_signed_transaction_after_its_max_time() {
+    let Some(state) = live_state().await else {
+        eprintln!("SKIPPED: set OCTO_LIVE_TESTS=1 and DATABASE_URL to run live testnet tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let (_wallet_id, source_g, keypair, _token) = create_funded_wallet(&app, &state).await;
+    let sequence = sequence_with_retry("https://horizon-testnet.stellar.org", &source_g).await;
+    let destination = stellar_base::crypto::PublicKey::from_account_id(&source_g).unwrap();
+    let payment = Operation::new_payment()
+        .with_destination(destination)
+        .with_amount(stellar_base::amount::Stroops::new(100))
+        .unwrap()
+        .with_asset(stellar_base::asset::Asset::new_native())
+        .build()
+        .unwrap();
+    let expired_max_time = chrono::Utc::now() - chrono::Duration::seconds(60);
+    let bounds = TimeBounds::always_valid()
+        .with_upper(expired_max_time)
+        .expect("valid historical max_time");
+    let mut tx = Transaction::builder(keypair.public_key(), sequence + 1, MIN_BASE_FEE)
+        .with_time_bounds(bounds)
+        .add_operation(payment)
+        .into_transaction()
+        .unwrap();
+    tx.sign(
+        keypair.as_ref(),
+        &stellar_base::network::Network::new_test(),
+    )
+    .unwrap();
+    let envelope_xdr = tx.into_envelope().xdr_base64().unwrap();
+
+    let result = state.horizon().submit_transaction(&envelope_xdr).await;
+    assert!(
+        matches!(result, Err(octo_api::ApiError::BadRequest(_))),
+        "Horizon must reject the signed expired envelope, got {result:?}"
     );
 }

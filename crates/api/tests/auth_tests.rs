@@ -665,3 +665,258 @@ async fn denylisted_token_is_rejected_even_though_its_signature_and_expiry_are_s
         "deny-listed token must be rejected regardless of signature/expiry validity"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Full lifecycle test (#492)
+// ---------------------------------------------------------------------------
+
+/// Complete authentication lifecycle: signup → verify → login → refresh → logout.
+/// This test walks through the entire flow as a single integration test against a real database,
+/// verifying that each step produces the correct state and tokens work as expected.
+#[tokio::test]
+async fn full_auth_lifecycle_signup_verify_login_refresh_logout() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let email = unique_email();
+    let password = "secure_password_123";
+
+    // Step 1: Signup — returns 201 and requires email verification
+    let signup_resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/signup",
+            &format!(r#"{{"email":"{}","password":"{}"}}"#, email, password),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        signup_resp.status(),
+        StatusCode::CREATED,
+        "signup should return 201"
+    );
+    let signup_json = body_json(signup_resp).await;
+    assert_eq!(
+        signup_json["data"]["email_verification_required"], true,
+        "email verification should be required"
+    );
+    let user_id = signup_json["data"]["user_id"]
+        .as_str()
+        .expect("signup must return user_id")
+        .to_string();
+
+    // Step 2: Verify email with captured OTP → returns token
+    let otp = state
+        .email()
+        .last_otp_for(&email)
+        .expect("OTP must be captured");
+    let verify_resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/verify-email",
+            &format!(r#"{{"user_id":"{}","code":"{}"}}"#, user_id, otp),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        verify_resp.status(),
+        StatusCode::OK,
+        "email verification should succeed"
+    );
+    let verify_json = body_json(verify_resp).await;
+    let initial_token = verify_json["data"]["token"]
+        .as_str()
+        .expect("verify should return token")
+        .to_string();
+    assert_eq!(
+        verify_json["data"]["user"]["email"], email,
+        "verify response should include user email"
+    );
+    assert!(!initial_token.is_empty(), "token should not be empty");
+
+    // Step 3: Use token with /me to confirm it works
+    let me_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {}", initial_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me_resp.status(), StatusCode::OK, "/me should succeed");
+    let me_json = body_json(me_resp).await;
+    assert_eq!(
+        me_json["data"]["email"], email,
+        "/me should return correct email"
+    );
+    assert_eq!(
+        me_json["data"]["id"], user_id,
+        "/me should return correct user_id"
+    );
+
+    // Step 4: Login with correct password → returns new token
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // Ensure exp differs
+    let login_resp = app
+        .clone()
+        .oneshot(post_json(
+            "/v1/auth/login",
+            &format!(r#"{{"email":"{}","password":"{}"}}"#, email, password),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), StatusCode::OK, "login should succeed");
+    let login_json = body_json(login_resp).await;
+    let login_token = login_json["data"]["token"]
+        .as_str()
+        .expect("login must return token")
+        .to_string();
+    assert!(!login_token.is_empty(), "login token should not be empty");
+    assert_ne!(
+        login_token, initial_token,
+        "login should issue a different token"
+    );
+
+    // Verify login token works with /me
+    let me2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {}", login_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me2_resp.status(), StatusCode::OK, "/me with login token works");
+
+    // Step 5: Refresh token → returns new token with extended expiry
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let refresh_resp = app
+        .clone()
+        .oneshot(post_refresh(Some(&login_token)))
+        .await
+        .unwrap();
+    assert_eq!(
+        refresh_resp.status(),
+        StatusCode::OK,
+        "refresh should succeed"
+    );
+    let refresh_json = body_json(refresh_resp).await;
+    let refreshed_token = refresh_json["data"]["token"]
+        .as_str()
+        .expect("refresh must return token")
+        .to_string();
+    assert!(!refreshed_token.is_empty(), "refreshed token should not be empty");
+    assert_ne!(
+        refreshed_token, login_token,
+        "refresh should issue a new token"
+    );
+
+    // Verify refreshed token has later expiry
+    let login_claims = jwt_claims(&login_token);
+    let refreshed_claims = jwt_claims(&refreshed_token);
+    assert_eq!(
+        refreshed_claims["sub"], login_claims["sub"],
+        "refreshed token should have same subject"
+    );
+    assert!(
+        refreshed_claims["exp"].as_i64().unwrap() > login_claims["exp"].as_i64().unwrap(),
+        "refreshed token should have later expiry"
+    );
+
+    // Verify refreshed token works with /me
+    let me3_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {}", refreshed_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        me3_resp.status(),
+        StatusCode::OK,
+        "/me with refreshed token works"
+    );
+
+    // Step 6: Logout with refreshed token → invalidates it
+    let logout_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/logout")
+                .header("authorization", format!("Bearer {}", refreshed_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        logout_resp.status(),
+        StatusCode::OK,
+        "logout should succeed"
+    );
+
+    // Step 7: Verify logged-out token is rejected
+    let me4_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {}", refreshed_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        me4_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "logged-out token must be rejected"
+    );
+
+    // Step 8: Verify old tokens (initial_token, login_token) still work
+    // (logout only invalidates the specific token used, not all tokens for the user)
+    let me5_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {}", login_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        me5_resp.status(),
+        StatusCode::OK,
+        "other tokens should still work after logout"
+    );
+
+    let me6_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/me")
+                .header("authorization", format!("Bearer {}", initial_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        me6_resp.status(),
+        StatusCode::OK,
+        "initial token should still work after logout of different token"
+    );
+}

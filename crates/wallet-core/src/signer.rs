@@ -17,6 +17,7 @@ use stellar_base::crypto::DalekKeyPair;
 use stellar_base::network::Network;
 // sign_fee_bump (production, not test-gated) rejects sub-minimum fees against this constant.
 use stellar_base::transaction::MIN_BASE_FEE;
+use zeroize::Zeroizing;
 
 // validate_change_trust (production) checks the issuer strkey.
 use crate::address::is_valid_account;
@@ -33,6 +34,8 @@ use stellar_base::crypto::{MuxedEd25519PublicKey, PublicKey};
 use stellar_base::memo::Memo;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::operations::Operation;
+#[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::time_bounds::TimeBounds;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::transaction::Transaction;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -107,6 +110,18 @@ impl StellarNetwork {
     }
 }
 
+/// Typed memo for a payment.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone)]
+pub enum MemoType<'a> {
+    /// `MEMO_TEXT`: up to 28 bytes of UTF-8 text.
+    Text(&'a str),
+    /// `MEMO_ID`: nonnegative 64-bit integer.
+    Id(u64),
+    /// `MEMO_HASH`: 32-byte hash.
+    Hash([u8; 32]),
+}
+
 /// A single payment to build and sign from the master account.
 ///
 /// **Test fixture only** since the non-custodial cutover: production code has no server-held
@@ -120,7 +135,10 @@ pub struct PaymentRequest<'a> {
     pub stroops: i64,
     /// `None` => native XLM. `Some((code, issuer_g))` => a credit asset.
     pub asset: Option<(&'a str, &'a str)>,
+    /// Optional typed memo (TEXT, ID, or HASH).
+    pub memo: Option<MemoType<'a>>,
     /// Optional nonnegative Stellar `MEMO_ID`; the `u64` type matches XDR and excludes negatives.
+    /// **Deprecated**: use `memo: Some(MemoType::Id(id))` instead. Kept for backwards compatibility.
     pub memo_id: Option<u64>,
     /// The master account's current sequence number (fetched from Horizon by the caller).
     pub sequence: i64,
@@ -137,15 +155,24 @@ pub struct SignedPayment {
 
 /// Open a sealed seed for `network`, derive Stellar account `account_index`, and return its
 /// `DalekKeyPair`. The decrypted seed is zeroized as it leaves scope.
+fn derived_secret_from_sealed(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    network: StellarNetwork,
+    account_index: u32,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
+    let seed = WalletSeed::from_bytes(seed_bytes.to_vec())?;
+    seed.derive_ed25519_secret(account_index)
+}
+
 fn keypair_from_sealed(
     master_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
     network: StellarNetwork,
     account_index: u32,
 ) -> Result<DalekKeyPair, WalletError> {
-    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
-    let seed = WalletSeed::from_bytes(seed_bytes.to_vec())?;
-    let secret = seed.derive_ed25519_secret(account_index)?;
+    let secret = derived_secret_from_sealed(master_key, sealed, network, account_index)?;
     // stellar-base builds the ed25519 keypair from the 32-byte secret seed.
     DalekKeyPair::from_seed_bytes(secret.as_ref()).map_err(|_| WalletError::KeyDerivation)
 }
@@ -210,10 +237,30 @@ pub fn sign_payment(
         .build()
         .map_err(|_| WalletError::Signing)?;
 
-    let mut builder = Transaction::builder(source, req.sequence, MIN_BASE_FEE);
-    if let Some(id) = req.memo_id {
+    let mut builder = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
+        .with_time_bounds(configured_time_bounds());
+    
+    // Apply memo: prefer the new `memo` field, fall back to deprecated `memo_id` for compatibility.
+    if let Some(memo_type) = &req.memo {
+        match memo_type {
+            MemoType::Text(text) => {
+                if text.len() > 28 {
+                    return Err(WalletError::InvalidMemo);
+                }
+                builder = builder.with_memo(Memo::new_text(text).map_err(|_| WalletError::InvalidMemo)?);
+            }
+            MemoType::Id(id) => {
+                builder = builder.with_memo(Memo::new_id(*id));
+            }
+            MemoType::Hash(hash) => {
+                builder = builder.with_memo(Memo::new_hash(*hash).map_err(|_| WalletError::InvalidMemo)?);
+            }
+        }
+    } else if let Some(id) = req.memo_id {
+        // Backwards compatibility path
         builder = builder.with_memo(Memo::new_id(id));
     }
+    
     let mut tx = builder
         .add_operation(payment)
         .into_transaction()
@@ -311,6 +358,7 @@ pub fn sign_change_trust(
         .map_err(|_| WalletError::Signing)?;
 
     let mut tx = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
+        .with_time_bounds(configured_time_bounds())
         .add_operation(change_trust)
         .into_transaction()
         .map_err(|_| WalletError::Signing)?;
@@ -379,9 +427,7 @@ pub fn sign_fee_bump(
     let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
-    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
-    let seed = WalletSeed::from_bytes(seed_bytes.to_vec())?;
-    let secret = seed.derive_ed25519_secret(account_index)?;
+    let secret = derived_secret_from_sealed(master_key, sealed, network, account_index)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
 
     let pk_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
@@ -533,6 +579,18 @@ fn parse_destination(dest: &str) -> Result<stellar_base::crypto::MuxedAccount, W
     Ok(pk.into())
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+fn configured_time_bounds() -> TimeBounds {
+    const DEFAULT_WINDOW_SECONDS: i64 = 300;
+    const MAX_WINDOW_SECONDS: i64 = 86_400;
+    let seconds = std::env::var("STELLAR_TX_MAX_AGE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|seconds| (1..=MAX_WINDOW_SECONDS).contains(seconds))
+        .unwrap_or(DEFAULT_WINDOW_SECONDS);
+    TimeBounds::valid_for(chrono::Duration::seconds(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +667,12 @@ mod tests {
         match env {
             stellar_base::xdr::TransactionEnvelope::Tx(e) => {
                 assert_eq!(e.signatures.len(), 1, "must be signed once");
+                match &e.tx.cond {
+                    stellar_base::xdr::Preconditions::Time(bounds) => {
+                        assert!(bounds.max_time.0 > 0, "payment envelope must expire");
+                    }
+                    _ => panic!("payment envelope must have time bounds"),
+                }
             }
             _ => panic!("unexpected envelope variant"),
         }
@@ -630,6 +694,12 @@ mod tests {
         match env {
             stellar_base::xdr::TransactionEnvelope::Tx(e) => {
                 assert_eq!(e.signatures.len(), 1, "must be signed once");
+                match &e.tx.cond {
+                    stellar_base::xdr::Preconditions::Time(bounds) => {
+                        assert!(bounds.max_time.0 > 0, "trustline envelope must expire");
+                    }
+                    _ => panic!("trustline envelope must have time bounds"),
+                }
                 // A `None` limit must serialize as i64::MAX (unlimited), NOT 0 —
                 // 0 means "remove trustline" and yields op_invalid_limit on-chain.
                 match &e.tx.operations[0].body {
@@ -738,6 +808,45 @@ mod tests {
         };
         assert!(matches!(
             sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+            Err(WalletError::SeedDecryption)
+        ));
+    }
+
+    #[test]
+    fn every_sealed_seed_operation_rejects_cross_network_use() {
+        let (master_key, sealed) = sealed_vector_seed(StellarNetwork::Public);
+
+        assert!(matches!(
+            account_id_from_sealed(&master_key, &sealed, StellarNetwork::Testnet, 0),
+            Err(WalletError::SeedDecryption)
+        ));
+
+        let payment = PaymentRequest {
+            destination: DEST,
+            stroops: 1,
+            asset: None,
+            memo_id: None,
+            sequence: 1,
+        };
+        assert!(matches!(
+            sign_payment(&master_key, &sealed, StellarNetwork::Testnet, 0, &payment),
+            Err(WalletError::SeedDecryption)
+        ));
+
+        let trustline = ChangeTrustRequest {
+            asset_code: "USDC",
+            asset_issuer: DEST,
+            limit_stroops: None,
+            sequence: 1,
+        };
+        assert!(matches!(
+            sign_change_trust(
+                &master_key,
+                &sealed,
+                StellarNetwork::Testnet,
+                0,
+                &trustline,
+            ),
             Err(WalletError::SeedDecryption)
         ));
     }
@@ -1473,3 +1582,188 @@ mod tests {
         assert!(matches!(res, Err(WalletError::InvalidDerivationPath)));
     }
 }
+
+    // ── Memo type tests (issue #474) ──────────────────────────────────────────
+
+    #[test]
+    fn sign_payment_memo_text() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Text("exchange deposit")),
+                memo_id: None,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                assert!(matches!(
+                    e.tx.memo,
+                    stellar_base::xdr::Memo::Text(_)
+                ));
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_text_rejects_over_28_bytes() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let long_text = "this is way too long for stellar memo";
+        assert!(long_text.len() > 28);
+        
+        let result = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Text(long_text)),
+                memo_id: None,
+                sequence: 1,
+            },
+        );
+        assert!(matches!(result, Err(WalletError::InvalidMemo)));
+    }
+
+    #[test]
+    fn sign_payment_memo_hash() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let hash = [0xab; 32];
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Hash(hash)),
+                memo_id: None,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match e.tx.memo {
+                    stellar_base::xdr::Memo::Hash(h) => assert_eq!(h.0, hash),
+                    _ => panic!("expected MEMO_HASH"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_id_via_new_api() {
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Id(12345)),
+                memo_id: None,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match e.tx.memo {
+                    stellar_base::xdr::Memo::Id(id) => assert_eq!(id, 12345),
+                    _ => panic!("expected MEMO_ID"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_id_deprecated_field_still_works() {
+        // Backwards compatibility: the old memo_id field should still work
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: None,
+                memo_id: Some(67890),
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                match e.tx.memo {
+                    stellar_base::xdr::Memo::Id(id) => assert_eq!(id, 67890),
+                    _ => panic!("expected MEMO_ID"),
+                }
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }
+
+    #[test]
+    fn sign_payment_memo_field_takes_precedence_over_memo_id() {
+        // When both are provided, the new memo field wins
+        let (mk, sealed) = sealed_vector_seed(StellarNetwork::Testnet);
+        let signed = sign_payment(
+            &mk,
+            &sealed,
+            StellarNetwork::Testnet,
+            0,
+            &PaymentRequest {
+                destination: DEST,
+                stroops: 100,
+                asset: None,
+                memo: Some(MemoType::Text("priority")),
+                memo_id: Some(99999), // This should be ignored
+                sequence: 1,
+            },
+        )
+        .unwrap();
+
+        let envelope =
+            stellar_base::xdr::TransactionEnvelope::from_xdr_base64(&signed.envelope_xdr).unwrap();
+        match envelope {
+            stellar_base::xdr::TransactionEnvelope::Tx(e) => {
+                assert!(matches!(e.tx.memo, stellar_base::xdr::Memo::Text(_)));
+            }
+            _ => panic!("unexpected envelope variant"),
+        }
+    }

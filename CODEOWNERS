@@ -1,7 +1,22 @@
 # Default owners for everything in the repo.
-* @blockme/maintainers
+* @Octo-Protocol-org/maintainers
 
 # The signing / key-management core requires extra scrutiny.
-/crates/wallet-core/ @blockme/security
-/crates/crypto/      @blockme/security
-/SECURITY.md         @blockme/security
+/crates/wallet-core/ @Octo-Protocol-org/security
+/crates/crypto/      @Octo-Protocol-org/security
+/SECURITY.md         @Octo-Protocol-org/security
+
+# Dependency manifests: every Dependabot cargo PR (crypto-crate bumps included) lands here.
+# Later rules override `*`, so maintainers are listed explicitly alongside security.
+/Cargo.toml                   @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/Cargo.lock                   @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/crates/crypto/Cargo.toml     @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/crates/wallet-core/Cargo.toml @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+
+# Supply-chain controls: workflows, Dependabot policy, and scanner exception lists.
+/.github/           @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/deny.toml          @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/.cargo/audit.toml  @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/.gitleaksignore    @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/scripts/check-pinned-actions.sh @Octo-Protocol-org/maintainers @Octo-Protocol-org/security
+/CODEOWNERS         @Octo-Protocol-org/maintainers @Octo-Protocol-org/security

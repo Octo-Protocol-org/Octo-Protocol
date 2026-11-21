@@ -38,6 +38,11 @@ pub struct Wallet {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
+    /// Opted into Horizon SSE ingest (migration 0032); polling still covers it when the stream is down.
+    pub ingest_streaming: bool,
+    /// When true the ingest supervisor skips this wallet; its cursor is left untouched.
+    pub ingest_paused: bool,
+    pub ingest_paused_at: Option<DateTime<Utc>>,
 }
 
 impl Wallet {
@@ -87,6 +92,25 @@ pub struct Transaction {
     pub created_at: DateTime<Utc>,
 }
 
+/// Optional filters for listing/exporting a wallet's transactions. `None` means "any".
+///
+/// Callers validate values before building this; the store only binds them as parameters.
+#[derive(Debug, Clone, Default)]
+pub struct TransactionFilter {
+    /// `deposit` | `withdrawal`.
+    pub direction: Option<String>,
+    /// `pending` | `confirmed` | `failed`.
+    pub status: Option<String>,
+    /// `native` for XLM, otherwise a credit asset code.
+    pub asset_code: Option<String>,
+    /// Restricts a credit asset to one issuer; ignored when `asset_code` is `native`.
+    pub asset_issuer: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `created_at`.
+    pub to: Option<DateTime<Utc>>,
+}
+
 /// A withdrawal (payout) intent.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Withdrawal {
@@ -121,8 +145,8 @@ pub struct User {
     pub session_epoch: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Bumped on password change; JWTs carrying an older epoch are rejected.
-    pub session_epoch: i32,
+    /// Set when the account was deleted; the row is then a scrubbed tombstone (migration 0032).
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// A registered webhook endpoint.
@@ -135,6 +159,10 @@ pub struct WebhookEndpoint {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Dead deliveries in a row; any successful delivery resets it to 0.
+    pub consecutive_dead_deliveries: i32,
+    /// Set when the endpoint was deactivated for hitting the dead-delivery threshold.
+    pub auto_disabled_at: Option<DateTime<Utc>>,
 }
 
 /// A single webhook delivery attempt (append-only log).
@@ -172,6 +200,19 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
+/// A dashboard login session (migration 0027). The JWT's `sid` claim names one of these.
+#[derive(Debug, Clone, FromRow)]
+pub struct Session {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    /// SHA-256 hex of the User-Agent header at sign-in; never the raw header.
+    pub user_agent_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 /// A per-wallet API key (only the hash + display prefix are stored).
 #[derive(Debug, Clone, FromRow)]
 pub struct ApiKey {
@@ -180,6 +221,9 @@ pub struct ApiKey {
     pub prefix: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// A sponsored (fee-bump) transaction record.
@@ -232,6 +276,8 @@ pub struct GasSponsorshipConfig {
     pub daily_budget_stroops: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Operation types this wallet may sponsor; `None` = the global allowlist. Can only narrow it.
+    pub allowed_operations: Option<Vec<String>>,
 }
 
 /// The withdrawal-allowlist config for a wallet (one row per wallet).
@@ -290,6 +336,30 @@ pub struct PaymentLink {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Optional merchant deadline; at or past it the link is not payable (#454).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Set once when the merchant cancels; a cancelled link is permanently closed (#454).
+    pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+impl PaymentLink {
+    /// True once the link is cancelled or past its deadline at `now` — it can never be paid again.
+    pub fn is_closed_at(&self, now: DateTime<Utc>) -> bool {
+        self.cancelled_at.is_some() || self.expires_at.is_some_and(|e| now >= e)
+    }
+
+    /// Lifecycle state at `now`: `cancelled` and `expired` (terminal) win over the `active` toggle.
+    pub fn status_at(&self, now: DateTime<Utc>) -> &'static str {
+        if self.cancelled_at.is_some() {
+            "cancelled"
+        } else if self.expires_at.is_some_and(|e| now >= e) {
+            "expired"
+        } else if self.active {
+            "active"
+        } else {
+            "inactive"
+        }
+    }
 }
 
 /// Input to create a new payment link.
@@ -303,6 +373,15 @@ pub struct NewPaymentLink<'a> {
     pub image_url: Option<&'a str>,
     pub redirect_url: Option<&'a str>,
     pub amount_usdc_stroops: Option<i64>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Owner edits to a payment link. Outer `None` leaves a field unchanged; `Some(None)` clears it.
+#[derive(Debug, Clone, Default)]
+pub struct PaymentLinkUpdate<'a> {
+    pub description: Option<Option<&'a str>>,
+    pub redirect_url: Option<Option<&'a str>>,
+    pub amount_usdc_stroops: Option<Option<i64>>,
 }
 
 /// One payment attempt against a payment link.
@@ -319,6 +398,22 @@ pub struct PaymentLinkPayment {
     pub amount_usdc_stroops: i64,
     pub status: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// Result of claiming an idempotency key before running a create (#453).
+#[derive(Debug, Clone, PartialEq)]
+pub enum IdempotencyClaim {
+    /// First use (or the previous use expired): the caller runs the operation, then completes.
+    Claimed,
+    /// A finished request with the same body: replay this response instead of re-running.
+    Replay {
+        status_code: u16,
+        response: serde_json::Value,
+    },
+    /// The key was already used with a different request body.
+    Mismatch,
+    /// The first request with this key has not finished yet.
+    InProgress,
 }
 
 /// A one-time email code, for signup verification or withdrawal confirmation.

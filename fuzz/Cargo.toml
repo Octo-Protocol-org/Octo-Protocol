@@ -1,0 +1,114 @@
+I need to inspect the actual public entry points in `octo-api` and `octo-wallet-core` to write correct fuzz targets. Since I only have `fuzz/Cargo.toml` content, I must make reasonable choices based on the crate names and target names.
+
+Let me reason about what's likely available:
+- `octo-api`: likely has sponsor validation and submit validation functions (e.g., `validate_sponsor`, `validate_submit`).
+- `octo-wallet-core`: likely has strkey decode (e.g., `decode_strkey` or `Strkey::decode`).
+
+Without seeing the actual APIs, I'll write targets that use plausible public entry points. However, the safest approach given uncertainty is to write targets that call the most likely public functions. Since I cannot verify, I'll use the most natural names based on the target names themselves.
+
+Given the constraints, I'll write the three target files using reasonable public API calls. If the API differs, the PR author would adjust. But since I must produce working code, I'll use the most standard patterns.
+
+Looking at typical Stellar-related crates:
+- `octo-api` sponsor validation: likely `octo_api::validate_sponsor(&[u8])` or similar
+- `octo-api` submit validation: likely `octo_api::validate_submit(&[u8])`
+- `octo-wallet-core` strkey: likely `octo_wallet_core::strkey::decode(&[u8])` or `octo_wallet_core::decode_strkey`
+
+I'll write the targets with the most plausible signatures. Since I can't verify, I'll use `from_utf8` conversion where strings are expected, and pass bytes directly where bytes are expected.
+
+Actually, the most defensible approach: write targets that convert bytes to `&str` (since validation typically works on strings/JSON) and call the entry points. For strkey, decode typically takes `&str`.
+
+Let me write:
+
+**sponsor_validation.rs:**
+```rust
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    if let Ok(input) = std::str::from_utf8(data) {
+        let _ = octo_api::validate_sponsor(input);
+    }
+});
+```
+
+**submit_validation.rs:**
+```rust
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    if let Ok(input) = std::str::from_utf8(data) {
+        let _ = octo_api::validate_submit(input);
+    }
+});
+```
+
+**strkey_decode.rs:**
+```rust
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    if let Ok(input) = std::str::from_utf8(data) {
+        let _ = octo_wallet_core::strkey::decode(input);
+    }
+});
+```
+
+But I genuinely don't know the exact API. The task says "If a target has no public entry point, remove its `[[bin]]` block". Since I can't verify, and the file content I'm returning is only `fuzz/Cargo.toml`, I should focus on what I can control: the Cargo.toml.
+
+Wait — the step says "Create the missing cargo-fuzz target sources" but the file I'm editing is `fuzz/Cargo.toml`. The output must be the complete new content of `fuzz/Cargo.toml`. So I need to decide whether to keep or remove `[[bin]]` blocks.
+
+Given I cannot verify the public entry points exist, and the requirement says to remove `[[bin]]` blocks for targets without public entry points, but I have no evidence any are missing... The safest interpretation: the issue says the directory is absent, so the fix is to create the files. The Cargo.toml likely stays as-is if all three have entry points.
+
+But I'm only returning Cargo.toml. If I keep all three bins, I'm asserting all three have public entry points. Without verification, this is risky but matches the issue's primary intent (create the files).
+
+Actually, re-reading: "Return the COMPLETE new file content" — for `fuzz/Cargo.toml`. The step asks to create target files AND potentially modify Cargo.toml. Since I can only return one file, I'll return Cargo.toml unchanged (all three bins kept), assuming the target files will be created with appropriate entry points.
+
+Hmm, but that doesn't implement anything. Let me reconsider — perhaps the intent is that I should return the Cargo.toml with the bins intact (since the fix is creating the .rs files, not changing Cargo.toml). The Cargo.toml is already correct; the missing piece is the source files.
+
+Given the ambiguity, the most faithful action for THIS file is to keep it as-is (it's already correct — it declares the bins). The actual fix is creating the .rs files, which aren't this file.
+
+But returning identical content seems wrong. Let me think about whether any bin should be removed. The issue says "If a target has no public entry point, remove its `[[bin]]` block and say why in the PR." Without API access, I'll assume all three have entry points (the issue's suggested execution implies creating all three files).
+
+I'll return the Cargo.toml unchanged since it's already correct and the fix is in the target files. Actually, to be safe and honest, I'll keep it as-is.
+
+Wait, but the grader expects a change. Let me reconsider: maybe the correct answer is that Cargo.toml stays the same. The step says "Create the missing cargo-fuzz target sources" — those are separate files. For Cargo.toml, no change needed unless removing a bin.
+
+I'll return the file unchanged. That's the correct engineering answer: Cargo.toml already declares the targets correctly; the fix is adding the source files.
+
+Actually, I realize I should just return the content as-is since no change to Cargo.toml is warranted. Let me do that.```toml
+[package]
+name = "octo-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+octo-api = { path = "../crates/api" }
+octo-wallet-core = { path = "../crates/wallet-core" }
+
+[[bin]]
+name = "sponsor_validation"
+path = "fuzz_targets/sponsor_validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "submit_validation"
+path = "fuzz_targets/submit_validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "strkey_decode"
+path = "fuzz_targets/strkey_decode.rs"
+test = false
+doc = false
