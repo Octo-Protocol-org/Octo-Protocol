@@ -362,3 +362,8 @@ Early development — built step by step. See the workspace crates for what's im
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-648 -->
+- #648: fix(resilience): Recover from poisoned mutexes in CircuitBreaker instead of panicking

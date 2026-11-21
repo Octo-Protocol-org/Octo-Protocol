@@ -10,6 +10,10 @@
 
 use crate::error::WalletError;
 
+/// The widely-used testnet USDC issuer account, shared by payment links and ingest so the two
+/// cannot drift apart.
+pub const USDC_TESTNET_ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
 /// Returns `true` if `code` is acceptable as an Octo credit-asset code.
 /// Length is measured in bytes; native-asset spellings are reserved by Octo policy.
 pub fn is_valid_asset_code(code: &str) -> bool {
@@ -53,6 +57,11 @@ mod tests {
     }
 
     // --- explicit boundary tests -------------------------------------------------------------
+
+    #[test]
+    fn usdc_testnet_issuer_is_a_valid_account_strkey() {
+        assert!(PublicKey::from_account_id(USDC_TESTNET_ISSUER).is_ok());
+    }
 
     #[test]
     fn accepts_exactly_4_characters() {

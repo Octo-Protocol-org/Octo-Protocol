@@ -351,6 +351,8 @@ Guidelines:
 3. **Deduplicate by delivery/event id.** Each delivery carries a unique delivery id and references a stable event id. Use these to detect and drop duplicates (see [Idempotent handling](#6-idempotent-handling)).
 4. **Return `401` only for signature failures.** For transient internal errors, return `5xx` so Octo retries; for permanent, unprocessable payloads, return `4xx` (other than `401`) to stop retries.
 
+> **Endpoints can be auto-disabled.** Repeated delivery failures can cause Octo to disable an endpoint automatically. The threshold is controlled by `OCTO_WEBHOOK_AUTO_DISABLE_AFTER` (see [environment variables](./environment-variables.md)). Once disabled, the endpoint stops receiving deliveries until it is re-enabled; fix the underlying failure (e.g., signature verification or availability) and re-enable the endpoint before relying on deliveries again.
+
 ---
 
 ## 5. Ordering
