@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # horizon-mock
 //!
 //! A small, offline mock of the Stellar Horizon API used for local development

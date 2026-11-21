@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- API: rate-limited `429` responses now carry a `Retry-After` header with the remaining
+  window in seconds, so well-behaved clients can back off correctly (#688).
 - API: `service_unavailable` (503) is now part of the public error catalogue in `ERROR_CODES`,
   `docs/api.md` and the `ErrorResponse.code` enum in `docs/openapi.yaml` (#608).
 - Docker: the builder image's default `RUST_VERSION` is aligned with the pinned `1.84.1`

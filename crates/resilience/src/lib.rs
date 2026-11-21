@@ -500,6 +500,52 @@ mod tests {
         assert_eq!(p.delay_for(5), Duration::from_millis(2_000));
     }
 
+    #[test]
+    fn delay_stays_within_jitter_band() {
+        let p = RetryPolicy {
+            base_delay_ms: 100,
+            multiplier: 2.0,
+            max_delay_ms: 10_000,
+            jitter_factor: 0.2,
+            ..Default::default()
+        };
+        for attempt in 0..10 {
+            let expected = (100.0 * 2f64.powi(attempt as i32)).min(10_000.0);
+            let half_band = expected * p.jitter_factor / 2.0;
+            let delay = p.delay_for(attempt).as_millis() as f64;
+            assert!(
+                delay >= expected - half_band && delay <= expected + half_band,
+                "attempt {attempt}: delay {delay}ms outside jitter band [{}, {}]",
+                expected - half_band,
+                expected + half_band
+            );
+            assert!(
+                delay <= p.max_delay_ms as f64,
+                "attempt {attempt}: delay {delay}ms exceeds max {}ms",
+                p.max_delay_ms
+            );
+        }
+    }
+
+    #[test]
+    fn zero_jitter_matches_exponential_delay() {
+        let p = RetryPolicy {
+            base_delay_ms: 100,
+            multiplier: 2.0,
+            max_delay_ms: 10_000,
+            jitter_factor: 0.0,
+            ..Default::default()
+        };
+        for attempt in 0..10 {
+            let expected = (100u64 * 2u64.pow(attempt)).min(10_000);
+            assert_eq!(
+                p.delay_for(attempt),
+                Duration::from_millis(expected),
+                "attempt {attempt}: zero jitter must equal the exponential delay"
+            );
+        }
+    }
+
     // --- RetryPolicy property tests (#488) -----------------------------------
 
     use proptest::prelude::*;

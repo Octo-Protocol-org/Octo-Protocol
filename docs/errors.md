@@ -19,7 +19,7 @@ status, meaning, and the remedy an integrator should apply.
 | `Conflict` | 409 Conflict | The request conflicts with the current state of the resource (e.g. duplicate create, illegal state transition). | Re-read the resource, reconcile state, and retry only if the operation is still valid. |
 | `ConflictWith` | 409 Conflict | The request conflicts with a specific existing resource; the response identifies the conflicting entity. | Inspect the conflicting resource in the response, resolve the overlap, then retry. |
 | `Gone` | 410 Gone | The resource existed but has been permanently removed and is no longer available. | Stop requesting this resource; treat it as deleted. |
-| `TooManyRequests` | 429 Too Many Requests | A rate limit or quota has been exceeded. | Back off with exponential delay and retry. No `Retry-After` header is guaranteed; the API does not currently set one. |
+| `TooManyRequests` | 429 Too Many Requests | A rate limit or quota has been exceeded. | 429 responses include a `Retry-After` header giving the remaining window in seconds. Wait at least that long before retrying, then back off exponentially. |
 | `StaleSequence` | 400 Bad Request | The supplied sequence number is stale or out of order relative to the current state. | Re-fetch the latest state/sequence and retry with the current value. |
 | `Internal` | 500 Internal Server Error | An unexpected server-side failure occurred. | Retry with backoff; if it persists, contact support with the request ID. |
 | `GatewayTimeout` | 504 Gateway Timeout | An upstream dependency did not respond in time. | Retry with backoff; the operation may or may not have completed, so reconcile state first where relevant. |
