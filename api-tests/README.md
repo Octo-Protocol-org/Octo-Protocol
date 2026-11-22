@@ -23,6 +23,11 @@ https://www.usebruno.com
    Open `checkout_url` in a browser to see the real hosted pay page.
 5. **Payment Links → Public - ...** requests exercise the same flow a real payer's browser
    would, with no auth — this is what a developer integrating checkout actually calls.
+6. **Sessions → Revoke Other Sessions** — `POST /v1/auth/sessions/revoke-others`, saves the
+   replacement token into `token`.
+7. **Audit → List Audit Logs** — `GET /v1/audit-logs`, optional `category`/`search` query params.
+8. **Wallets → Export Transactions CSV** — `GET /v1/wallets/{{wallet_id}}/transactions.csv`.
+9. **Wallets → Get and Revoke API Key** — `GET`/`DELETE /v1/wallets/{{wallet_id}}/api-key`.
 
 ## Why some requests can't just be "run"
 

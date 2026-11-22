@@ -1,0 +1,45 @@
+meta {
+  name: Get and Revoke API Key
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/api-key
+  body: none
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+---
+
+meta {
+  name: Revoke API Key
+  type: http
+  seq: 2
+}
+
+delete {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/api-key
+  body: none
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}

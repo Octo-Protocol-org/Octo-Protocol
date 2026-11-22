@@ -1,0 +1,24 @@
+meta {
+  name: Export Transactions CSV
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/transactions.csv
+  body: none
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("content-type is text/csv", function() {
+    expect(res.headers["content-type"]).to.include("text/csv");
+  });
+}
