@@ -1,0 +1,26 @@
+meta {
+  name: List Audit Logs
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/v1/audit-logs
+  body: none
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+params:query {
+  category: all
+  search: 
+}
+
+tests {
+  test("should return status 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}

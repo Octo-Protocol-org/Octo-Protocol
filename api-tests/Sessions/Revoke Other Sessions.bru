@@ -1,0 +1,28 @@
+meta {
+  name: Revoke Other Sessions
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/v1/auth/sessions/revoke-others
+  body: none
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.status).to.equal(200);
+  });
+}
+
+script:post-response {
+  const body = res.body;
+  if (body && body.data && body.data.token) {
+    bru.setEnvVar('token', body.data.token);
+  }
+}
