@@ -9,6 +9,8 @@ authors.workspace = true
 
 [dependencies]
 rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

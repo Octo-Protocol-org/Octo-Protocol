@@ -1265,6 +1265,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-mock"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1839,6 +1851,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "octo-store",
+ "octo-webhooks",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "octo-api"
 version = "0.1.0"
 dependencies = [
@@ -1970,6 +1997,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "octo-migrate-keys"
 version = "0.1.0"
 dependencies = [
@@ -1988,15 +2019,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "octo-metrics"
-version = "0.1.0"
-
-[[package]]
 name = "octo-resilience"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "rand 0.8.8",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "octo-seed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "octo-store",
+ "octo-wallet-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2030,6 +2074,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dotenvy",
+ "futures",
  "hmac",
  "serde",
  "serde_json",
@@ -2054,6 +2099,7 @@ dependencies = [
  "proptest",
  "rand 0.8.8",
  "serde",
+ "serde_json",
  "sha2",
  "slip10_ed25519",
  "stellar-base",

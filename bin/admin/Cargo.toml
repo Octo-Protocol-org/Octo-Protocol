@@ -1,0 +1,20 @@
+[package]
+name = "octo-admin"
+description = "Audited operator commands for Octo Protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap = { version = "4.0", features = ["derive"] }
+octo-store.workspace = true
+octo-webhooks.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zeroize.workspace = true

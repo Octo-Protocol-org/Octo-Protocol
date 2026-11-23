@@ -42,6 +42,7 @@ A Cargo workspace; all secret-handling is isolated in `wallet-core` and zeroized
 | [`crates/crypto`](crates/crypto) | AES-256-GCM seal/open of the HD seed (random nonce + salt) |
 | [`crates/wallet-core`](crates/wallet-core) | SEP-0005 ed25519 derivation, muxed encode/decode, tx sign + `zeroize` |
 | [`crates/store`](crates/store) | Postgres models + migrations (sqlx) |
+| [`octo-admin`](docs/octo-admin.md) | Read-only inspection and audited operator commands |
 | [`crates/webhooks`](crates/webhooks) | HMAC-SHA256 signed outbound webhooks + delivery log |
 | [`crates/ingest`](crates/ingest) | Horizon payment streaming + durable cursor → deposit detection |
 | [`crates/api`](crates/api) | axum REST API |

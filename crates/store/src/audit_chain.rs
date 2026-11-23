@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::{FromRow, Postgres, Transaction};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -42,8 +43,7 @@ impl AuditChainKey {
     /// Build the HMAC state for this key. HMAC accepts any key length, so this only fails on a
     /// broken `hmac`/`sha2` build; surface it as a `StoreError` rather than panicking.
     fn mac(&self) -> Result<HmacSha256, StoreError> {
-        <HmacSha256 as Mac>::new_from_slice(&self.0[..])
-            .map_err(|_| StoreError::AuditChainCorrupt("invalid audit chain HMAC key".into()))
+        <HmacSha256 as Mac>::new_from_slice(&self.0[..]).map_err(|_| StoreError::AuditChainCorrupt)
     }
 }
 
@@ -188,12 +188,16 @@ fn now_micros() -> DateTime<Utc> {
 
 impl HeadRow {
     /// The head's `(seq, row_hash)` if its MAC checks out.
-    fn verified(&self, key: &AuditChainKey, user_id: Uuid) -> Result<Option<(i64, [u8; 32])>, StoreError> {
+    fn verified(
+        &self,
+        key: &AuditChainKey,
+        user_id: Uuid,
+    ) -> Result<Option<(i64, [u8; 32])>, StoreError> {
         let Some(hash) = to_hash(&self.row_hash) else {
             return Ok(None);
         };
         let mac = head_mac(key, user_id, self.seq, &hash)?;
-        Ok((mac.as_slice() == self.head_mac.as_slice()).then_some((self.seq, hash)))
+        Ok(bool::from(mac.as_slice().ct_eq(&self.head_mac)).then_some((self.seq, hash)))
     }
 }
 
@@ -224,11 +228,15 @@ impl Store {
         key: &AuditChainKey,
         user_id: Uuid,
     ) -> Result<AuditChainReport, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let unchained: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM audit_logs WHERE user_id = $1 AND seq IS NULL",
         )
         .bind(user_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         let mut report = AuditChainReport {
             user_id,
@@ -252,7 +260,7 @@ impl Store {
             .bind(user_id)
             .bind(last_seq)
             .bind(VERIFY_BATCH)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
             if rows.is_empty() {
                 break;
@@ -296,19 +304,18 @@ impl Store {
             }
         }
 
-        if report.rows_verified == 0 {
-            report.status = AuditChainStatus::Unchained;
-            return Ok(report);
-        }
-
         let head = sqlx::query_as::<_, HeadRow>(
             "SELECT seq, row_hash, head_mac FROM audit_chain_heads WHERE user_id = $1",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         match head {
+            None if report.rows_verified == 0 => report.status = AuditChainStatus::Unchained,
             None => report.status = broken(None, "missing chain head"),
+            Some(head) if report.rows_verified == 0 => {
+                report.status = broken(Some(head.seq), "chain head has no rows");
+            }
             Some(head) => match head.verified(key, user_id)? {
                 None => report.status = broken(Some(head.seq), "head MAC mismatch"),
                 Some((seq, hash)) if seq != last_seq || hash != prev => {
@@ -317,11 +324,40 @@ impl Store {
                 Some(_) => {}
             },
         }
+        tx.commit().await?;
         Ok(report)
+    }
+
+    /// Verify every user represented by an audit row or a pinned chain head.
+    pub async fn verify_all_audit_chains(
+        &self,
+        key: &AuditChainKey,
+    ) -> Result<Vec<AuditChainReport>, StoreError> {
+        let users = sqlx::query_scalar::<_, Uuid>(
+            "SELECT user_id FROM audit_logs UNION SELECT user_id FROM audit_chain_heads ORDER BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut reports = Vec::with_capacity(users.len());
+        for user_id in users {
+            reports.push(self.verify_audit_chain(key, user_id).await?);
+        }
+        Ok(reports)
     }
 }
 
-async fn append_link(
+/// Take the per-user append lock (transaction-scoped; re-entrant within one transaction).
+async fn lock_chain(tx: &mut Transaction<'_, Postgres>, user_id: Uuid) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(LOCK_NAMESPACE)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Append one row to the user's chain inside the caller's transaction.
+pub(crate) async fn append_link(
     tx: &mut Transaction<'_, Postgres>,
     key: &AuditChainKey,
     user_id: Uuid,
@@ -330,71 +366,236 @@ async fn append_link(
     target: Option<&str>,
     ip_address: Option<&str>,
 ) -> Result<(), StoreError> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
-        .bind(LOCK_NAMESPACE)
-        .bind(user_id.as_u64() as i64)
-        .execute(&mut **tx)
-        .await?;
+    lock_chain(tx, user_id).await?;
+    let (tip_seq, prev) = chain_tip(tx, key, user_id).await?;
+    let seq = tip_seq
+        .checked_add(1)
+        .ok_or(StoreError::AuditChainCorrupt)?;
+    let id = Uuid::new_v4();
+    let created_at = now_micros();
+    let hash = row_hash(
+        key,
+        &prev,
+        &LinkFields {
+            id,
+            user_id,
+            seq,
+            action,
+            category,
+            target,
+            ip_address,
+            created_at,
+        },
+    )?;
+    sqlx::query(
+        "INSERT INTO audit_logs
+             (id, user_id, action, category, target, ip_address, created_at,
+              seq, prev_hash, row_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(action)
+    .bind(category)
+    .bind(target)
+    .bind(ip_address)
+    .bind(created_at)
+    .bind(seq)
+    .bind(prev.as_slice())
+    .bind(hash.as_slice())
+    .execute(&mut **tx)
+    .await?;
+    write_head(tx, key, user_id, seq, &hash).await
+}
 
+/// Null `target` and `ip_address` on every row of a deleted user's chain and re-link it.
+///
+/// Each row is checked against its existing hash first, so a tampered chain is refused with
+/// [`StoreError::AuditChainCorrupt`] instead of being re-signed (which would launder the edit).
+/// Requires `users.deleted_at` to be set already: the append-only trigger checks it (0032).
+pub(crate) async fn anonymise_chain(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &AuditChainKey,
+    user_id: Uuid,
+) -> Result<u64, StoreError> {
+    lock_chain(tx, user_id).await?;
+    let (tip_seq, tip_hash) = chain_tip(tx, key, user_id).await?;
+
+    let mut last_seq = 0i64;
+    let mut old_prev = GENESIS_PREV_HASH;
+    let mut new_prev = GENESIS_PREV_HASH;
+    loop {
+        let rows = sqlx::query_as::<_, ChainRow>(
+            "SELECT id, user_id, seq, prev_hash, row_hash, action, category, target,
+                    ip_address, created_at
+             FROM audit_logs
+             WHERE user_id = $1 AND seq > $2
+             ORDER BY seq
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(last_seq)
+        .bind(VERIFY_BATCH)
+        .fetch_all(&mut **tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let linked = row.prev_hash.as_deref().and_then(to_hash) == Some(old_prev);
+            if row.seq != last_seq + 1 || !linked {
+                return Err(StoreError::AuditChainCorrupt);
+            }
+            let mut fields = LinkFields {
+                id: row.id,
+                user_id: row.user_id,
+                seq: row.seq,
+                action: &row.action,
+                category: &row.category,
+                target: row.target.as_deref(),
+                ip_address: row.ip_address.as_deref(),
+                created_at: row.created_at,
+            };
+            let old_hash = row_hash(key, &old_prev, &fields)?;
+            if row.row_hash.as_deref().and_then(to_hash) != Some(old_hash) {
+                return Err(StoreError::AuditChainCorrupt);
+            }
+            fields.target = None;
+            fields.ip_address = None;
+            let new_hash = row_hash(key, &new_prev, &fields)?;
+            sqlx::query(
+                "UPDATE audit_logs
+                 SET target = NULL, ip_address = NULL, prev_hash = $2, row_hash = $3
+                 WHERE id = $1",
+            )
+            .bind(row.id)
+            .bind(new_prev.as_slice())
+            .bind(new_hash.as_slice())
+            .execute(&mut **tx)
+            .await?;
+            old_prev = old_hash;
+            new_prev = new_hash;
+            last_seq = row.seq;
+        }
+    }
+    // The walk must end exactly at the MAC-verified head, or rows were cut off the end.
+    if last_seq != tip_seq || old_prev != tip_hash {
+        return Err(StoreError::AuditChainCorrupt);
+    }
+    if last_seq > 0 {
+        write_head(tx, key, user_id, last_seq, &new_prev).await?;
+    }
+    // Stray unchained rows carry no hash to break; scrub them too.
+    let stray = sqlx::query(
+        "UPDATE audit_logs SET target = NULL, ip_address = NULL
+         WHERE user_id = $1 AND seq IS NULL AND (target IS NOT NULL OR ip_address IS NOT NULL)",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(u64::try_from(last_seq).unwrap_or(0) + stray)
+}
+
+/// The `(seq, row_hash)` to append after. Starts a new chain (adopting pre-0026 rows) when the
+/// user has none, and refuses to extend a chain whose head is missing or forged.
+async fn chain_tip(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &AuditChainKey,
+    user_id: Uuid,
+) -> Result<(i64, [u8; 32]), StoreError> {
     let head = sqlx::query_as::<_, HeadRow>(
         "SELECT seq, row_hash, head_mac FROM audit_chain_heads WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&mut **tx)
     .await?;
-
-    let (seq, prev) = match head {
-        None => (1i64, GENESIS_PREV_HASH),
-        Some(head) => head
+    if let Some(head) = head {
+        return head
             .verified(key, user_id)?
-            .ok_or_else(|| StoreError::AuditChainCorrupt("chain head MAC mismatch".into()))?,
-    };
+            .ok_or(StoreError::AuditChainCorrupt);
+    }
 
-    let id = Uuid::new_v4();
-    let created_at = now_micros();
-    let fields = LinkFields {
-        id,
-        user_id,
-        seq,
-        action,
-        category,
-        target,
-        ip_address,
-        created_at,
-    };
-    let hash = row_hash(key, &prev, &fields)?;
-    let mac = head_mac(key, user_id, seq, &hash)?;
-
-    sqlx::query(
-        "INSERT INTO audit_logs
-            (id, user_id, seq, prev_hash, row_hash, action, category, target, ip_address, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    let chained: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM audit_logs WHERE user_id = $1 AND seq IS NOT NULL)",
     )
-    .bind(id)
     .bind(user_id)
-    .bind(seq)
-    .bind(prev.as_slice())
-    .bind(hash.as_slice())
-    .bind(action)
-    .bind(category)
-    .bind(target)
-    .bind(ip_address)
-    .bind(created_at)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
+    .await?;
+    if chained {
+        return Err(StoreError::AuditChainCorrupt);
+    }
+    adopt_legacy_rows(tx, key, user_id).await
+}
+
+/// Chain a user's pre-0026 rows in `(created_at, id)` order. Runs once, when their chain starts.
+async fn adopt_legacy_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &AuditChainKey,
+    user_id: Uuid,
+) -> Result<(i64, [u8; 32]), StoreError> {
+    let legacy = sqlx::query_as::<_, LegacyRow>(
+        "SELECT id, action, category, target, ip_address, created_at
+         FROM audit_logs
+         WHERE user_id = $1 AND seq IS NULL
+         ORDER BY created_at, id
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
     .await?;
 
+    let mut seq = 0i64;
+    let mut prev = GENESIS_PREV_HASH;
+    for row in &legacy {
+        seq += 1;
+        let hash = row_hash(
+            key,
+            &prev,
+            &LinkFields {
+                id: row.id,
+                user_id,
+                seq,
+                action: &row.action,
+                category: &row.category,
+                target: row.target.as_deref(),
+                ip_address: row.ip_address.as_deref(),
+                created_at: row.created_at,
+            },
+        )?;
+        sqlx::query("UPDATE audit_logs SET seq = $2, prev_hash = $3, row_hash = $4 WHERE id = $1")
+            .bind(row.id)
+            .bind(seq)
+            .bind(prev.as_slice())
+            .bind(hash.as_slice())
+            .execute(&mut **tx)
+            .await?;
+        prev = hash;
+    }
+    Ok((seq, prev))
+}
+
+/// Upsert the user's chain head to `(seq, row_hash)` under a fresh head MAC.
+async fn write_head(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &AuditChainKey,
+    user_id: Uuid,
+    seq: i64,
+    row_hash: &[u8; 32],
+) -> Result<(), StoreError> {
+    let mac = head_mac(key, user_id, seq, row_hash)?;
     sqlx::query(
-        "INSERT INTO audit_chain_heads (user_id, seq, row_hash, head_mac)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO audit_chain_heads (user_id, seq, row_hash, head_mac, updated_at)
+         VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (user_id) DO UPDATE
-            SET seq = EXCLUDED.seq, row_hash = EXCLUDED.row_hash, head_mac = EXCLUDED.head_mac",
+         SET seq = EXCLUDED.seq, row_hash = EXCLUDED.row_hash,
+             head_mac = EXCLUDED.head_mac, updated_at = now()",
     )
     .bind(user_id)
     .bind(seq)
-    .bind(hash.as_slice())
+    .bind(row_hash.as_slice())
     .bind(mac.as_slice())
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
