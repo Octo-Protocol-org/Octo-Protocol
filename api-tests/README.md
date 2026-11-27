@@ -29,6 +29,8 @@ https://www.usebruno.com
 8. **Wallets → Export Transactions CSV** — `GET /v1/wallets/{{wallet_id}}/transactions.csv`.
 9. **Wallets → Get and Revoke API Key** — `GET`/`DELETE /v1/wallets/{{wallet_id}}/api-key`.
 
+> **Webhooks → Test Webhook** calls `POST /v1/wallets/:id/webhooks/:endpoint_id/test`. That route is not implemented on `main` yet, so the request returns 404 until it is.
+
 ## Why some requests can't just be "run"
 
 `Create Wallet` and `Public - Submit Signed` both require an ed25519 signature made with a

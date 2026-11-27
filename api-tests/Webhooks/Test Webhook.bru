@@ -1,0 +1,21 @@
+meta {
+  name: Test Webhook
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/v1/wallets/{{wallet_id}}/webhooks/{{webhook_id}}/test
+  body: none
+  auth: none
+}
+
+headers {
+  authorization: Bearer {{token}}
+}
+
+tests {
+  test("returns 200", function () {
+    expect(res.status).to.equal(200);
+  });
+}
