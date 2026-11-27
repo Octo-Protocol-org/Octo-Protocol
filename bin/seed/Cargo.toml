@@ -13,8 +13,8 @@ name = "octo-seed"
 path = "src/main.rs"
 
 [dependencies]
-octo-store = { path = "../../crates/octo-store" }
-octo-wallet-core = { path = "../../crates/octo-wallet-core" }
+octo-store.workspace = true
+octo-wallet-core.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
 tracing = "0.1"

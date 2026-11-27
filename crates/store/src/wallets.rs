@@ -344,24 +344,34 @@ impl Store {
         wallet_id: Uuid,
         paused: bool,
     ) -> Result<Wallet, StoreError> {
-        sqlx::query_as::<_, Wallet>(
-            r#"
-            UPDATE wallets SET
-                ingest_paused = $2,
-                ingest_paused_at = CASE
-                    WHEN $2 THEN COALESCE(ingest_paused_at, now())
-                    ELSE NULL
-                END,
-                updated_at = now()
-            WHERE id = $1
-            RETURNING *
-            "#,
+        let mut conn = self.pool.acquire().await?;
+        update_ingest_pause(&mut conn, wallet_id, paused).await
+    }
+
+    /// Pause ingestion and append the operator's audit entry in the same transaction.
+    pub async fn admin_pause_ingest(
+        &self,
+        key: &crate::AuditChainKey,
+        actor: Uuid,
+        wallet_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let wallet = update_ingest_pause(&mut tx, wallet_id, true).await?;
+        if wallet.is_archived() {
+            return Err(StoreError::WalletArchived);
+        }
+        crate::audit_chain::append_link(
+            &mut tx,
+            key,
+            actor,
+            "paused wallet ingestion",
+            "wallet",
+            Some(&wallet_id.to_string()),
+            None,
         )
-        .bind(wallet_id)
-        .bind(paused)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::NotFound)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Fetch a wallet by id.
@@ -462,4 +472,29 @@ impl Store {
         .await?;
         Ok(rows)
     }
+}
+
+async fn update_ingest_pause(
+    conn: &mut sqlx::PgConnection,
+    wallet_id: Uuid,
+    paused: bool,
+) -> Result<Wallet, StoreError> {
+    sqlx::query_as::<_, Wallet>(
+        r#"
+            UPDATE wallets SET
+                ingest_paused = $2,
+                ingest_paused_at = CASE
+                    WHEN $2 THEN COALESCE(ingest_paused_at, now())
+                    ELSE NULL
+                END,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            "#,
+    )
+    .bind(wallet_id)
+    .bind(paused)
+    .fetch_optional(conn)
+    .await?
+    .ok_or(StoreError::NotFound)
 }

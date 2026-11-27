@@ -220,17 +220,7 @@ impl WebhookSender {
     ) -> DeliveryResult {
         if !is_safe_url(&ep.url) {
             tracing::warn!(url = %ep.url, "skipping webhook to unsafe URL");
-            let delivery_id = self
-                .store
-                .log_webhook_delivery(ep.id, event_type, body, status::FAILED, 0, None, None)
-                .await
-                .ok();
-            return DeliveryResult {
-                delivery_id,
-                status: status::FAILED,
-                attempts: 0,
-                response_code: None,
-            };
+            return self.log_unsent(ep.id, event_type, body).await;
         }
         let body_bytes = serde_json::to_vec(body).unwrap_or_default();
         let result = self
@@ -256,6 +246,25 @@ impl WebhookSender {
         result
     }
 
+    async fn log_unsent(
+        &self,
+        endpoint_id: Uuid,
+        event_type: &str,
+        body: &serde_json::Value,
+    ) -> DeliveryResult {
+        let delivery_id = self
+            .store
+            .log_webhook_delivery(endpoint_id, event_type, body, status::FAILED, 0, None, None)
+            .await
+            .ok();
+        DeliveryResult {
+            delivery_id,
+            status: status::FAILED,
+            attempts: 0,
+            response_code: None,
+        }
+    }
+
     /// Deliver to one endpoint via `octo_resilience::execute`, then log the final outcome.
     async fn deliver_with_retry(
         &self,
@@ -275,7 +284,10 @@ impl WebhookSender {
                 status::FAILED,
             ),
         };
-        let signature = sign::sign(ep.secret.as_bytes(), body_bytes);
+        let Some(signature) = sign::sign(ep.secret.as_bytes(), body_bytes) else {
+            tracing::error!(endpoint_id = %ep.id, "could not sign webhook");
+            return self.log_unsent(ep.id, event_type, body).await;
+        };
         // Fresh per delivery and never tripping: one endpoint's outage must not gate another's.
         let circuit = CircuitBreaker::new(u32::MAX, Duration::ZERO);
         // Atomic (not Cell) so the dispatch future stays `Send` for callers that spawn it.
@@ -408,7 +420,8 @@ async fn is_safe_delivery_url(url: &str) -> bool {
         return true;
     }
     let port = parsed.port_or_known_default().unwrap_or(443);
-    match tokio::net::lookup_host((host, port)).await {
+    let lookup = tokio::net::lookup_host((host, port)).await;
+    match lookup {
         Ok(addresses) => {
             let resolved: Vec<_> = addresses.collect();
             !resolved.is_empty()

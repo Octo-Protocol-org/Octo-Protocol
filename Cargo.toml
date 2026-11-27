@@ -16,6 +16,7 @@ members = [
     "crates/evm-rpc",
     "crates/metrics",
     "bin/server",
+    "bin/admin",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
     "bin/seed",
